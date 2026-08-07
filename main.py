@@ -366,7 +366,7 @@ async def dashboard():
             </div>
 
             <footer>
-                <div class="dev-tag">Developer: Walter</div>
+                <div class="dev-tag">Developer: ElitePlex</div>
             </footer>
         </div>
     </body>
