@@ -663,82 +663,117 @@ def _score_mirror(url: str, label: str) -> int:
 
 async def resolve_hubcloud(drive_url: str) -> List[dict]:
     """
-    hubcloud.*/drive/xxx  →  direct download / stream URLs
+    hubcloud.*/drive/xxx  →  all direct mirrors (FSL, 10Gbps, PixelDrain, Watch Online, R2…)
     """
     if "hubcloud." not in drive_url or "/drive/" not in drive_url:
         raise HTTPException(400, "Not a HubCloud /drive/ URL")
 
-    headers = {"User-Agent": FK_UA, "Referer": drive_url}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0, headers=headers) as client:
+    headers = {
+        "User-Agent": FK_UA,
+        "Referer": drive_url,
+        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0, headers=headers) as client:
         r1 = await client.get(drive_url)
         if r1.status_code != 200:
             raise HTTPException(502, f"HubCloud page HTTP {r1.status_code}")
         soup1 = BeautifulSoup(r1.text, "html.parser")
+        title = (soup1.title.string or "").strip() if soup1.title else ""
 
-        resolver_url = None
-        for a in soup1.select(
-            "a#download, a.btn-primary, a.btn-success, a.btn[href*='/download/'], "
-            "a[href*='/download/'], a[href*='gamerxyt.com'], a[href*='hubcloud.php']"
-        ):
-            href = a.get("href") or ""
-            if href.startswith("https://"):
-                resolver_url = href
-                break
-        if not resolver_url:
-            m = re.search(r"var\s+url\s*=\s*['\"](https://[^'\"]+)['\"]", r1.text)
+        resolver_urls: List[str] = []
+        for a in soup1.select("a[href]"):
+            href = (a.get("href") or "").strip()
+            if not href.startswith("http"):
+                continue
+            low = href.lower()
+            if any(x in low for x in ("gamerxyt.com", "hubcloud.php", "/download/", "generate")):
+                if href not in resolver_urls:
+                    resolver_urls.append(href)
+        if not resolver_urls:
+            m = re.search(
+                r"https?://gamerxyt\.com/hubcloud\.php\?[^\s\"'<>]+",
+                r1.text,
+            )
             if m:
-                resolver_url = m.group(1)
-        if not resolver_url:
-            raise HTTPException(502, "HubCloud: download button not found")
+                resolver_urls.append(m.group(0).rstrip("\\';'\""))
+        if not resolver_urls:
+            raise HTTPException(502, "HubCloud: download / generate link not found")
 
-        r2 = await client.get(resolver_url, headers={**headers, "Referer": drive_url})
-        if r2.status_code != 200:
-            raise HTTPException(502, f"HubCloud resolver HTTP {r2.status_code}")
-        html2 = r2.text
+        html2 = ""
+        for ru in resolver_urls:
+            try:
+                r2 = await client.get(ru, headers={**headers, "Referer": drive_url})
+                if r2.status_code == 200 and len(r2.text) > 200 and "404" not in r2.text[:20]:
+                    html2 = r2.text
+                    break
+            except Exception:
+                continue
+        if not html2:
+            raise HTTPException(502, "HubCloud resolver page failed (gamerxyt/mirror down)")
+
         soup2 = BeautifulSoup(html2, "html.parser")
-
         candidates: List[Tuple[int, str, str]] = []
 
-        for prefix in (
-            "https://pixeldrain.dev/u/",
-            "https://pixeldrain.com/u/",
-            "https://pixeldrain.dev/api/file/",
-            "https://pixeldrain.com/api/file/",
-        ):
-            pos = 0
-            while True:
-                i = html2.find(prefix, pos)
-                if i < 0:
-                    break
-                end = i
-                while end < len(html2) and html2[end] not in "\"' \t\n\r<>\\":
-                    end += 1
-                chunk = html2[i:end]
-                api = _pixeldrain_api(chunk)
-                if api:
-                    candidates.append((_score_mirror(api, "PixelDrain"), api, "PixelDrain"))
-                pos = end
+        def _add(url: str, label: str, score: int = 50):
+            if not url or not url.startswith("http"):
+                return
+            # normalize pixeldrain
+            pd = _pixeldrain_api(url) if "pixeldrain" in url.lower() or "pixeldra" in url.lower() else None
+            final = pd or url
+            try:
+                unwrapped = _unwrap_pages_dev(final)
+                if unwrapped and unwrapped.startswith("http"):
+                    final = unwrapped
+            except Exception:
+                pass
+            candidates.append((score, final, label[:100]))
 
         for a in soup2.select("a[href]"):
             href = (a.get("href") or "").strip()
-            if not href.startswith("https://"):
+            if not href.startswith("http"):
                 continue
             label = a.get_text(" ", strip=True) or "Direct"
-            unwrapped = _unwrap_pages_dev(href)
-            if unwrapped and _is_playable_direct(unwrapped):
-                candidates.append((_score_mirror(unwrapped, "Watch Online"), unwrapped, "Watch Online"))
+            low = (label + " " + href).lower()
+            if any(x in low for x in (
+                "telegram", "winexch", "login", "vpn", "tutorial", "idm", "ida",
+                "google.com/search", "movies4u", "hdhub4u", "facebook", "twitter",
+                "instagram", "youtube.com", "t.me/", "favicon", "bootstrap",
+            )):
                 continue
-            pd = _pixeldrain_api(href)
-            if pd:
-                candidates.append((_score_mirror(pd, label), pd, "PixelDrain"))
-                continue
-            if _is_playable_direct(href):
-                candidates.append((_score_mirror(href, label), href, label[:80]))
+            try:
+                from urllib.parse import urlparse as _up
+                path=(_up(href).path or "").strip("/")
+                host=(_up(href).hostname or "").lower()
+                junk_hosts=("movies4u.","hdhub4u.","t.me","telegram","facebook.","twitter.","instagram.")
+                if any(host.endswith(j.rstrip(".")) or j in host for j in junk_hosts):
+                    continue
+                if not path and not any(x in host for x in ("pixeldrain","r2.cloudflare","workers.dev","bunker.monster","hubcloud")):
+                    continue
+            except Exception:
+                pass
+            score = 50
+            if "fsl" in low:
+                score = 5
+            elif "10gbps" in low or "10 gbps" in low:
+                score = 10
+            elif "pixel" in low:
+                score = 15
+            elif "watch" in low:
+                score = 20
+            elif "r2.cloudflare" in low or "workers.dev" in low:
+                score = 12
+            elif "hubcdn" in low or "gpdl.hubcloud" in low:
+                score = 18
+            _add(href, label, score)
 
-        for a in soup2.select("a#fsl, a[id*=fsl]"):
-            href = a.get("href") or ""
-            if href.startswith("https://") and _is_playable_direct(href):
-                candidates.append((0, href, "FSL Server"))
+        # raw pixeldrain strings in HTML
+        for m in re.finditer(
+            r"https?://(?:www\.)?pixeldrain\.(?:com|dev|net)/[u/]+([A-Za-z0-9_-]+)",
+            html2,
+        ):
+            fid = m.group(1)
+            _add(f"https://cdn.pixeldrain.eu.cc/{fid}", "PixelDrain", 15)
+            _add(f"https://pixeldrain.com/api/file/{fid}?download", "PixelDrain API", 16)
 
         candidates.sort(key=lambda x: x[0])
         seen = set()
@@ -753,6 +788,8 @@ async def resolve_hubcloud(drive_url: str) -> List[dict]:
                     "url": url,
                     "priority": score,
                     "direct": True,
+                    "title": title or None,
+                    "source": "hubcloud",
                 }
             )
         if not results:
@@ -761,127 +798,73 @@ async def resolve_hubcloud(drive_url: str) -> List[dict]:
 
 
 async def resolve_hubdrive(file_url: str) -> List[dict]:
+    """
+    hubdrive.*/file/xxx → HubCloud server → same mirrors as HubCloud.
+    """
     if "hubdrive." not in file_url:
         raise HTTPException(400, "Not a HubDrive URL")
-    headers = {"User-Agent": FK_UA, "Referer": file_url}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20.0, headers=headers) as client:
+    headers = {"User-Agent": FK_UA, "Referer": file_url, "Accept": "text/html,*/*"}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0, headers=headers) as client:
         r = await client.get(file_url)
         if r.status_code != 200:
             raise HTTPException(502, f"HubDrive HTTP {r.status_code}")
         soup = BeautifulSoup(r.text, "html.parser")
+        title = (soup.title.string or "").strip() if soup.title else ""
+        hub_links: List[str] = []
         for a in soup.select("a[href]"):
-            href = a.get("href") or ""
-            if "hubcloud." in href and "/drive/" in href:
-                return await resolve_hubcloud(href)
-    raise HTTPException(502, "HubDrive: no HubCloud mirror found")
-
-
-
-
-def _rot13(s: str) -> str:
-    out = []
-    for ch in s:
-        if "a" <= ch <= "z":
-            out.append(chr((ord(ch) - 97 + 13) % 26 + 97))
-        elif "A" <= ch <= "Z":
-            out.append(chr((ord(ch) - 65 + 13) % 26 + 65))
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def _b64_str(s: str) -> str:
-    pad = (-len(s)) % 4
-    return base64.b64decode(s + ("=" * pad)).decode("utf-8", errors="strict")
-
-
-def _decode_greenmotors_payload(payload: str) -> Optional[str]:
-    """greenmotors localStorage `o`: atob → atob → rot13 → atob → JSON → o → atob → hubcloud URL."""
-    try:
-        s = payload.strip()
-        s = _b64_str(s)
-        s = _b64_str(s)
-        s = _rot13(s)
-        s = _b64_str(s)
-        data = json.loads(s)
-        inner = data.get("o") or data.get("url") or ""
-        if not inner:
-            return None
-        url = _b64_str(inner) if not inner.startswith("http") else inner
-        if url.startswith("https://") and ("hubcloud." in url or "hubdrive." in url):
-            return url
-    except Exception:
-        return None
-    return None
-
-
-async def _resolve_masked_hub(url: str) -> List[dict]:
-    """Follow greenmotors / similar gates → HubCloud /drive/ → direct mirrors."""
-    headers = {
-        "User-Agent": FK_UA,
-        "Referer": "https://4khdhub.one/",
-        "Accept": "text/html,application/xhtml+xml",
-    }
-    out: List[dict] = []
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0, headers=headers) as client:
-        r = await client.get(url)
-        text = r.text or ""
-        final = str(r.url)
-        candidates: List[str] = []
-
-        # 1) Decode greenmotors s('o','...') payload
-        for m in re.finditer(r"s\(\s*['\"]o['\"]\s*,\s*['\"]([^'\"]+)['\"]", text):
-            decoded = _decode_greenmotors_payload(m.group(1))
-            if decoded:
-                candidates.append(decoded)
-
-        # 2) Any hubcloud/hubdrive already in HTML
-        for u in re.findall(r"https?://[^\s\"'<>]+", text + " " + final):
-            u = u.rstrip(").,;'\"")
-            if "hubcloud." in u and "/drive/" in u:
-                candidates.append(u.split("&")[0])
-            if "hubdrive." in u and "/file/" in u:
-                candidates.append(u.split("&")[0])
-
-        # 3) If still on greenmotors, fetch mediator with cookie and scan
-        if "greenmotors." in final or "greenmotors." in url:
-            try:
-                client.cookies.set("xla", "s4t")
-                r2 = await client.get(
-                    "https://greenmotors.cc/homelander/",
-                    headers={**headers, "Referer": final},
-                )
-                t2 = r2.text or ""
-                for m in re.finditer(r"https://hubcloud\.[a-z.]+/drive/[a-zA-Z0-9]+", t2):
-                    candidates.append(m.group(0))
-                for m in re.finditer(r"s\(\s*['\"]o['\"]\s*,\s*['\"]([^'\"]+)['\"]", t2):
-                    decoded = _decode_greenmotors_payload(m.group(1))
-                    if decoded:
-                        candidates.append(decoded)
-            except Exception:
-                pass
-
+            href = (a.get("href") or "").strip()
+            text = a.get_text(" ", strip=True)
+            if "hubcloud" in href.lower() or "hubcloud" in text.lower():
+                if href.startswith("/"):
+                    href = str(r.url).rstrip("/") + href  # unlikely
+                if href.startswith("http") and href not in hub_links:
+                    hub_links.append(href)
+        # relative hubcloud sometimes
+        if not hub_links:
+            m = re.search(r"https?://hubcloud\.[a-z.]+/drive/[A-Za-z0-9_-]+", r.text)
+            if m:
+                hub_links.append(m.group(0))
+        if not hub_links:
+            raise HTTPException(502, "HubDrive: HubCloud server link not found")
+        all_links: List[dict] = []
         seen = set()
-        for c in candidates:
-            if c in seen:
-                continue
-            seen.add(c)
+        for hl in hub_links[:3]:
             try:
-                out.extend(await resolve_any(c))
+                part = await resolve_hubcloud(hl)
+                for item in part:
+                    u = item.get("url")
+                    if u and u not in seen:
+                        seen.add(u)
+                        item = dict(item)
+                        item["hubdrive"] = file_url
+                        item["hubcloud"] = hl
+                        if title and not item.get("title"):
+                            item["title"] = title
+                        all_links.append(item)
             except Exception:
                 continue
-            if len(out) >= 8:
-                break
-    return out
+        if not all_links:
+            raise HTTPException(502, "HubDrive: could not resolve HubCloud mirrors")
+        return all_links
 
 
 async def resolve_any(url: str) -> List[dict]:
     u = url.strip()
-    if "hubcloud." in u and "/drive/" in u:
+    low = u.lower()
+    if "hubcloud." in low and "/drive/" in low:
         return await resolve_hubcloud(u)
-    if "hubdrive." in u:
+    if "hubdrive." in low:
         return await resolve_hubdrive(u)
-    raise HTTPException(400, "Supported: hubcloud.*/drive/... or hubdrive.*/file/...")
+    if "gamerxyt.com/hubcloud.php" in low:
+        # treat as already-resolved generator page — wrap as drive if possible
+        m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", u)
+        if m:
+            return await resolve_hubcloud(f"https://hubcloud.ist/drive/{m.group(1)}")
+    if "pixeldrain." in low:
+        api = _pixeldrain_api(u)
+        if api:
+            return [{"label": "PixelDrain", "url": api, "priority": 10, "direct": True, "source": "pixeldrain"}]
+    raise HTTPException(400, "Supported: hubcloud.*/drive/..., hubdrive.*/file/..., pixeldrain")
 
 
 # =============================================================================
@@ -1595,6 +1578,35 @@ async def tools_resolve(url: str = Query(..., description="hubcloud.*/drive/... 
     """
     links = await resolve_any(url)
     return {"input": url, "count": len(links), "direct_links": links}
+
+@app.get("/tools/hubcloud", tags=["Tools"])
+async def tools_hubcloud(url: str = Query(..., description="https://hubcloud.ist/drive/xxx")):
+    """Resolve HubCloud drive page → all direct mirrors (FSL, PixelDrain, 10Gbps, Watch…)."""
+    links = await resolve_hubcloud(url)
+    return {"ok": True, "count": len(links), "links": links, "input": url}
+
+
+@app.get("/tools/hubdrive", tags=["Tools"])
+async def tools_hubdrive(url: str = Query(..., description="https://hubdrive.pics/file/xxx")):
+    """Resolve HubDrive file → HubCloud → direct mirrors."""
+    links = await resolve_hubdrive(url)
+    return {"ok": True, "count": len(links), "links": links, "input": url}
+
+
+@app.get("/tools/resolve/batch", tags=["Tools"])
+async def tools_resolve_batch(urls: str = Query(..., description="Comma-separated HubCloud/HubDrive URLs")):
+    """Resolve many Hub links at once."""
+    parts = [u.strip() for u in urls.split(",") if u.strip()]
+    out = []
+    for u in parts[:15]:
+        try:
+            links = await resolve_any(u)
+            out.append({"input": u, "ok": True, "count": len(links), "links": links})
+        except Exception as e:
+            out.append({"input": u, "ok": False, "error": str(e)})
+    return {"results": out}
+
+
 
 
 # ----- Aggregate -----
@@ -2702,28 +2714,117 @@ def _music_proxy_url(audio_url: str) -> str:
 # DOWNLOADER (OmniGet-inspired · yt-dlp probe + direct links)
 # =============================================================================
 
+def _extract_youtube_id(url: str) -> Optional[str]:
+    m = re.search(
+        r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|embed/|shorts/|live/)|youtube-nocookie\.com/embed/)([A-Za-z0-9_-]{11})",
+        url,
+    )
+    return m.group(1) if m else None
+
+
 def _ytdlp_info(url: str) -> dict:
-    """Extract media metadata + formats without downloading (OmniGet-style probe)."""
+    """Extract media + direct URLs. YouTube: android client first, then embed fallback."""
     try:
         import yt_dlp  # type: ignore
     except ImportError:
-        return {"ok": False, "error": "yt-dlp not installed — pip install yt-dlp"}
-    opts = {
+        return {"ok": False, "error": "yt-dlp not installed — add yt-dlp to requirements"}
+
+    url = (url or "").strip()
+    yt_id = _extract_youtube_id(url)
+    is_yt = bool(yt_id)
+
+    def _run(opts: dict):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    base_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
         "extract_flat": False,
         "socket_timeout": 25,
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        "retries": 1,
     }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:400]}
+
+    info = None
+    last_err = None
+    attempts = []
+    if is_yt:
+        attempts = [
+            {**base_opts, "extractor_args": {"youtube": {"player_client": ["android"]}}},
+            {**base_opts, "extractor_args": {"youtube": {"player_client": ["android_creator"]}}},
+            {**base_opts, "extractor_args": {"youtube": {"player_client": ["ios"]}}},
+        ]
+    else:
+        attempts = [base_opts]
+
+    for opts in attempts:
+        try:
+            info = _run(opts)
+            if info:
+                break
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    # --- YouTube blocked: still return usable embed + metadata ---
+    if not info and is_yt and yt_id:
+        title = f"YouTube {yt_id}"
+        # try oembed for title
+        try:
+            import httpx as _hx
+            oe = _hx.get(
+                "https://www.youtube.com/oembed",
+                params={"url": f"https://www.youtube.com/watch?v={yt_id}", "format": "json"},
+                timeout=8.0,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if oe.status_code == 200:
+                title = (oe.json() or {}).get("title") or title
+        except Exception:
+            pass
+        embed = f"https://www.youtube.com/embed/{yt_id}?autoplay=1&rel=0"
+        watch = f"https://www.youtube.com/watch?v={yt_id}"
+        return {
+            "ok": True,
+            "mode": "embed",
+            "title": title,
+            "id": yt_id,
+            "extractor": "youtube-embed-fallback",
+            "thumbnail": f"https://i.ytimg.com/vi/{yt_id}/hqdefault.jpg",
+            "webpage_url": watch,
+            "embed_url": embed,
+            "download_url": None,
+            "formats": [
+                {
+                    "id": "embed",
+                    "label": "YouTube Embed (play in browser)",
+                    "kind": "embed",
+                    "ext": "embed",
+                    "url": embed,
+                }
+            ],
+            "format_count": 1,
+            "best": {"url": embed, "kind": "embed", "label": "YouTube Embed"},
+            "note": (
+                "Direct CDN blocked on this server IP (YouTube bot-check). "
+                "Use embed_url to play in an iframe, or host cookies.txt / different IP for direct links."
+            ),
+            "error_detail": (last_err or "")[:200],
+        }
+
     if not info:
-        return {"ok": False, "error": "no info"}
+        msg = last_err or "extract failed"
+        if "Sign in" in msg or "bot" in msg.lower():
+            msg = "YouTube bot-check blocked this server IP. Retry later or use cookies."
+        return {"ok": False, "error": msg[:500], "url": url}
+
+    if info.get("_type") == "playlist" and info.get("entries"):
+        ent = next((e for e in info["entries"] if e), None)
+        if ent:
+            info = ent
+
     formats = []
     seen = set()
     for f in info.get("formats") or []:
@@ -2732,89 +2833,84 @@ def _ytdlp_info(url: str) -> dict:
         fu = f.get("url")
         if not fu or fu in seen:
             continue
-        # skip storyboard / pure images
-        if f.get("vcodec") == "none" and f.get("acodec") == "none":
+        vcodec = f.get("vcodec") or "none"
+        acodec = f.get("acodec") or "none"
+        if vcodec == "none" and acodec == "none":
             continue
         seen.add(fu)
         height = f.get("height") or 0
-        abr = f.get("abr") or f.get("tbr") or 0
-        vcodec = f.get("vcodec") or "none"
-        acodec = f.get("acodec") or "none"
+        abr = f.get("abr") or 0
+        tbr = f.get("tbr") or 0
         ext = f.get("ext") or "mp4"
-        kind = "video" if vcodec != "none" else "audio"
+        if vcodec != "none" and acodec != "none":
+            kind = "video+audio"
+        elif vcodec != "none":
+            kind = "video"
+        else:
+            kind = "audio"
         label_parts = []
         if height:
             label_parts.append(f"{height}p")
-        if kind == "audio":
-            label_parts.append(f"{int(abr)}kbps" if abr else "audio")
+        elif kind == "audio":
+            label_parts.append(f"{int(abr or tbr)}kbps" if (abr or tbr) else "audio")
         label_parts.append(ext.upper())
-        if vcodec != "none" and acodec == "none":
+        if kind == "video":
             label_parts.append("video-only")
-        if vcodec == "none" and acodec != "none":
+        if kind == "audio":
             label_parts.append("audio-only")
+        if kind == "video+audio":
+            label_parts.append("🔊 muxed")
         formats.append({
             "id": f.get("format_id"),
-            "label": " · ".join(label_parts) or f.get("format") or "stream",
+            "label": " · ".join(label_parts) or "stream",
             "ext": ext,
-            "height": height,
-            "abr": abr,
+            "height": height or None,
+            "abr": abr or None,
             "vcodec": vcodec,
             "acodec": acodec,
-            "filesize": f.get("filesize") or f.get("filesize_approx"),
-            "url": fu,
             "kind": kind,
+            "url": fu,
         })
-    # Prefer progressive (video+audio muxed) — these play with sound when copied
-    def score(x):
-        prog = 2 if (x["vcodec"] != "none" and x["acodec"] != "none") else 0
-        audio_only = 1 if (x["vcodec"] == "none" and x["acodec"] != "none") else 0
-        return (prog, x.get("height") or 0, audio_only, x.get("abr") or 0)
-    formats.sort(key=score, reverse=True)
-    # Tag progressive clearly
-    for x in formats:
-        if x["vcodec"] != "none" and x["acodec"] != "none":
-            if "VIDEO+AUDIO" not in x["label"]:
-                x["label"] = "🔊 " + x["label"] + " · VIDEO+AUDIO"
-            x["muxed"] = True
-        else:
-            x["muxed"] = False
-    formats = formats[:40]
-    best_muxed = next((f for f in formats if f.get("muxed")), None)
-    best_audio = next((f for f in formats if f.get("kind") == "audio" or (f.get("acodec") and f["acodec"] != "none" and f.get("vcodec") == "none")), None)
-    thumb = None
-    ths = info.get("thumbnails") or []
-    if ths:
-        thumb = ths[-1].get("url")
-    thumb = thumb or info.get("thumbnail")
+
+    def _sk(x):
+        k = x.get("kind")
+        pri = 0 if k == "video+audio" else (1 if k == "video" else 2)
+        return (pri, -(x.get("height") or 0), -(x.get("abr") or 0))
+
+    formats.sort(key=_sk)
+    thumb = info.get("thumbnail")
+    if not thumb and info.get("thumbnails"):
+        try:
+            thumb = info["thumbnails"][-1].get("url")
+        except Exception:
+            pass
+
     return {
         "ok": True,
+        "title": info.get("title") or "media",
         "id": info.get("id"),
-        "title": info.get("title") or info.get("id"),
-        "uploader": info.get("uploader") or info.get("channel"),
-        "duration": info.get("duration"),
-        "webpage_url": info.get("webpage_url") or url,
-        "thumbnail": thumb,
-        "description": (info.get("description") or "")[:400],
         "extractor": info.get("extractor") or info.get("ie_key"),
+        "duration": info.get("duration"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "thumbnail": thumb,
+        "webpage_url": info.get("webpage_url") or url,
         "formats": formats,
-        "count": len(formats),
-        "best_muxed": best_muxed,
-        "best_audio": best_audio,
-        "note": "Prefer 🔊 VIDEO+AUDIO rows — single file with sound. Video-only needs separate audio.",
-        "provider": "yt-dlp",
+        "format_count": len(formats),
+        "best": formats[0] if formats else None,
+        "note": "Direct URLs expire — re-extract if needed",
     }
 
 
 
 @app.get("/dl/info", tags=["Downloader"])
 async def dl_info(url: str = Query(..., min_length=8)):
-    """Probe URL with yt-dlp — list formats (muxed preferred)."""
+    """Probe any media page (yt-dlp) — list formats + direct URLs."""
     url = url.strip()
     if not re.match(r"^https?://", url, re.I):
         raise HTTPException(400, "url must start with http(s)://")
     data = await asyncio.to_thread(_ytdlp_info, url)
     if not data.get("ok"):
-        return JSONResponse(data, status_code=502)
+        return JSONResponse(data, status_code=422)
     return data
 
 
@@ -2823,7 +2919,7 @@ async def dl_audio(url: str = Query(..., min_length=8)):
     """Best audio-only stream for a page URL."""
     data = await asyncio.to_thread(_ytdlp_info, url)
     if not data.get("ok"):
-        return JSONResponse(data, status_code=502)
+        return JSONResponse(data, status_code=422)
     auds = [f for f in data.get("formats") or [] if f.get("kind") == "audio"]
     best = auds[0] if auds else None
     if not best:
@@ -2840,28 +2936,165 @@ async def dl_audio(url: str = Query(..., min_length=8)):
     }
 
 
+@app.get("/dl/smart", tags=["Downloader"])
+async def dl_smart(url: str = Query(..., min_length=8)):
+    """Prefer muxed file; else video+audio pair for /dl/combine."""
+    data = await asyncio.to_thread(_ytdlp_info, url)
+    if not data.get("ok"):
+        return JSONResponse(data, status_code=422)
+    formats = data.get("formats") or []
+    muxed = [f for f in formats if f.get("kind") == "video+audio"]
+    videos = [f for f in formats if f.get("kind") == "video"]
+    audios = [f for f in formats if f.get("kind") == "audio"]
+    title = data.get("title") or "video"
+    if muxed:
+        return {
+            "ok": True,
+            "mode": "progressive",
+            "title": title,
+            "download_url": muxed[0].get("url"),
+            "format": muxed[0],
+            "note": "Has audio+video — no merge needed",
+            "thumbnail": data.get("thumbnail"),
+        }
+    if videos and audios:
+        v, a = videos[0], audios[0]
+        return {
+            "ok": True,
+            "mode": "merge",
+            "title": title,
+            "video": v,
+            "audio": a,
+            "combine_post": {"video": v.get("url"), "audio": a.get("url"), "title": title},
+            "note": "POST /dl/combine to merge (needs ffmpeg on server)",
+            "thumbnail": data.get("thumbnail"),
+        }
+    if videos:
+        return {"ok": True, "mode": "video_only", "title": title, "download_url": videos[0].get("url"), "format": videos[0]}
+    if audios:
+        return {"ok": True, "mode": "audio_only", "title": title, "download_url": audios[0].get("url"), "format": audios[0]}
+    return JSONResponse({"ok": False, "error": "no formats"}, status_code=422)
 
-def _cdn_headers(url: str) -> dict:
-    """Headers so Instagram/FB/TikTok CDNs accept the request."""
-    h = {
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-        ),
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
+
+@app.get("/dl/extract", tags=["Downloader"])
+async def dl_extract(url: str = Query(..., min_length=8)):
+    """Universal format list (yt-dlp · 1000+ sites)."""
+    url = url.strip()
+    if not re.match(r"^https?://", url, re.I):
+        raise HTTPException(400, "url must start with http(s)://")
+    data = await asyncio.to_thread(_ytdlp_info, url)
+    if not data.get("ok"):
+        return JSONResponse(data, status_code=422)
+    return data
+
+
+@app.get("/dl/any", tags=["Downloader"])
+async def dl_any(url: str = Query(..., min_length=8)):
+    """
+    One endpoint for everything:
+    HubCloud / HubDrive / PixelDrain / YouTube / TikTok / Instagram / X / Facebook / …
+    """
+    url = url.strip()
+    if not re.match(r"^https?://", url, re.I):
+        raise HTTPException(400, "url must start with http(s)://")
+    low = url.lower()
+    try:
+        if "hubcloud." in low and "/drive/" in low:
+            links = await resolve_hubcloud(url)
+            return {"ok": True, "provider": "hubcloud", "count": len(links), "links": links, "input": url}
+        if "hubdrive." in low:
+            links = await resolve_hubdrive(url)
+            return {"ok": True, "provider": "hubdrive", "count": len(links), "links": links, "input": url}
+        if "pixeldrain." in low or "pixeldra.in" in low:
+            api = _pixeldrain_api(url)
+            if api:
+                return {
+                    "ok": True,
+                    "provider": "pixeldrain",
+                    "count": 1,
+                    "links": [{"label": "PixelDrain", "url": api, "direct": True}],
+                    "input": url,
+                }
+    except HTTPException as e:
+        return JSONResponse({"ok": False, "provider": "hub", "error": e.detail, "input": url}, status_code=422)
+    except Exception as e:
+        return JSONResponse({"ok": False, "provider": "hub", "error": str(e)[:300], "input": url}, status_code=422)
+
+    data = await asyncio.to_thread(_ytdlp_info, url)
+    if not data.get("ok"):
+        return JSONResponse({"ok": False, "provider": "yt-dlp", "error": data.get("error"), "input": url}, status_code=422)
+
+    # Embed fallback (YouTube IP block)
+    if data.get("mode") == "embed" or data.get("embed_url"):
+        return {
+            "ok": True,
+            "provider": "youtube-embed",
+            "mode": "embed",
+            "title": data.get("title"),
+            "thumbnail": data.get("thumbnail"),
+            "embed_url": data.get("embed_url"),
+            "webpage_url": data.get("webpage_url"),
+            "formats": data.get("formats") or [],
+            "input": url,
+            "note": data.get("note"),
+        }
+
+    formats = data.get("formats") or []
+    muxed = [f for f in formats if f.get("kind") == "video+audio"]
+    videos = [f for f in formats if f.get("kind") == "video"]
+    audios = [f for f in formats if f.get("kind") == "audio"]
+    result = {
+        "ok": True,
+        "provider": "yt-dlp",
+        "extractor": data.get("extractor"),
+        "title": data.get("title"),
+        "thumbnail": data.get("thumbnail"),
+        "duration": data.get("duration"),
+        "webpage_url": data.get("webpage_url"),
+        "formats": formats,
+        "input": url,
     }
-    u = (url or "").lower()
-    if "instagram" in u or "cdninstagram" in u or "fbcdn" in u:
-        h["Referer"] = "https://www.instagram.com/"
-        h["Origin"] = "https://www.instagram.com"
-    elif "tiktok" in u or "musical.ly" in u:
-        h["Referer"] = "https://www.tiktok.com/"
-    elif "youtube" in u or "googlevideo" in u:
-        h["Referer"] = "https://www.youtube.com/"
-    elif "twitter" in u or "twimg" in u or "x.com" in u:
-        h["Referer"] = "https://x.com/"
-    return h
+    if muxed:
+        result["mode"] = "progressive"
+        result["download_url"] = muxed[0].get("url")
+        result["best"] = muxed[0]
+        result["note"] = "Single file with audio+video"
+    elif videos and audios:
+        result["mode"] = "merge"
+        result["video"] = videos[0]
+        result["audio"] = audios[0]
+        result["combine_post"] = {
+            "video": videos[0].get("url"),
+            "audio": audios[0].get("url"),
+            "title": data.get("title") or "video",
+        }
+        result["note"] = "POST /dl/combine to merge (ffmpeg)"
+    elif videos:
+        result["mode"] = "video_only"
+        result["download_url"] = videos[0].get("url")
+        result["best"] = videos[0]
+    elif audios:
+        result["mode"] = "audio_only"
+        result["download_url"] = audios[0].get("url")
+        result["best"] = audios[0]
+    else:
+        return JSONResponse({"ok": False, "error": "no playable formats", "input": url}, status_code=422)
+    return result
+
+
+@app.get("/dl/sites", tags=["Downloader"])
+async def dl_sites():
+    return {
+        "ok": True,
+        "engine": "yt-dlp (android client for YouTube) + HubCloud/HubDrive",
+        "endpoints": {
+            "universal": "GET /dl/any?url=",
+            "formats": "GET /dl/extract?url=",
+            "smart": "GET /dl/smart?url=",
+            "combine": "POST /dl/combine",
+        },
+        "note": "YouTube uses android player client (no cookies). Direct URLs expire.",
+    }
 
 
 async def _combine_streams(video: str, audio: str, title: str = "video"):
@@ -4589,6 +4822,61 @@ body{background:var(--bg);background-image:radial-gradient(ellipse 80% 50% at 20
 .an-watch-top .btn{border-radius:12px}
 .an-eps .ep{min-width:52px;justify-content:center}
 
+
+/* Clean anime player */
+.an-load{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:220px;gap:12px;color:var(--mute)}
+.an-spin{width:36px;height:36px;border:3px solid rgba(45,212,191,.25);border-top-color:#2dd4bf;border-radius:50%;animation:an-rot .7s linear infinite}
+@keyframes an-rot{to{transform:rotate(360deg)}}
+.an-iframe{width:100%;aspect-ratio:16/9;border:0;background:#000;border-radius:16px}
+.vlc-shell,.an-watch #anime-player{border-radius:16px;overflow:hidden;background:#000;border:1px solid rgba(255,255,255,.08);box-shadow:0 16px 48px rgba(0,0,0,.45)}
+.vlc-stage{position:relative;width:100%;aspect-ratio:16/9;background:#000}
+.vlc-stage video{width:100%;height:100%;object-fit:contain;background:#000;display:block}
+/* hide any native controls if browser forces them */
+.vlc-stage video::-webkit-media-controls{display:none!important}
+.vlc-overlay{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;
+  background:linear-gradient(180deg,rgba(0,0,0,.75) 0%,transparent 35%,transparent 55%,rgba(0,0,0,.9) 100%);
+  opacity:0;transition:opacity .2s ease;pointer-events:none;z-index:5}
+.vlc-overlay.show{opacity:1;pointer-events:auto}
+.vlc-top{display:flex;align-items:center;gap:8px;padding:10px 12px}
+.vlc-badge{font-size:.6rem;font-weight:800;background:linear-gradient(135deg,#2dd4bf,#38bdf8);color:#041016;padding:3px 8px;border-radius:6px}
+.vlc-live-title{flex:1;font-size:.8rem;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vlc-center{flex:1;display:flex;align-items:center;justify-content:center;pointer-events:auto}
+.vlc-big{width:64px;height:64px;border-radius:50%;border:none;cursor:pointer;
+  background:rgba(255,255,255,.18);backdrop-filter:blur(12px);color:#fff;font-size:24px;
+  box-shadow:0 8px 28px rgba(0,0,0,.4);transition:transform .15s,background .15s}
+.vlc-big:hover,.vlc-big.playing{background:rgba(45,212,191,.35);transform:scale(1.05)}
+.vlc-bottom{padding:4px 10px 10px;pointer-events:auto}
+.vlc-progress-wrap input[type=range]{width:100%;height:4px;accent-color:#2dd4bf;cursor:pointer}
+.vlc-times{display:flex;justify-content:space-between;font-size:.65rem;color:rgba(255,255,255,.7);margin-top:2px;font-variant-numeric:tabular-nums}
+.vlc-controls{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-top:6px}
+.vlc-ico{width:34px;height:34px;border-radius:10px;border:1px solid rgba(255,255,255,.1);
+  background:rgba(255,255,255,.08);color:#fff;cursor:pointer;font-size:13px;
+  display:inline-flex;align-items:center;justify-content:center;padding:0}
+.vlc-ico:hover,.vlc-play-main{background:rgba(45,212,191,.22);border-color:rgba(45,212,191,.35)}
+.vlc-vol{display:flex;align-items:center;gap:2px}
+.vlc-vol input{width:64px;accent-color:#2dd4bf}
+.vlc-spacer{flex:1;min-width:4px}
+.vlc-sel{font-size:.58rem;color:rgba(255,255,255,.5);display:flex;align-items:center;gap:3px;font-weight:700;text-transform:uppercase}
+.vlc-sel select{background:#141820;color:#fff;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:5px 6px;font-size:.72rem;max-width:72px}
+.vlc-shell:fullscreen,.vlc-shell:-webkit-full-screen,
+#anime-player:fullscreen,#anime-player:-webkit-full-screen{width:100vw!important;height:100vh!important;border-radius:0!important;background:#000}
+#anime-player:fullscreen .vlc-stage,#anime-player:-webkit-full-screen .vlc-stage{height:100%!important;aspect-ratio:auto!important}
+#anime-player:fullscreen video,#anime-player:-webkit-full-screen video{height:100%!important}
+.an-watch{max-width:960px;margin:0 auto;padding-bottom:40px}
+.an-watch-top{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.an-watch-title{font-weight:700;font-size:1.05rem;line-height:1.3}
+.an-nav-ep{display:flex;gap:8px;margin:12px 0}
+.an-ep-title{margin:16px 0 8px;font-size:1rem}
+.an-eps{display:flex;flex-wrap:wrap;gap:6px}
+.an-eps .ep{min-width:48px;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer;font-size:.78rem}
+.an-eps .ep.on{background:linear-gradient(135deg,#2dd4bf,#38bdf8);color:#041016;border-color:transparent;font-weight:700}
+.an-eps .ep:hover{border-color:rgba(45,212,191,.4)}
+@media(max-width:520px){
+  .vlc-big{width:56px;height:56px;font-size:20px}
+  .vlc-sel select{max-width:64px;padding:4px 5px;font-size:.68rem}
+  .vlc-vol input{width:48px}
+}
+
 </style></head>
 <body>
 <div class="app">
@@ -4875,58 +5163,64 @@ async function animePlayStream(slug, idx){
   const box=document.getElementById('anime-player');
   if(!box)return;
   try{
-    box.innerHTML='<div class="empty">Loading stream…</div>';
+    box.innerHTML='<div class="an-load"><div class="an-spin"></div><p>Loading stream…</p></div>';
     let url='';
     if(ep.stream_url) url=ep.stream_url;
     else if(ep.video_hash){
       const s=await api('/anime/stream?hash='+encodeURIComponent(ep.video_hash));
       url=s.stream_url||'';
     }
-    if(!url){box.innerHTML='<div class="empty err">No stream URL</div>';return}
+    if(!url){box.innerHTML='<div class="empty err">No stream</div>';return}
     if(/embed|vidmoly|abyss|filesforever/i.test(url)){
-      box.innerHTML=`<iframe src="${esc(url)}" allowfullscreen allow="autoplay; encrypted-media; picture-in-picture" style="width:100%;aspect-ratio:16/9;border:0;background:#000"></iframe>`;
+      box.innerHTML=`<iframe src="${esc(url)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture" class="an-iframe"></iframe>`;
       return;
     }
     const isHls=/\.m3u8(\?|$)/i.test(url);
     const playUrl=isHls?('/anime/hls?u='+encodeURIComponent(url)):url;
-    const title=esc((window.__animeMeta&&window.__animeMeta.title)||'')+' · EP '+(ep.episode||idx+1);
+    const titleTxt=((window.__animeMeta&&window.__animeMeta.title)||'')+' · EP '+(ep.episode||idx+1);
     box.innerHTML=`
-      <div class="vlc-stage">
-        <video id="av" playsinline webkit-playsinline crossorigin="anonymous" controls controlslist="nodownload"></video>
+      <div class="vlc-stage" id="vlc-stage">
+        <video id="av" playsinline webkit-playsinline crossorigin="anonymous" preload="auto"></video>
         <div class="vlc-overlay show" id="vlc-ov">
           <div class="vlc-top">
             <span class="vlc-badge">HLS</span>
-            <span class="vlc-live-title">${title}</span>
-            <button type="button" class="vlc-ico vlc-fs-top" id="v-fs" title="Fullscreen">⛶</button>
+            <span class="vlc-live-title">${esc(titleTxt)}</span>
+            <button type="button" class="vlc-ico" id="v-fs" title="Fullscreen">⛶</button>
           </div>
-          <div class="vlc-center"><button type="button" class="vlc-big" id="v-bigplay">▶</button></div>
+          <div class="vlc-center">
+            <button type="button" class="vlc-big" id="v-bigplay" aria-label="Play">▶</button>
+          </div>
           <div class="vlc-bottom">
             <div class="vlc-progress-wrap">
-              <input type="range" id="v-seek" min="0" max="1000" value="0" class="vlc-seek"/>
+              <input type="range" id="v-seek" min="0" max="1000" value="0" step="1"/>
               <div class="vlc-times"><span id="v-cur">0:00</span><span id="v-dur">0:00</span></div>
             </div>
             <div class="vlc-controls">
-              <button type="button" class="vlc-ico" id="v-prev">⏮</button>
-              <button type="button" class="vlc-ico" id="v-play">▶</button>
-              <button type="button" class="vlc-ico" id="v-next">⏭</button>
-              <button type="button" class="vlc-ico" id="v-stop">⏹</button>
+              <button type="button" class="vlc-ico" id="v-prev" title="Previous">⏮</button>
+              <button type="button" class="vlc-ico vlc-play-main" id="v-play" title="Play">▶</button>
+              <button type="button" class="vlc-ico" id="v-next" title="Next">⏭</button>
               <div class="vlc-vol">
                 <button type="button" class="vlc-ico" id="v-mute">🔊</button>
                 <input type="range" id="v-vol" min="0" max="1" step="0.05" value="1"/>
               </div>
               <div class="vlc-spacer"></div>
-              <button type="button" class="vlc-ico" id="v-pip">⧉</button>
-              <button type="button" class="vlc-ico" id="v-fs2">⛶</button>
-            </div>
-            <div class="vlc-menu">
-              <label>Speed<select id="v-speed">
-                <option value="0.5">0.5×</option><option value="0.75">0.75×</option>
-                <option value="1" selected>1×</option><option value="1.25">1.25×</option>
-                <option value="1.5">1.5×</option><option value="2">2×</option>
-              </select></label>
-              <label>Quality<select id="av-quality"><option value="-1">Auto</option></select></label>
-              <label>Audio<select id="av-audio"><option value="-1">…</option></select></label>
-              <label>Subs<select id="av-subs"><option value="-1">Off</option></select></label>
+              <label class="vlc-sel">Q
+                <select id="av-quality"><option value="-1">Auto</option></select>
+              </label>
+              <label class="vlc-sel">A
+                <select id="av-audio"><option value="-1">…</option></select>
+              </label>
+              <label class="vlc-sel">S
+                <select id="v-speed">
+                  <option value="0.75">0.75×</option>
+                  <option value="1" selected>1×</option>
+                  <option value="1.25">1.25×</option>
+                  <option value="1.5">1.5×</option>
+                  <option value="2">2×</option>
+                </select>
+              </label>
+              <button type="button" class="vlc-ico" id="v-pip" title="PiP">⧉</button>
+              <button type="button" class="vlc-ico" id="v-fs2" title="Fullscreen">⛶</button>
             </div>
           </div>
         </div>
@@ -4935,149 +5229,183 @@ async function animePlayStream(slug, idx){
     const ov=document.getElementById('vlc-ov');
     const qSel=document.getElementById('av-quality');
     const aSel=document.getElementById('av-audio');
-    const sSel=document.getElementById('av-subs');
     if(window.__hls){try{window.__hls.destroy()}catch(e){} window.__hls=null;}
-    function fmt(s){if(!isFinite(s)||s<0)return '0:00';const m=Math.floor(s/60),sec=Math.floor(s%60);return m+':'+String(sec).padStart(2,'0');}
+
+    function fmt(s){
+      if(!isFinite(s)||s<0) return '0:00';
+      s=Math.floor(s);
+      const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60;
+      if(h>0) return h+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');
+      return m+':'+String(sec).padStart(2,'0');
+    }
     function setPlaying(on){
       const a=document.getElementById('v-play'), b=document.getElementById('v-bigplay');
       if(a) a.textContent=on?'⏸':'▶';
-      if(b){b.textContent=on?'⏸':'▶'; b.style.opacity=on?'0':'1';}
+      if(b){ b.textContent=on?'⏸':'▶'; b.classList.toggle('playing',on); }
     }
-    function togglePlay(){if(v.paused){v.play().then(()=>setPlaying(true)).catch(()=>{});}else{v.pause();setPlaying(false);}}
+    function doPlay(){
+      const p=v.play();
+      if(p&&p.then) p.then(()=>setPlaying(true)).catch(()=>{ setPlaying(false); toast('Tap ▶ to play'); });
+      else setPlaying(!v.paused);
+    }
+    function togglePlay(){ if(v.paused) doPlay(); else { v.pause(); setPlaying(false); } }
     function goFs(){
       const el=box;
       try{
-        if(document.fullscreenElement||document.webkitFullscreenElement){(document.exitFullscreen||document.webkitExitFullscreen).call(document);}
-        else{(el.requestFullscreen||el.webkitRequestFullscreen).call(el);}
-      }catch(e){try{if(v.webkitEnterFullscreen)v.webkitEnterFullscreen();}catch(e2){toast('Fullscreen blocked');}}
+        if(document.fullscreenElement||document.webkitFullscreenElement)
+          (document.exitFullscreen||document.webkitExitFullscreen).call(document);
+        else (el.requestFullscreen||el.webkitRequestFullscreen).call(el);
+      }catch(e){
+        try{ if(v.webkitEnterFullscreen) v.webkitEnterFullscreen(); }catch(e2){ toast('Fullscreen blocked'); }
+      }
     }
+
     document.getElementById('v-play').onclick=togglePlay;
     document.getElementById('v-bigplay').onclick=togglePlay;
-    document.getElementById('v-stop').onclick=()=>{v.pause();v.currentTime=0;setPlaying(false);};
-    document.getElementById('v-vol').oninput=function(){v.volume=+this.value;document.getElementById('v-mute').textContent=(v.volume===0||v.muted)?'🔇':'🔊';};
-    document.getElementById('v-mute').onclick=()=>{v.muted=!v.muted;document.getElementById('v-mute').textContent=v.muted?'🔇':'🔊';};
-    document.getElementById('v-speed').onchange=function(){v.playbackRate=+this.value;};
+    document.getElementById('v-mute').onclick=()=>{ v.muted=!v.muted; document.getElementById('v-mute').textContent=v.muted?'🔇':'🔊'; };
+    document.getElementById('v-vol').oninput=function(){ v.volume=+this.value; v.muted=false; document.getElementById('v-mute').textContent=v.volume===0?'🔇':'🔊'; };
+    document.getElementById('v-speed').onchange=function(){ v.playbackRate=+this.value; };
     const seek=document.getElementById('v-seek');
-    seek.oninput=function(){if(v.duration)v.currentTime=(+this.value/1000)*v.duration;};
-    v.ontimeupdate=()=>{
+    let seeking=false;
+    seek.addEventListener('input', function(){ seeking=true; if(v.duration) document.getElementById('v-cur').textContent=fmt((+this.value/1000)*v.duration); });
+    seek.addEventListener('change', function(){ if(v.duration) v.currentTime=(+this.value/1000)*v.duration; seeking=false; });
+    v.addEventListener('timeupdate', function(){
+      if(seeking) return;
       document.getElementById('v-cur').textContent=fmt(v.currentTime);
       document.getElementById('v-dur').textContent=fmt(v.duration||0);
       if(v.duration) seek.value=Math.floor((v.currentTime/v.duration)*1000);
-    };
-    v.onplay=()=>setPlaying(true); v.onpause=()=>setPlaying(false);
+    });
+    v.addEventListener('loadedmetadata', function(){
+      document.getElementById('v-dur').textContent=fmt(v.duration||0);
+    });
+    v.addEventListener('play', ()=>setPlaying(true));
+    v.addEventListener('pause', ()=>setPlaying(false));
+    v.addEventListener('waiting', ()=>{ /* buffering */ });
+    v.addEventListener('playing', ()=>setPlaying(true));
     document.getElementById('v-fs').onclick=goFs;
     document.getElementById('v-fs2').onclick=goFs;
-    document.getElementById('v-pip').onclick=async()=>{try{if(document.pictureInPictureElement)await document.exitPictureInPicture();else await v.requestPictureInPicture();}catch(e){toast('PiP not supported');}};
-    document.getElementById('v-prev').onclick=()=>{if(idx>0)location.hash='#/anime/watch/'+encodeURIComponent(slug)+'?ep='+(idx-1);};
-    document.getElementById('v-next').onclick=()=>{if(idx<eps.length-1)location.hash='#/anime/watch/'+encodeURIComponent(slug)+'?ep='+(idx+1);};
-    let hideT=null;
-    const showOv=()=>{ov.classList.add('show');clearTimeout(hideT);hideT=setTimeout(()=>{if(!v.paused)ov.classList.remove('show');},3500);};
-    box.onmousemove=showOv; box.ontouchstart=showOv;
+    document.getElementById('v-pip').onclick=async()=>{
+      try{ if(document.pictureInPictureElement) await document.exitPictureInPicture(); else await v.requestPictureInPicture(); }
+      catch(e){ toast('PiP not supported'); }
+    };
+    document.getElementById('v-prev').onclick=()=>{ if(idx>0) location.hash='#/anime/watch/'+encodeURIComponent(slug)+'?ep='+(idx-1); };
+    document.getElementById('v-next').onclick=()=>{ if(idx<eps.length-1) location.hash='#/anime/watch/'+encodeURIComponent(slug)+'?ep='+(idx+1); };
 
-    function startHls(src){
-      if(!(window.Hls&&Hls.isSupported())) return false;
+    let hideT=null;
+    const showOv=()=>{
+      ov.classList.add('show');
+      clearTimeout(hideT);
+      hideT=setTimeout(()=>{ if(!v.paused) ov.classList.remove('show'); }, 3200);
+    };
+    box.addEventListener('mousemove', showOv);
+    box.addEventListener('touchstart', showOv, {passive:true});
+    // tap video toggles play when overlay hidden
+    v.addEventListener('click', function(e){ e.preventDefault(); showOv(); togglePlay(); });
+
+    if(isHls && window.Hls && Hls.isSupported()){
       const hls=new Hls({
         enableWorker:true,
+        lowLatencyMode:false,
+        backBufferLength:30,
         maxBufferLength:60,
         maxMaxBufferLength:120,
         capLevelToPlayerSize:true,
-        startLevel:-1,
-        fragLoadingMaxRetry:6,
-        manifestLoadingMaxRetry:4,
-        levelLoadingMaxRetry:4,
-        xhrSetup:function(xhr){try{xhr.withCredentials=false;}catch(e){}}
+        startLevel:0,
+        fragLoadingMaxRetry:8,
+        manifestLoadingMaxRetry:5,
+        levelLoadingMaxRetry:5,
+        fragLoadingRetryDelay:1000,
+        xhrSetup:function(xhr){ try{ xhr.withCredentials=false; }catch(e){} }
       });
       window.__hls=hls;
       window.__hlsSwitching=false;
-      function bindSelects(){
-        if(qSel) qSel.onchange=function(){
-          const i=parseInt(this.value,10);
-          window.__hlsSwitching=true;
-          if(i<0){hls.currentLevel=-1;hls.nextLevel=-1;toast('Quality: Auto');}
-          else{hls.currentLevel=i;hls.nextLevel=i;const lv=hls.levels[i];toast('Quality: '+(lv&&lv.height?lv.height+'p':'L'+i));}
-          setTimeout(()=>{window.__hlsSwitching=false;},1000);
-        };
-        if(aSel) aSel.onchange=function(){
-          const i=parseInt(this.value,10);
-          if(isNaN(i)||i<0)return;
-          try{hls.audioTrack=i;const tr=hls.audioTracks[i];toast('Audio: '+(tr&&(tr.name||tr.lang)||i));}catch(e){toast('Audio switch failed');}
-        };
-        if(sSel) sSel.onchange=function(){
-          const i=parseInt(this.value,10);
-          hls.subtitleDisplay=i>=0; hls.subtitleTrack=i;
-        };
-      }
+
       function fillTracks(){
-        if(window.__hlsSwitching)return;
-        if(qSel&&hls.levels&&hls.levels.length){
+        if(window.__hlsSwitching) return;
+        if(qSel && hls.levels && hls.levels.length){
           const cur=qSel.value;
           qSel.innerHTML='<option value="-1">Auto</option>'+hls.levels.map((lv,i)=>{
-            const h=lv.height||0; const br=lv.bitrate?Math.round(lv.bitrate/1000)+'k':'';
-            return '<option value="'+i+'">'+(h?h+'p':'L'+i)+(br?' · '+br:'')+'</option>';
+            const h=lv.height||0;
+            return '<option value="'+i+'">'+(h?h+'p':'L'+i)+'</option>';
           }).join('');
           if(cur!==''&&cur!=null) qSel.value=cur;
+          qSel.onchange=function(){
+            const i=parseInt(this.value,10);
+            window.__hlsSwitching=true;
+            hls.currentLevel=i; hls.nextLevel=i;
+            toast(i<0?'Quality: Auto':('Quality: '+(hls.levels[i]&&hls.levels[i].height?hls.levels[i].height+'p':i)));
+            setTimeout(()=>{window.__hlsSwitching=false;},800);
+          };
         }
         const tracks=hls.audioTracks||[];
-        if(aSel&&tracks.length){
+        if(aSel && tracks.length){
           const prev=aSel.value;
-          aSel.innerHTML=tracks.map((tr,i)=>'<option value="'+i+'">'+esc(tr.name||tr.lang||('Audio '+(i+1)))+'</option>').join('');
+          aSel.innerHTML=tracks.map((tr,i)=>'<option value="'+i+'">'+esc(tr.name||tr.lang||('A'+(i+1)))+'</option>').join('');
           if(prev!==''&&prev!=='-1'&&tracks[parseInt(prev,10)]) aSel.value=prev;
           else{
             let hi=tracks.findIndex(tr=>/hin|hindi/i.test((tr.name||'')+' '+(tr.lang||'')));
             if(hi<0) hi=0;
             aSel.value=String(hi);
-            try{hls.audioTrack=hi;}catch(e){}
+            try{ hls.audioTrack=hi; }catch(e){}
           }
+          aSel.onchange=function(){
+            const i=parseInt(this.value,10);
+            if(isNaN(i)||i<0) return;
+            try{ hls.audioTrack=i; toast('Audio: '+(tracks[i]&&(tracks[i].name||tracks[i].lang)||i)); }catch(e){ toast('Audio failed'); }
+          };
         }
-        if(sSel&&hls.subtitleTracks&&hls.subtitleTracks.length){
-          sSel.innerHTML='<option value="-1">Off</option>'+hls.subtitleTracks.map((tr,i)=>
-            '<option value="'+i+'">'+esc(tr.name||tr.lang||('Sub '+(i+1)))+'</option>').join('');
-        }
-        bindSelects();
       }
-      bindSelects();
-      hls.loadSource(src);
+
+      hls.loadSource(playUrl);
       hls.attachMedia(v);
       hls.on(Hls.Events.MANIFEST_PARSED, function(){
         fillTracks();
-        v.play().then(()=>setPlaying(true)).catch(()=>{ toast('Tap ▶ to play'); setPlaying(false); });
+        try{
+          if(hls.levels && hls.levels.length){
+            // start at lowest quality for reliable first frame on weak CDNs
+            const last=hls.levels.length-1;
+            hls.startLevel=last;
+            hls.currentLevel=last;
+            if(qSel) qSel.value=String(last);
+          }
+        }catch(e){}
+        doPlay();
       });
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, fillTracks);
-      hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, fillTracks);
       hls.on(Hls.Events.LEVEL_SWITCHED, function(){
-        if(qSel&&!window.__hlsSwitching&&hls.currentLevel>=0) qSel.value=String(hls.currentLevel);
+        if(qSel && !window.__hlsSwitching && hls.currentLevel>=0) qSel.value=String(hls.currentLevel);
       });
-      hls.on(Hls.Events.ERROR, function(ev,data){
+      hls.on(Hls.Events.ERROR, function(ev, data){
         if(!data||!data.fatal) return;
         console.warn('HLS fatal', data.type, data.details);
         if(data.type===Hls.ErrorTypes.NETWORK_ERROR){
-          try{hls.startLoad();}catch(e){}
-          toast('Buffering…');
-        } else if(data.type===Hls.ErrorTypes.MEDIA_ERROR){
-          try{hls.recoverMediaError();}catch(e){}
-        } else {
-          toast('Stream error — try Next episode');
+          try{ hls.startLoad(); }catch(e){}
+          setTimeout(function(){
+            if(v.readyState<2){
+              toast('CDN blocked — try another quality or episode');
+              try{ hls.destroy(); }catch(e){}
+              v.controls=true;
+              v.src=playUrl;
+              v.load();
+            }
+          }, 2500);
+        }
+        else if(data.type===Hls.ErrorTypes.MEDIA_ERROR){ try{ hls.recoverMediaError(); }catch(e){} }
+        else {
+          toast('Stream error: '+(data.details||''));
+          v.controls=true;
         }
       });
-      return true;
-    }
-
-    if(isHls){
-      if(!startHls(playUrl)){
-        // Safari native
-        if(v.canPlayType('application/vnd.apple.mpegurl')){
-          v.src=playUrl;
-          v.play().then(()=>setPlaying(true)).catch(()=>{});
-        } else {
-          box.innerHTML='<div class="empty err">HLS not supported in this browser</div>';
-        }
-      }
+    } else if(isHls && v.canPlayType('application/vnd.apple.mpegurl')){
+      v.src=playUrl;
+      doPlay();
     } else {
       v.src=playUrl;
-      v.play().then(()=>setPlaying(true)).catch(()=>{});
+      doPlay();
     }
-  }catch(e){box.innerHTML='<div class="empty err">'+esc(e.message)+'</div>';}
+  }catch(e){ box.innerHTML='<div class="empty err">'+esc(e.message)+'</div>'; }
 }
+
 
 
 
