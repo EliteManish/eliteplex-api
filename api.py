@@ -58,9 +58,12 @@ MB_HOSTS = [
     "https://api4sg.aoneroom.com",
     "https://api3.aoneroom.com",
     "https://api6sg.aoneroom.com",
+    "https://api7.aoneroom.com",
+    "https://api8.aoneroom.com",
     "https://api.inmoviebox.com",
 ]
 MB_SECRET = "76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O"
+STREAM_REFERER = "https://sportslive.wine"
 RETRY_CODES = {403, 406, 407, 429, 500, 502, 503, 504}
 
 _mb_token: Optional[str] = None
@@ -1428,40 +1431,155 @@ async def mb_detail(subject_id: str):
     return {"provider": "moviebox", "data": subject}
 
 
+
 @app.get("/mb/stream/{subject_id}", tags=["MovieBox"])
 async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
     """
-    Playable stream URLs (DASH / MP4 / HLS).
-    - Movie: se=0 & ep=0
-    - Series: se=1&ep=1 …
-    Each source includes `headers` (Cookie, User-Agent) required by the CDN.
+    **One play endpoint for a MovieBox subject_id.**
+
+    - `mp4` — progressive files if any (all phones)
+    - `sources` — DASH/MPD + headers (HEVC; use VLC)
+    - `qualities` — MPD broken into 1080/720/480
+    - `browser` — embed players (all phones)
+    - `play` — best single URL to open first
     """
     if se == 0 and ep == 0:
         path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}"
     else:
         path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={se}&ep={ep}"
+    data: dict = {}
     try:
         data = await mb_request("GET", path)
     except HTTPException:
-        data = await mb_request("GET", path.replace("/play-info/v2", "/play-info"))
+        try:
+            data = await mb_request("GET", path.replace("/play-info/v2", "/play-info"))
+        except HTTPException:
+            data = {}
     if not isinstance(data, dict):
         data = {}
+
     sources = _parse_mb_play_info(data, _mb_ua)
-    extra = await _mb_resource_links(subject_id, se, ep)
-    seen = {s["url"] for s in sources}
+    try:
+        extra = await _mb_resource_links(subject_id, se, ep)
+    except Exception:
+        extra = []
+    seen = {s.get("url") for s in sources}
     for item in extra:
-        if item["url"] not in seen:
+        if item.get("url") and item["url"] not in seen:
             sources.append(item)
             seen.add(item["url"])
+
+    referer = globals().get("STREAM_REFERER", "https://sportslive.wine")
+    for s in sources:
+        h = dict(s.get("headers") or {})
+        h.setdefault("User-Agent", _mb_ua)
+        h.setdefault("Referer", referer)
+        s["headers"] = h
+        s["play_url"] = s.get("url")
+
+    # Progressive MP4 only (real files)
+    mp4_list = []
+    for s in sources:
+        u = (s.get("url") or "").strip()
+        if not u or _is_dummy_url(u):
+            continue
+        if ".mpd" in u or ".m3u8" in u:
+            continue
+        if any(x in u.lower() for x in (".mp4", ".mkv", ".webm")):
+            mp4_list.append({
+                "label": s.get("resolution") or "MP4",
+                "url": u,
+                "headers": s.get("headers"),
+                "phone_friendly": True,
+            })
+
+    # Expand first MPD into qualities
+    qualities, audio = [], []
+    proxy_mpd = None
+    for s in sources:
+        u = s.get("url") or ""
+        if ".mpd" not in u:
+            continue
+        cookie = (s.get("headers") or {}).get("Cookie") or ""
+        try:
+            parsed = await _mb_expand_mpd(u, cookie, referer)
+            qualities = parsed.get("video") or []
+            audio = parsed.get("audio") or []
+            if cookie:
+                _mb_proxy_remember(u, cookie, referer)
+            proxy_mpd = f"/mb/proxy/mpd?u={quote(u, safe='')}"
+        except Exception as e:
+            qualities = [{"error": str(e)[:160]}]
+        break
+
+    # Title + browser embeds
+    title = data.get("title")
+    try:
+        det = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}")
+        subj = det.get("subject") or det
+        title = title or subj.get("title")
+    except Exception:
+        pass
+    browser, tmdb_id = [], None
+    if title:
+        try:
+            q = re.sub(r"\[.*?\]", "", title).strip()
+            tr = await _tmdb_get("/search/multi", {"query": q})
+            for res in (tr.get("results") or [])[:5]:
+                if res.get("media_type") not in ("movie", "tv"):
+                    continue
+                tmdb_id = res["id"]
+                media = res["media_type"]
+                browser = [
+                    {"provider": p, "url": u, "phone_friendly": True}
+                    for p, u in [
+                        ("vidsrc", f"https://vidsrc.to/embed/{media}/{tmdb_id}"),
+                        ("vidlink", f"https://vidlink.pro/{media}/{tmdb_id}"),
+                        ("videasy", f"https://player.videasy.net/{media}/{tmdb_id}"),
+                        ("vidking", f"https://www.vidking.net/embed/{media}/{tmdb_id}"),
+                    ]
+                ]
+                if media == "tv":
+                    for b in browser:
+                        b["url"] = b["url"].rstrip("/") + f"/{se or 1}/{ep or 1}"
+                break
+        except Exception:
+            pass
+
+    # Netplay catalog match → real progressive MP4
+    if title:
+        try:
+            for n in await _np_match_mp4(title, se, ep):
+                mp4_list.append(n)
+        except Exception:
+            pass
+
+    play = None
+    if mp4_list:
+        play = mp4_list[0]["url"]
+    elif browser:
+        play = browser[0]["url"]  # phone-friendly embed first
+    elif proxy_mpd:
+        play = proxy_mpd
+    elif sources:
+        play = sources[0].get("url")
+
     return {
         "provider": "moviebox",
         "subject_id": subject_id,
+        "title": title,
         "se": se,
         "ep": ep,
-        "count": len(sources),
-        "has_resource": len(sources) > 0,
+        "tmdb_id": tmdb_id,
+        "mp4": mp4_list,
         "sources": sources,
-        "note": None if sources else "No playable sources",
+        "qualities": qualities,
+        "audio": audio,
+        "browser": browser,
+        "proxy_mpd": proxy_mpd,
+        "play": play,
+        "count": len(sources),
+        "note": "mp4=all phones · sources/qualities=HEVC DASH (VLC) · browser=embed all phones",
     }
 
 
@@ -1723,42 +1841,73 @@ def _mb_items_from_ops(data) -> list:
     return items
 
 
+
 @app.get("/api/home", tags=["Catalog"])
 async def api_home():
-    """TMDB homepage — more rows for richer home."""
+    """
+    Home feed for the web.
+
+    - TMDB trending/popular rows
+    - `netplay_admin` — optional direct-MP4 list (UUID ids, not MovieBox subject_id)
+    """
     async def grab(path, media, pages=1):
         items = []
         for pg in range(1, pages + 1):
-            d = await _tmdb_get(path, {"page": pg})
-            for x in d.get("results") or []:
-                c = _tmdb_card(x, media)
-                if c:
-                    items.append(c)
+            try:
+                d = await _tmdb_get(path, {"page": pg})
+            except Exception:
+                break
+            for it in d.get("results") or []:
+                it = dict(it)
+                it["media_type"] = media
+                items.append(_tmdb_card(it))
         return items
 
-    trending_m = await grab("/trending/movie/week", "movie", 2)
-    trending_t = await grab("/trending/tv/week", "tv", 2)
-    popular_m = await grab("/movie/popular", "movie", 2)
-    popular_t = await grab("/tv/popular", "tv", 2)
-    top_m = await grab("/movie/top_rated", "movie", 1)
-    top_t = await grab("/tv/top_rated", "tv", 1)
-    now_m = await grab("/movie/now_playing", "movie", 1)
-    airing = await grab("/tv/on_the_air", "tv", 1)
-    upcoming = await grab("/movie/upcoming", "movie", 1)
+    trending = await grab("/trending/all/day", "movie", 1)
+    # fix media types for mixed trending
+    try:
+        d = await _tmdb_get("/trending/all/day", {"page": 1})
+        trending = [_tmdb_card(x) for x in (d.get("results") or []) if x.get("media_type") in ("movie", "tv")]
+    except Exception:
+        trending = []
+    popular_movies = await grab("/movie/popular", "movie", 1)
+    popular_tv = await grab("/tv/popular", "tv", 1)
+    top_movies = await grab("/movie/top_rated", "movie", 1)
+    top_tv = await grab("/tv/top_rated", "tv", 1)
+
+    netplay_admin = []
+    try:
+        _npv = await _np_get("/videos")
+        if isinstance(_npv, list):
+            for v in _npv[:20]:
+                netplay_admin.append({
+                    "id": v.get("id"),
+                    "netplay_id": v.get("id"),
+                    "id_type": "netplay_uuid",
+                    "title": v.get("title"),
+                    "poster": v.get("poster"),
+                    "type": v.get("type"),
+                    "provider": "netplay",
+                    "play": f"/play?netplay_id={v.get('id')}",
+                    "stream": f"/np/stream/{v.get('id')}",
+                })
+    except Exception:
+        pass
+
     return {
-        "trending_movies": trending_m[:24],
-        "trending_series": trending_t[:24],
-        "popular_movies": popular_m[:24],
-        "popular_series": popular_t[:24],
-        "top_movies": top_m[:18],
-        "top_series": top_t[:18],
-        "now_playing": now_m[:18],
-        "on_the_air": airing[:18],
-        "upcoming": upcoming[:18],
-        "provider": "tmdb",
+        "trending": trending,
+        "popular_movies": popular_movies,
+        "popular_tv": popular_tv,
+        "top_movies": top_movies,
+        "top_tv": top_tv,
+        "netplay_admin": netplay_admin,
+        "id_help": {
+            "moviebox": "subject_id from GET /mb/search or /api/search — main catalog",
+            "netplay": "UUID from netplay_admin or GET /np/videos — admin MP4 only",
+            "play_moviebox": "GET /play?subject_id=...  or  GET /mb/stream/{subject_id}",
+            "play_netplay": "GET /play?netplay_id=...  or  GET /np/stream/{id}?se=&ep=",
+        },
     }
-
-
 
 
 @app.get("/api/movies", tags=["Catalog"])
@@ -1786,12 +1935,103 @@ async def api_series(page: int = 1):
         "total_results": d.get("total_results") or len(items),
         "provider": "tmdb",
     }
+
 @app.get("/api/search", tags=["Catalog"])
 async def api_search_catalog(q: str = Query(..., min_length=1)):
-    """TMDB multi-search for web + optional 4KHDHub hits."""
-    items = []
-    fk_items = []
-    errors = {}
+    """
+    Unified search for the web + API clients.
+
+    **IDs**
+    - `subject_id` / `id_type=moviebox_subject` → main catalog (same as Netplay app movies)
+    - `netplay_id` / `id_type=netplay_uuid` → admin MP4 list only (`/np/videos`)
+    - `tmdb_id` → embed helpers
+
+    Play MovieBox: `GET /play?subject_id=...` or `GET /mb/stream/{subject_id}`
+    """
+    items: List[dict] = []
+    errors: Dict[str, str] = {}
+    try:
+        mb = await mb_search(q=q, page=1)
+        for it in mb.get("items") or []:
+            sid = it.get("subject_id")
+            items.append({
+                "id": sid,
+                "subject_id": sid,
+                "id_type": "moviebox_subject",
+                "title": it.get("name") or it.get("title"),
+                "name": it.get("name") or it.get("title"),
+                "poster": it.get("poster_url") or it.get("poster"),
+                "year": it.get("year"),
+                "type": it.get("type") or "movie",
+                "provider": "moviebox",
+                "play": f"/play?subject_id={sid}",
+                "stream": f"/mb/stream/{sid}",
+            })
+    except Exception as e:
+        errors["moviebox"] = str(e)[:160]
+    try:
+        np = await _np_get("/videos")
+        if isinstance(np, list):
+            ql = q.lower()
+            for v in np:
+                title = v.get("title") or ""
+                if ql not in title.lower() and not any(
+                    w in title.lower() for w in ql.split() if len(w) > 2
+                ):
+                    continue
+                nid = v.get("id")
+                items.append({
+                    "id": nid,
+                    "netplay_id": nid,
+                    "id_type": "netplay_uuid",
+                    "title": title,
+                    "name": title,
+                    "poster": v.get("poster"),
+                    "type": v.get("type") or "series",
+                    "provider": "netplay",
+                    "seasons": v.get("seasons"),
+                    "play": f"/play?netplay_id={nid}",
+                    "stream": f"/np/stream/{nid}",
+                })
+    except Exception as e:
+        errors["netplay"] = str(e)[:160]
+    try:
+        d = await _tmdb_get("/search/multi", {"query": q, "page": 1, "include_adult": "false"})
+        for res in (d.get("results") or [])[:10]:
+            if res.get("media_type") not in ("movie", "tv"):
+                continue
+            tid = res.get("id")
+            items.append({
+                "id": tid,
+                "tmdb_id": tid,
+                "id_type": "tmdb",
+                "title": res.get("title") or res.get("name"),
+                "name": res.get("title") or res.get("name"),
+                "poster": (
+                    f"https://image.tmdb.org/t/p/w500{res['poster_path']}"
+                    if res.get("poster_path")
+                    else None
+                ),
+                "type": res.get("media_type"),
+                "provider": "tmdb",
+                "play": f"/api/play?media={res.get('media_type')}&id={tid}",
+            })
+    except Exception as e:
+        errors["tmdb"] = str(e)[:160]
+    return {
+        "query": q,
+        "count": len(items),
+        "items": items,
+        "errors": errors or None,
+        "how_to_play": {
+            "moviebox_subject_id": "GET /play?subject_id=ID  or  GET /mb/stream/ID",
+            "netplay_uuid": "GET /play?netplay_id=UUID  or  GET /np/stream/UUID?se=&ep=",
+            "note": "subject_id and netplay_id are different backends — do not mix them",
+        },
+    }
+
+
+
     try:
         d = await _tmdb_get("/search/multi", {"query": q, "page": 1, "include_adult": "false"})
         for x in d.get("results") or []:
@@ -2751,18 +2991,30 @@ def _ytdlp_info(url: str) -> dict:
     last_err = None
     attempts = []
     if is_yt:
+        # As of 2026 YouTube requires a PO Token for most GVS (streaming) URLs on
+        # the android/ios/android_creator clients — yt-dlp still "succeeds" but
+        # silently drops those format URLs, so we can't just take the first
+        # client that doesn't raise; we need one that actually returns formats.
+        # web_embedded / tv currently don't require a PO Token (per yt-dlp's own
+        # PO Token Guide), so try those first; keep the others as fallbacks since
+        # YouTube's enforcement shifts client-by-client over time.
         attempts = [
+            {**base_opts, "extractor_args": {"youtube": {"player_client": ["web_embedded"]}}},
+            {**base_opts, "extractor_args": {"youtube": {"player_client": ["tv"]}}},
             {**base_opts, "extractor_args": {"youtube": {"player_client": ["android"]}}},
             {**base_opts, "extractor_args": {"youtube": {"player_client": ["android_creator"]}}},
             {**base_opts, "extractor_args": {"youtube": {"player_client": ["ios"]}}},
+            {**base_opts, "extractor_args": {"youtube": {"player_client": ["web_safari"]}}},
+            {**base_opts},  # let yt-dlp pick its own (self-updating) default client mix
         ]
     else:
         attempts = [base_opts]
 
     for opts in attempts:
         try:
-            info = _run(opts)
-            if info:
+            candidate = _run(opts)
+            if candidate and candidate.get("formats"):
+                info = candidate
                 break
         except Exception as e:
             last_err = str(e)
@@ -2869,6 +3121,8 @@ def _ytdlp_info(url: str) -> dict:
             "vcodec": vcodec,
             "acodec": acodec,
             "kind": kind,
+            "muxed": kind == "video+audio",
+            "filesize": f.get("filesize") or f.get("filesize_approx") or None,
             "url": fu,
         })
 
@@ -2885,6 +3139,9 @@ def _ytdlp_info(url: str) -> dict:
         except Exception:
             pass
 
+    best_muxed = next((f for f in formats if f["kind"] == "video+audio"), None)
+    best_audio = next((f for f in formats if f["kind"] == "audio"), None)
+
     return {
         "ok": True,
         "title": info.get("title") or "media",
@@ -2897,6 +3154,8 @@ def _ytdlp_info(url: str) -> dict:
         "formats": formats,
         "format_count": len(formats),
         "best": formats[0] if formats else None,
+        "best_muxed": best_muxed,
+        "best_audio": best_audio,
         "note": "Direct URLs expire — re-extract if needed",
     }
 
@@ -3698,7 +3957,7 @@ async def anime_stream(
 
 
 @app.get("/anime/hls", tags=["Anime"])
-async def anime_hls_proxy(u: str = Query(..., min_length=8)):
+async def anime_hls_proxy(request: Request, u: str = Query(..., min_length=8)):
     """Proxy m3u8 + segments (CORS). Unwraps HindiAnime segment?url= to CDN when needed."""
     if not (u.startswith("http://") or u.startswith("https://")):
         raise HTTPException(400, "url must be http(s)")
@@ -3720,6 +3979,7 @@ async def anime_hls_proxy(u: str = Query(..., min_length=8)):
             return url
 
     target = _unwrap(u)
+    range_header = request.headers.get("range")
     headers = {
         "User-Agent": (
             HA_HEADERS.get("User-Agent")
@@ -3731,6 +3991,11 @@ async def anime_hls_proxy(u: str = Query(..., min_length=8)):
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
+    # Players (hls.js, <video>) issue byte-range requests for segments and
+    # fMP4 init sections — pass that through so seeking/buffering works and
+    # we're not always pulling whole files through this proxy.
+    if range_header:
+        headers["Range"] = range_header
     try:
         async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
             r = await client.get(target, headers=headers)
@@ -3823,15 +4088,20 @@ async def anime_hls_proxy(u: str = Query(..., min_length=8)):
             },
         )
 
+    out_headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "*",
+        "Cache-Control": "public, max-age=60",
+        "Content-Length": str(len(body)),
+        "Accept-Ranges": "bytes",
+    }
+    if r.status_code == 206 and r.headers.get("content-range"):
+        out_headers["Content-Range"] = r.headers["content-range"]
+        return Response(content=body, media_type=ctype or "application/octet-stream", status_code=206, headers=out_headers)
     return Response(
         content=body,
         media_type=ctype or "application/octet-stream",
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "*",
-            "Cache-Control": "public, max-age=60",
-            "Content-Length": str(len(body)),
-        },
+        headers=out_headers,
     )
 
 
@@ -4244,6 +4514,316 @@ SwaggerUIBundle({
 });
 </script>
 </body></html>""")
+
+
+
+
+# =============================================================================
+# MPD expand + cookie proxy + Netplay (phone MP4)
+# =============================================================================
+
+_MB_PROXY_JAR: Dict[str, str] = {}
+_MB_PROXY_REF: Dict[str, str] = {}
+
+
+def _mb_proxy_remember(url: str, cookie: str, referer: str = "") -> None:
+    host = urlparse(url).hostname or ""
+    if host and cookie:
+        _MB_PROXY_JAR[host] = cookie
+    if host and referer:
+        _MB_PROXY_REF[host] = referer
+
+
+def _mpd_abs(base_mpd: str, rel: str) -> str:
+    if not rel:
+        return ""
+    if rel.startswith("http://") or rel.startswith("https://"):
+        return rel
+    return urljoin(base_mpd.rsplit("/", 1)[0] + "/", rel)
+
+
+def _parse_mpd_xml(xml_text: str, mpd_url: str) -> dict:
+    video, audio = [], []
+    for m in re.finditer(r"<Representation\b([^>]*)>(.*?)</Representation>", xml_text, re.I | re.S):
+        attrs, body = m.group(1), m.group(2)
+
+        def _a(name: str, src=attrs):
+            mm = re.search(rf'\b{name}="([^"]*)"', src, re.I)
+            return mm.group(1) if mm else ""
+
+        rid = _a("id")
+        codecs = (_a("codecs") or "").lower()
+        mime = _a("mimeType") or ""
+        height = int(_a("height") or 0)
+        width = int(_a("width") or 0)
+        bw = int(_a("bandwidth") or 0)
+        st = re.search(r"<SegmentTemplate\b([^/>]*)", body, re.I)
+        init_tpl = media_tpl = start_n = "1"
+        if st:
+            sa = st.group(1)
+            init_tpl = _a("initialization", sa)
+            media_tpl = _a("media", sa)
+            start_n = _a("startNumber", sa) or "1"
+
+        def exp(tpl: str) -> str:
+            if not tpl:
+                return ""
+            return tpl.replace("$RepresentationID$", rid).replace("$RepresentationID", rid)
+
+        init_rel = exp(init_tpl)
+        media_rel = exp(media_tpl)
+        first = ""
+        if media_rel:
+            sn = int(start_n or 1)
+            first = re.sub(
+                r"\$Number(?:%0(\d+)d)?\$",
+                lambda m: str(sn).zfill(int(m.group(1))) if m.group(1) else str(sn),
+                media_rel,
+            )
+        kind = "audio" if mime.startswith("audio") or codecs.startswith("mp4a") else "video"
+        family = "hevc" if any(x in codecs for x in ("hev", "hvc")) else (
+            "avc" if "avc" in codecs else codecs or "unknown"
+        )
+        row = {
+            "id": rid,
+            "label": (f"{height}p · {family}" if height else f"{kind} · {codecs}"),
+            "height": height or None,
+            "width": width or None,
+            "bandwidth": bw,
+            "codec": family,
+            "init": _mpd_abs(mpd_url, init_rel) if init_rel else None,
+            "first_segment": _mpd_abs(mpd_url, first) if first else None,
+            "phone_friendly": kind == "audio" or family == "avc",
+        }
+        (audio if kind == "audio" else video).append(row)
+    return {"video": video, "audio": audio, "has_h264": any(v["codec"] == "avc" for v in video)}
+
+
+async def _mb_expand_mpd(mpd_url: str, cookie: str = "", referer: str = "") -> dict:
+    headers = {
+        "User-Agent": _mb_ua,
+        "Referer": referer or globals().get("STREAM_REFERER", "https://sportslive.wine"),
+        "Accept": "*/*",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as client:
+        r = await client.get(mpd_url, headers=headers)
+        if r.status_code != 200:
+            raise HTTPException(502, f"MPD HTTP {r.status_code}")
+        if "<MPD" not in r.text and "<mpd" not in r.text.lower():
+            raise HTTPException(502, "Not an MPD")
+        return _parse_mpd_xml(r.text, mpd_url)
+
+
+@app.get("/mb/proxy/mpd", tags=["MovieBox"])
+async def mb_proxy_mpd(u: str = Query(...), cookie: str = "", referer: str = ""):
+    """Proxy MPD with cookies; absolutize segment paths."""
+    host = urlparse(u).hostname or ""
+    ck = cookie or _MB_PROXY_JAR.get(host, "")
+    ref = referer or _MB_PROXY_REF.get(host, globals().get("STREAM_REFERER", "https://sportslive.wine"))
+    headers = {"User-Agent": _mb_ua, "Referer": ref, "Accept": "*/*"}
+    if ck:
+        headers["Cookie"] = ck
+        _mb_proxy_remember(u, ck, ref)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as client:
+        r = await client.get(u, headers=headers)
+        if r.status_code != 200:
+            raise HTTPException(r.status_code, "MPD fetch failed")
+        xml = r.text
+
+        def rew(m):
+            name, val = m.group(1), m.group(2)
+            if val.startswith("http"):
+                return m.group(0)
+            return f'{name}="{_mpd_abs(u, val)}"'
+
+        xml = re.sub(r'\b(initialization|media)="([^"]+)"', rew, xml, flags=re.I)
+        return Response(content=xml, media_type="application/dash+xml", headers={"Access-Control-Allow-Origin": "*"})
+
+
+@app.get("/mb/proxy/segment", tags=["MovieBox"])
+async def mb_proxy_segment(u: str = Query(...), cookie: str = "", referer: str = ""):
+    """Proxy DASH init/media segment with CDN cookies."""
+    host = urlparse(u).hostname or ""
+    ck = cookie or _MB_PROXY_JAR.get(host, "")
+    ref = referer or _MB_PROXY_REF.get(host, globals().get("STREAM_REFERER", "https://sportslive.wine"))
+    headers = {"User-Agent": _mb_ua, "Referer": ref, "Accept": "*/*"}
+    if ck:
+        headers["Cookie"] = ck
+    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+        r = await client.get(u, headers=headers)
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, "segment error")
+        return Response(
+            content=r.content,
+            media_type=r.headers.get("content-type") or "application/octet-stream",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+
+# --- Netplay admin (direct R2 MP4) ---
+NP_BASE = "https://netplay.majumdargaurav61.workers.dev"
+NP_UA = "Netplay/11.0 (Android)"
+
+
+async def _np_get(path: str) -> Any:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as client:
+        r = await client.get(NP_BASE + path, headers={"User-Agent": NP_UA, "Accept": "application/json"})
+        if r.status_code == 404:
+            raise HTTPException(404, "Netplay not found")
+        if r.status_code >= 400:
+            raise HTTPException(502, f"Netplay HTTP {r.status_code}")
+        return r.json()
+
+
+async def _np_match_mp4(title: str, se: int = 0, ep: int = 0) -> List[dict]:
+    """Match title against Netplay catalog; return progressive MP4 entries."""
+    out: List[dict] = []
+    try:
+        vids = await _np_get("/videos")
+    except Exception:
+        return out
+    if not isinstance(vids, list):
+        return out
+    clean = re.sub(r"\[.*?\]", "", title).strip().lower()
+    words = [w for w in clean.split() if len(w) > 2]
+    for v in vids:
+        vt = (v.get("title") or "").lower()
+        if not (clean in vt or vt in clean or sum(1 for w in words if w in vt) >= min(2, len(words))):
+            continue
+        seasons = v.get("seasons") or []
+        trials = []
+        if se or ep:
+            trials.append((se or 0, ep or 1))
+        for s in seasons:
+            for e in s.get("eps") or [1]:
+                trials.append((s.get("se") or 0, e))
+        if not trials:
+            trials = [(0, 0)]
+        seen = set()
+        for snum, enum in trials:
+            key = (snum, enum)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                st = await _np_get(f"/videos/{v['id']}/stream?se={snum}&ep={enum}")
+            except Exception:
+                continue
+            for q in st.get("qualities") or []:
+                if q.get("url"):
+                    out.append({
+                        "label": q.get("label") or "Netplay MP4",
+                        "url": q["url"],
+                        "phone_friendly": True,
+                        "source": "netplay",
+                        "netplay_id": v["id"],
+                        "se": snum,
+                        "ep": enum,
+                        "language": q.get("language"),
+                    })
+        break
+    return out
+
+
+@app.get("/np/videos", tags=["Netplay"])
+async def np_videos():
+    """
+    Netplay **admin** catalog only (Cloudflare Worker + R2 MP4).
+
+    This is NOT MovieBox. IDs are UUIDs, not subject_id.
+    Main movies/series still use MovieBox: `/mb/search` → `subject_id` → `/mb/stream/{subject_id}`.
+    Worker has no /home or /search — only `/videos`.
+    """
+    data = await _np_get("/videos")
+    items = data if isinstance(data, list) else []
+    out = []
+    for v in items:
+        if not isinstance(v, dict):
+            continue
+        out.append({
+            **v,
+            "id_type": "netplay_uuid",
+            "stream_url": f"/np/stream/{v.get('id')}",
+            "note": "Use /np/stream/{id}?se=&ep= for progressive MP4",
+        })
+    return {
+        "provider": "netplay",
+        "id_type": "netplay_uuid",
+        "count": len(out),
+        "items": out,
+        "how_to": {
+            "list": "GET /np/videos",
+            "detail": "GET /np/videos/{uuid}",
+            "stream": "GET /np/stream/{uuid}?se=2&ep=3",
+            "moviebox_main": "GET /mb/search?q= → subject_id → GET /mb/stream/{subject_id}",
+        },
+    }
+
+
+@app.get("/np/videos/{video_id}", tags=["Netplay"])
+async def np_detail(video_id: str):
+    data = await _np_get(f"/videos/{video_id}")
+    return {"provider": "netplay", "data": data}
+
+
+@app.get("/np/stream/{video_id}", tags=["Netplay"])
+async def np_stream(video_id: str, se: int = 0, ep: int = 0):
+    """Progressive MP4 — works on every phone."""
+    q = f"?se={se}&ep={ep}" if (se or ep) else ""
+    data = await _np_get(f"/videos/{video_id}/stream{q}")
+    sources = []
+    for item in (data.get("qualities") or []):
+        if item.get("url"):
+            sources.append({
+                "label": item.get("label") or "MP4",
+                "url": item["url"],
+                "play_url": item["url"],
+                "format": "MP4",
+                "phone_friendly": True,
+                "language": item.get("language"),
+            })
+    return {
+        "provider": "netplay",
+        "video_id": video_id,
+        "se": se,
+        "ep": ep,
+        "count": len(sources),
+        "mp4": sources,
+        "sources": sources,
+        "play": sources[0]["url"] if sources else None,
+        "note": "Progressive MP4 (R2)",
+    }
+
+
+@app.get("/play", tags=["Play"])
+async def unified_play(
+    subject_id: str = Query(None, description="MovieBox subject_id from /mb/search"),
+    netplay_id: str = Query(None, description="Only for /np/videos UUID (admin MP4)"),
+    se: int = 0,
+    ep: int = 0,
+):
+    """
+    **Main play API**
+
+    | ID | From | Example |
+    |----|------|---------|
+    | subject_id | `/mb/search` or `/api/search` | 1654274595068805784 |
+    | netplay_id | `/np/videos` only | c32891f8-fc0a-… |
+
+    MovieBox subject_id is what Netplay app uses for normal movies.
+    netplay_id is a separate admin upload list (few titles, direct MP4).
+    """
+    if netplay_id:
+        return await np_stream(netplay_id, se, ep)
+    if subject_id:
+        return await mb_stream(subject_id, se, ep)
+    raise HTTPException(
+        400,
+        "Pass subject_id from /mb/search (MovieBox). "
+        "netplay_id only if you took UUID from /np/videos.",
+    )
 
 
 
