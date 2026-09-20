@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0c0a18">
-<meta name="description" content="MovieAll — stream movies, series and anime with a fast, clean player.">
-<title>MovieAll — Movies, Series & Anime</title>
+<meta name="description" content="ElitePlex — stream movies, series and anime with a fast, clean player.">
+<title>ElitePlex — Movies, Series & Anime</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%23ffb62e'/%3E%3Cpath d='M26 18v28l22-14z' fill='%231c1300'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -478,7 +478,7 @@ main{min-height:100vh}
 <body data-mode="movie">
 <div id="bar"></div>
 <header class="nav" id="nav">
-  <a class="logo" href="#/" aria-label="MovieAll home"><span class="logo-mark"><svg class="ic" viewBox="0 0 24 24"><path d="M7.5 4.6v14.8a1 1 0 0 0 1.5.86l12.3-7.4a1 1 0 0 0 0-1.72L9 3.74a1 1 0 0 0-1.5.86z"/></svg></span><span class="logo-text">MovieAll</span></a>
+  <a class="logo" href="#/" aria-label="ElitePlex home"><span class="logo-mark"><svg class="ic" viewBox="0 0 24 24"><path d="M7.5 4.6v14.8a1 1 0 0 0 1.5.86l12.3-7.4a1 1 0 0 0 0-1.72L9 3.74a1 1 0 0 0-1.5.86z"/></svg></span><span class="logo-text">ElitePlex</span></a>
   <nav class="links" id="links" aria-label="Main">
     <a href="#/" data-k="home">Home</a><a href="#/movies" data-k="movies">Movies</a><a href="#/series" data-k="series">Series</a><a href="#/anime" data-k="anime">Anime</a><a href="#/mb" data-k="mb">MovieBox</a><a href="#/hub" data-k="hub">4K Hub</a><a href="#/music" data-k="music">Music</a>
     <i class="ind" id="ind"></i>
@@ -515,11 +515,11 @@ main{min-height:100vh}
   </div>
 </div>
 <div id="toasts"></div>
-<noscript><p style="padding:100px 20px;text-align:center">MovieAll needs JavaScript to run.</p></noscript>
+<noscript><p style="padding:100px 20px;text-align:center">ElitePlex needs JavaScript to run.</p></noscript>
 <script>
 'use strict';
 /* ===================================================================
-   MovieAll — core: utils, icons, API layer, data normalisers, router
+   ElitePlex — core: utils, icons, API layer, data normalisers, router
    =================================================================== */
 const $=(s,r=document)=>r.querySelector(s);
 const $$=(s,r=document)=>Array.from(r.querySelectorAll(s));
@@ -623,11 +623,11 @@ const LIB={
 };
 
 /* ---------- API layer ---------- */
-const DEFAULT_BASE='https://movieallshawon.vercel.app';
+const DEFAULT_BASE='https://ElitePlexshawon.vercel.app';
 function computeBase(){
   const o=store.get('base','');
   if(o&&typeof o==='string')return o.replace(/\/+$/,'');
-  if(/(^|\.)movieallshawon\.vercel\.app$/.test(location.hostname))return'';
+  if(/(^|\.)ElitePlexshawon\.vercel\.app$/.test(location.hostname))return'';
   return DEFAULT_BASE;
 }
 let BASE=computeBase();
@@ -1031,7 +1031,7 @@ function wireSheet(){
 }
 
 /* ===================================================================
-   MovieAll — VPlayer: HLS + DASH + MP4, auto fail-over, subtitles,
+   ElitePlex — VPlayer: HLS + DASH + MP4, auto fail-over, subtitles,
    audio tracks, gestures, keyboard, resume, media-session
    =================================================================== */
 class VPlayer{
@@ -1129,7 +1129,7 @@ class VPlayer{
     /* media session */
     if('mediaSession' in navigator){
       try{
-        navigator.mediaSession.metadata=new MediaMetadata({title:this.o.title||'MovieAll',artist:this.o.sub||'MovieAll',artwork:this.o.poster?[{src:abs(this.o.poster),sizes:'512x512'}]:[]});
+        navigator.mediaSession.metadata=new MediaMetadata({title:this.o.title||'ElitePlex',artist:this.o.sub||'ElitePlex',artwork:this.o.poster?[{src:abs(this.o.poster),sizes:'512x512'}]:[]});
         navigator.mediaSession.setActionHandler('play',()=>v.play());
         navigator.mediaSession.setActionHandler('pause',()=>v.pause());
         navigator.mediaSession.setActionHandler('seekbackward',()=>this.skip(-10));
@@ -1517,7 +1517,7 @@ function mountEmbed(host,url,opt={}){
 }
 
 /* ===================================================================
-   MovieAll — pages 1: helpers, home, grids, title, watch
+   ElitePlex — pages 1: helpers, home, grids, title, watch
    =================================================================== */
 const LI={};
 function fill(html,cls){
@@ -1658,7 +1658,7 @@ async function pageHome(tok){
     if(n<2)html+=`<div id="ph-anime">${skRow(6)}</div>`;
     if(n<3)html+=`<div id="ph-mb">${skRow(6)}</div>`;
   }else html+=`<div id="ph-anime">${skRow(6)}</div><div id="ph-mb">${skRow(6)}</div>`;
-  html+=`<footer class="foot"><span>MovieAll — movies, series & anime in one place.</span><a href="#/status">System status</a></footer>`;
+  html+=`<footer class="foot"><span>ElitePlex — movies, series & anime in one place.</span><a href="#/status">System status</a></footer>`;
   fill(html,'bleed');
   if(slides.length)initHero($('.hero'),slides);
   App.navSolid();
@@ -1739,7 +1739,7 @@ async function pageTitle(media,id,tok){
   const sim=tmdbList(d.similar||d.recommendations||[]);
   const bg=d.backdrop||d.poster||'';
   const genres=(d.genres||[]).map(g=>typeof g==='string'?g:(g&&g.name)).filter(Boolean);
-  document.title=(n.title||'Title')+' — MovieAll';
+  document.title=(n.title||'Title')+' — ElitePlex';
   let html=`<section class="dhero"><div class="dbg">${imgTag(bg,'')}</div><div class="dwrap">
     <div class="dposter${d.poster?'':' noimg'}" data-i="${esc(initials(n.title))}">${imgTag(d.poster||bg,n.title)}</div>
     <div class="dinfo"><div class="dmeta"><span class="tag">${tv?'Series':'Movie'}</span>${n.rating>0?`<span class="rate">${ic('star')}${n.rating.toFixed(1)}</span>`:''}${d.year?`<span>${esc(d.year)}</span>`:''}${d.runtime?`<span>${esc(d.runtime)}${/\D/.test(String(d.runtime))?'':' min'}</span>`:''}${genres.slice(0,4).map(g=>`<span>${esc(g)}</span>`).join('')}</div>
@@ -1993,7 +1993,7 @@ async function pageWatch(media,id,se,ep,tok){
   const playP=api(`/api/play?tmdb_id=${enc(id)}&media=${media}&fast=1${tv?`&se=${se}&ep=${ep}`:''}`,{timeout:35000,retries:1}).catch(e=>({__err:e}));
   detailP.then(d=>{
     if(tok!==RT)return;
-    if(d){W.detail=d;W.title=d.name||d.title||'';W.year=d.year||'';W.poster=d.poster||'';W.backdrop=d.backdrop||d.poster||'';document.title=(W.title?W.title+' — ':'')+'MovieAll'}
+    if(d){W.detail=d;W.title=d.name||d.title||'';W.year=d.year||'';W.poster=d.poster||'';W.backdrop=d.backdrop||d.poster||'';document.title=(W.title?W.title+' — ':'')+'ElitePlex'}
     renderBar();
     if(W.started)saveHist();
     if(tv)loadSide();
@@ -2017,7 +2017,7 @@ async function pageWatch(media,id,se,ep,tok){
 }
 
 /* ===================================================================
-   MovieAll — pages 2: anime + MovieBox
+   ElitePlex — pages 2: anime + MovieBox
    =================================================================== */
 const searchField=(id,ph,val,btn='Search')=>`<form class="field" id="${id}" autocomplete="off"><input name="q" value="${esc(val||'')}" placeholder="${esc(ph)}" enterkeyhint="search" aria-label="${esc(ph)}"><button class="btn sm" type="submit">${btn}</button></form>`;
 function wireField(id,fn){const f=$('#'+id);if(f)f.addEventListener('submit',e=>{e.preventDefault();const v=f.q.value.trim();if(v)fn(v)})}
@@ -2100,7 +2100,7 @@ async function pageAnimeTitle(slug,tok){
   if(tok!==RT)return;
   const eps=d.episodes||[];
   const title=d.title||slug,poster=d.poster||(eps[0]&&animeThumb(eps[0]))||'';
-  document.title=title+' — MovieAll';
+  document.title=title+' — ElitePlex';
   const key='anime:'+slug,h=Hist.get(key);
   const item={k:key,href:`#/anime/title/${enc(slug)}`,title,poster,sub:'Anime'};
   const seasons=[...new Set(eps.map(e=>e.season||1))].sort((a,b)=>a-b);
@@ -2143,7 +2143,7 @@ async function pageAnimeWatch(slug,idx,tok){
   const label=animeEpLabel(ep,idx);
   const stage=$('#stage');
   const goIdx=i=>{if(i>=0&&i<eps.length)location.hash=`#/anime/watch/${enc(slug)}?ep=${i}`};
-  document.title=`${title} ${label} — MovieAll`;
+  document.title=`${title} ${label} — ElitePlex`;
   Hist.put({k:key,href:`#/anime/watch/${enc(slug)}?ep=${idx}`,title,poster:d.poster||animeThumb(ep),sub:label,epIdx:idx,ep:idx,pos:(Hist.get(key)||{}).epIdx===idx?(Hist.get(key)||{}).pos:0,dur:(Hist.get(key)||{}).epIdx===idx?(Hist.get(key)||{}).dur:0});
   $('#wbar').innerHTML=`<div style="min-width:0"><h1 class="h2">${esc(title)}<small>${esc(label)}${ep.title?' — '+esc(ep.title):''}</small></h1></div><div class="wact">
     ${idx>0?`<a class="btn sm glass" href="#/anime/watch/${enc(slug)}?ep=${idx-1}">${ic('prev')}Previous</a>`:''}
@@ -2243,7 +2243,7 @@ async function pageMbTitle(id,tok){
   const seasons=mbSeasons(d);
   const tv=s.media==='tv'||seasons.length>0;
   const genres=(typeof raw.genre==='string'?raw.genre.split(/[,/]/):(Array.isArray(raw.genre)?raw.genre:(raw.genres||[]))).map(g=>typeof g==='string'?g.trim():(g&&g.name)).filter(Boolean);
-  document.title=s.title+' — MovieAll';
+  document.title=s.title+' — ElitePlex';
   const item={k:'mb:'+id,href:`#/mb/title/${enc(id)}`,title:s.title,poster:s.poster,sub:(s.year||'')+' • MovieBox'};
   const meta=`<span class="tag">${tv?'Series':'Movie'}</span>${s.rating>0?`<span class="rate">${ic('star')}${s.rating.toFixed(1)}</span>`:''}${s.year?`<span>${esc(s.year)}</span>`:''}${genres.slice(0,4).map(g=>`<span>${esc(g)}</span>`).join('')}`;
   const firstSe=seasons[0]?seasons[0].se:1;
@@ -2289,7 +2289,7 @@ async function pageMbWatch(id,se,ep,title,tok){
   bar();
   api('/mb/detail/'+enc(id),{ttl:600000,retries:0,timeout:20000}).then(d=>{
     if(tok!==RT)return;const s=findSubject(d);
-    if(s){S.title=s.title||S.title;S.poster=s.poster||'';S.seasons=mbSeasons(d);bar();document.title=S.title+' — MovieAll';
+    if(s){S.title=s.title||S.title;S.poster=s.poster||'';S.seasons=mbSeasons(d);bar();document.title=S.title+' — ElitePlex';
       Hist.put({k:key,href:location.hash,title:S.title,poster:S.poster,sub:tv?`S${se} E${ep}`:'MovieBox',se,ep});}
   }).catch(()=>{});
   const failStage=(msg)=>{
@@ -2322,7 +2322,7 @@ async function pageMbWatch(id,se,ep,title,tok){
 }
 
 /* ===================================================================
-   MovieAll — pages 3: 4K hub, downloader, list, search, status, boot
+   ElitePlex — pages 3: 4K hub, downloader, list, search, status, boot
    =================================================================== */
 function hubList(d){
   const arr=Array.isArray(d)?d:(d&&(d.items||d.results||d.data||d.movies||d.hits))||[];
@@ -2419,7 +2419,7 @@ async function pageHubTitle(id,name,tok){
   const m=meta&&(meta.data||meta)||{};
   const title=m.title||m.name||name||'4K release';
   const tv=/tv|series|show/i.test(String(m.type||''))||!!(m.seasons&&m.seasons.length);
-  document.title=title+' — MovieAll';
+  document.title=title+' — ElitePlex';
   mount(featureHTML({title,poster:m.poster||m.image||m.cover||'',text:m.overview||m.description||m.plot||'',
       meta:`<span class="tag">4K</span>${m.year?`<span>${esc(m.year)}</span>`:''}${m.rating?`<span class="rate">${ic('star')}${esc(m.rating)}</span>`:''}`,btns:''})
     +(tv?`<form class="field" id="hs" style="margin-top:18px;max-width:420px"><input name="se" type="number" min="1" value="1" aria-label="Season" style="max-width:90px"><input name="ep" type="number" min="1" value="1" aria-label="Episode"><button class="btn sm" type="submit">Load episode</button></form>`:'')
@@ -2487,7 +2487,7 @@ async function pageList(tok){
 async function pageSearch(q,tab,tok){
   setNav('');
   q=String(q||'').trim();
-  if(!q){mount(stateHTML('search','Search MovieAll','Type a title in the search bar.','<button class="btn" data-open-search>Open search</button>'));const b=$('[data-open-search]');if(b)b.onclick=()=>openSearch();return}
+  if(!q){mount(stateHTML('search','Search ElitePlex','Type a title in the search bar.','<button class="btn" data-open-search>Open search</button>'));const b=$('[data-open-search]');if(b)b.onclick=()=>openSearch();return}
   const secs=[
     {k:'tmdb',t:'Movies & series',load:()=>api('/api/search?q='+enc(q),{ttl:180000}),cards:d=>tmdbList(d).map(cTmdb)},
     {k:'anime',t:'Anime',load:()=>api('/anime/search?q='+enc(q),{ttl:180000}),cards:d=>((d&&d.items)||[]).filter(x=>x&&animeSlug(x)).map(cAnime)},
@@ -2495,7 +2495,7 @@ async function pageSearch(q,tab,tok){
     {k:'hub',t:'4K Hub',load:()=>api('/fk/search?q='+enc(q),{ttl:180000,timeout:45000}),cards:d=>hubList(d).map(cHub)}
   ];
   const cur=secs.some(s=>s.k===tab)?tab:'all';
-  document.title=`“${q}” — MovieAll`;
+  document.title=`“${q}” — ElitePlex`;
   mount(`<div class="phead"><div><h1 class="h1">Results for “${esc(q)}”</h1><p id="scount">Searching every source…</p></div></div>
     <div class="tabs" id="stabs"><button data-k="all" class="${cur==='all'?'on':''}">All</button>${secs.map(s=>`<button data-k="${s.k}" class="${cur===s.k?'on':''}">${s.t}</button>`).join('')}</div>
     ${secs.map(s=>`<section class="sec" data-s="${s.k}" style="margin-top:22px"${cur!=='all'&&cur!==s.k?' hidden':''}><div class="sec-h" style="padding:0"><h2 class="h2">${s.t}</h2></div><div id="s-${s.k}">${skGrid(6)}</div></section>`).join('')}`);
@@ -2595,7 +2595,7 @@ async function pageStatus(tok){
 /* ---------------- MUSIC ---------------- */
 async function pageMusic(q,tok){
   setNav('music');setMode('mb');
-  document.title='Music — MovieAll';
+  document.title='Music — ElitePlex';
   const tabs=['Home','Trending','Search'];
   mount(`<div class="phead"><div><h1 class="h1">Music</h1><p>Search, trending and play with synced lyrics.</p></div></div>
     ${searchField('mf','Search songs, artists…',q||'','Search')}
