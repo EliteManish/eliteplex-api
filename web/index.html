@@ -623,11 +623,11 @@ const LIB={
 };
 
 /* ---------- API layer ---------- */
-const DEFAULT_BASE='https://ElitePlexshawon.vercel.app';
+const DEFAULT_BASE='https://eliteplex-api.vercel.app';
 function computeBase(){
   const o=store.get('base','');
   if(o&&typeof o==='string')return o.replace(/\/+$/,'');
-  if(/(^|\.)ElitePlexshawon\.vercel\.app$/.test(location.hostname))return'';
+  if(/(^|\.)eliteplex-api\.vercel\.app$/.test(location.hostname))return'';
   return DEFAULT_BASE;
 }
 let BASE=computeBase();
