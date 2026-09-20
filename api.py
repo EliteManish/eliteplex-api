@@ -47,6 +47,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Inject creator on every JSON response
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response as StarletteResponse
+import json as _json
+
+class CreatorMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        ct = (response.headers.get("content-type") or "").lower()
+        if "application/json" not in ct:
+            return response
+        try:
+            body = b""
+            async for chunk in response.body_iterator:
+                body += chunk
+            data = _json.loads(body.decode("utf-8") or "null")
+            if isinstance(data, dict) and "creator" not in data:
+                data = {"creator": "shawon", **data}
+            elif isinstance(data, list):
+                data = {"creator": "shawon", "items": data}
+            else:
+                data = {"creator": "shawon", "data": data}
+            raw = _json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+            headers = dict(response.headers)
+            headers.pop("content-length", None)
+            return StarletteResponse(
+                content=raw,
+                status_code=response.status_code,
+                media_type="application/json",
+                headers=headers,
+            )
+        except Exception:
+            return response
+
+app.add_middleware(CreatorMiddleware)
+
+
 # =============================================================================
 # MOVIEBOX
 # =============================================================================
@@ -255,14 +293,16 @@ def _is_dummy_url(url: str) -> bool:
 
 
 def _dash_from_sign_cookie(cookie: str) -> Optional[str]:
+    """Extract real DASH/HLS URL from MovieBox signCookie / Edge-Cache-Cookie."""
     if not cookie:
         return None
+    # 1) CloudFront-Policy resource
     for part in cookie.split(";"):
         trimmed = part.strip()
         if not trimmed.startswith("CloudFront-Policy="):
             continue
         raw = trimmed[len("CloudFront-Policy=") :].strip()
-        normalized = raw.replace("-", "+").replace("_", "=").replace("~", "/")
+        normalized = raw.replace("-", "+").replace("_", "/").replace("~", "/")
         try:
             pad = (4 - len(normalized) % 4) % 4
             policy = json.loads(base64.b64decode(normalized + ("=" * pad)))
@@ -272,17 +312,26 @@ def _dash_from_sign_cookie(cookie: str) -> Optional[str]:
                 return f"{base}/index.mpd"
         except Exception:
             continue
+    # 2) Edge-Cache-Cookie=urlprefix=<b64>:sign=...:t=...
     if "urlprefix=" in cookie:
         try:
-            part = cookie.split("urlprefix=")[1].split("&")[0].split(";")[0]
+            part = cookie.split("urlprefix=", 1)[1]
+            # stop at sign / semicolon / ampersand
+            for sep in (":sign=", ";", "&", " "):
+                if sep in part:
+                    part = part.split(sep, 1)[0]
+            part = part.strip().strip('"').strip("'")
             pad = (4 - len(part) % 4) % 4
-            base = base64.b64decode(part + ("=" * pad)).decode("utf-8", errors="ignore")
+            base = base64.b64decode(part + ("=" * pad)).decode("utf-8", errors="strict")
+            # strip any non-printable leftover
+            base = "".join(ch for ch in base if ch.isprintable()).strip()
             if base.startswith("http"):
-                return base if base.endswith((".mpd", ".m3u8")) else base.rstrip("/") + "/index.mpd"
+                if base.endswith((".mpd", ".m3u8")):
+                    return base
+                return base.rstrip("/") + "/index.mpd"
         except Exception:
             pass
     return None
-
 
 def _parse_mb_play_info(data: dict, user_agent: str) -> List[dict]:
     out: List[dict] = []
@@ -664,6 +713,64 @@ def _score_mirror(url: str, label: str) -> int:
     return 4
 
 
+
+def _rot13(s: str) -> str:
+    out = []
+    for c in s:
+        if "a" <= c <= "z":
+            out.append(chr((ord(c) - 97 + 13) % 26 + 97))
+        elif "A" <= c <= "Z":
+            out.append(chr((ord(c) - 65 + 13) % 26 + 65))
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def _b64pad(s: str) -> str:
+    return s + ("=" * ((4 - len(s) % 4) % 4))
+
+
+def _decode_greenmotors_payload(payload: str) -> Optional[str]:
+    """MovieBox-TUI compatible greenmotors decode pipeline."""
+    try:
+        s1 = base64.b64decode(_b64pad(payload)).decode("utf-8")
+        s2 = base64.b64decode(_b64pad(s1)).decode("utf-8")
+        s3 = _rot13(s2)
+        s4 = base64.b64decode(_b64pad(s3)).decode("utf-8")
+        j = json.loads(s4)
+        target_b64 = j.get("o") or ""
+        return base64.b64decode(_b64pad(target_b64)).decode("utf-8")
+    except Exception:
+        return None
+
+
+async def resolve_greenmotors(url: str) -> List[dict]:
+    """greenmotors.club/?id=… → hubcloud/hubdrive/direct (MovieBox-TUI)."""
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://4khdhub.one/",
+    }) as client:
+        r = await client.get(url)
+        html = r.text
+    payload = None
+    m = re.search(r"s\(\s*['\"]o['\"]\s*,\s*['\"]([^'\"]+)['\"]", html)
+    if m:
+        payload = m.group(1)
+    if not payload:
+        # try id query as last resort
+        m = re.search(r"[?&]id=([^&]+)", url)
+        if m:
+            payload = unquote(m.group(1))
+    target = _decode_greenmotors_payload(payload) if payload else None
+    if not target:
+        raise HTTPException(502, "GreenMotors: could not decode target")
+    if "hubcloud." in target and "/drive/" in target:
+        return await resolve_hubcloud(target)
+    if "hubdrive." in target:
+        return await resolve_hubdrive(target)
+    return [{"url": target, "label": "Direct", "source": "greenmotors"}]
+
+
 async def resolve_hubcloud(drive_url: str) -> List[dict]:
     """
     hubcloud.*/drive/xxx  →  all direct mirrors (FSL, 10Gbps, PixelDrain, Watch Online, R2…)
@@ -867,7 +974,12 @@ async def resolve_any(url: str) -> List[dict]:
         api = _pixeldrain_api(u)
         if api:
             return [{"label": "PixelDrain", "url": api, "priority": 10, "direct": True, "source": "pixeldrain"}]
-    raise HTTPException(400, "Supported: hubcloud.*/drive/..., hubdrive.*/file/..., pixeldrain")
+    if "greenmotors." in low or "greenmountmotors." in low:
+        return await resolve_greenmotors(u)
+    raise HTTPException(
+        400,
+        "Supported: hubcloud.*/drive/..., hubdrive.*/file/..., greenmotors, pixeldrain",
+    )
 
 
 # =============================================================================
@@ -996,7 +1108,7 @@ def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return {"ok": True, "version": "5.3.0", "providers": ["tmdb", "vidsrc", "vidlink", "vidfast", "autoembed", "4khdhub", "hubcloud", "ytmusic", "moviebox-api"]}
+    return {"ok": True, "version": "5.7.0", "providers": ["tmdb", "vidsrc", "vidlink", "vidfast", "autoembed", "4khdhub", "hubcloud", "ytmusic", "moviebox-api"]}
 
 
 # ----- Mov
@@ -1316,61 +1428,70 @@ async def _tmdb_search_id(title: str, media: str = "movie"):
 
 
 def _embed_sources_meta(meta: dict, media: str, se: int = 1, ep: int = 1):
-    """Stream embeds inspired by streambert / Flick-style players (TMDB id).
-
-    Note: Videasy and its mirror Vidking shut down their entire embed
-    infrastructure on 2026-09-15 (see videasy.to), so they're intentionally
-    left out here in favour of currently-live providers (VidSrc, VidLink,
-    VidFast, AutoEmbed) that use the same "TMDB id -> iframe" shape.
-    """
-    sources = []
+    """KiduyuTv + FilmSnaps embed catalog (TMDB id)."""
     tmdb = meta.get("tmdb")
-    imdb = meta.get("imdb")
+    if not tmdb:
+        return []
+    try:
+        tid = int(tmdb)
+    except Exception:
+        return []
     se = max(1, int(se or 1))
     ep = max(1, int(ep or 1))
-    pairs = []
-    if media == "movie":
-        if tmdb:
-            pairs = [
-                ("VidSrc", f"https://vidsrc.xyz/embed/movie/{tmdb}"),
-                ("VidSrc 2", f"https://vsembed.su/embed/movie/{tmdb}"),
-                ("VidLink", f"https://vidlink.pro/movie/{tmdb}"),
-                ("VidFast", f"https://vidfast.pro/movie/{tmdb}"),
-                ("AutoEmbed", f"https://player.autoembed.cc/embed/movie/{tmdb}"),
-                ("EmbedSU", f"https://embed.su/embed/movie/{tmdb}"),
-                ("2Embed", f"https://www.2embed.cc/embed/{tmdb}"),
-            ]
-        elif imdb:
-            pairs = [
-                ("VidSrc IMDB", f"https://vsembed.su/embed/movie/{imdb}"),
-                ("AutoEmbed IMDB", f"https://player.autoembed.cc/embed/movie/{imdb}"),
-            ]
-    else:
-        if tmdb:
-            pairs = [
-                ("VidSrc", f"https://vidsrc.xyz/embed/tv/{tmdb}/{se}/{ep}"),
-                ("VidSrc 2", f"https://vsembed.su/embed/tv/{tmdb}/{se}/{ep}"),
-                ("VidLink", f"https://vidlink.pro/tv/{tmdb}/{se}/{ep}"),
-                ("VidFast", f"https://vidfast.pro/tv/{tmdb}/{se}/{ep}"),
-                ("AutoEmbed", f"https://player.autoembed.cc/embed/tv/{tmdb}/{se}/{ep}"),
-                ("EmbedSU", f"https://embed.su/embed/tv/{tmdb}/{se}/{ep}"),
-            ]
-        elif imdb:
-            pairs = [
-                ("VidSrc IMDB", f"https://vsembed.su/embed/tv/{imdb}/{se}/{ep}"),
-                ("AutoEmbed IMDB", f"https://player.autoembed.cc/embed/tv/{imdb}/{se}/{ep}"),
-            ]
-    for label, url in pairs:
-        sources.append({
-            "provider": "embed",
-            "label": label,
-            "url": url,
-            "play_url": url,
-            "format": "EMBED",
-            "type": "embed",
-        })
-    return sources
-
+    is_tv = media in ("tv", "series", "show")
+    templates = [
+        ("Videasy", "https://player.videasy.net/movie/{id}", "https://player.videasy.net/tv/{id}/{se}/{ep}"),
+        ("Vidrock", "https://vidrock.net/movie/{id}", "https://vidrock.net/tv/{id}/{se}/{ep}"),
+        ("VidLink", "https://vidlink.pro/movie/{id}", "https://vidlink.pro/tv/{id}/{se}/{ep}"),
+        ("VidFast", "https://vidfast.pro/movie/{id}", "https://vidfast.pro/tv/{id}/{se}/{ep}"),
+        ("VidKing", "https://www.vidking.net/embed/movie/{id}", "https://www.vidking.net/embed/tv/{id}/{se}/{ep}"),
+        ("VidNest", "https://vidnest.fun/movie/{id}", "https://vidnest.fun/tv/{id}/{se}/{ep}"),
+        ("VidUp", "https://vidup.to/movie/{id}", "https://vidup.to/tv/{id}/{se}/{ep}"),
+        ("111Movies", "https://111movies.com/movie/{id}", "https://111movies.com/tv/{id}/{se}/{ep}"),
+        ("Flixer", "https://flixer.su/watch/movie/{id}", "https://flixer.su/watch/tv/{id}/{se}/{ep}"),
+        ("VidCore", "https://vidcore.net/movie/{id}", "https://vidcore.net/tv/{id}/{se}/{ep}"),
+        ("MoviesApi", "https://moviesapi.to/movie/{id}", "https://moviesapi.to/tv/{id}-{se}-{ep}"),
+        ("Peachify", "https://peachify.top/embed/movie/{id}", "https://peachify.top/embed/tv/{id}/{se}/{ep}"),
+        ("VidAPI", "https://vaplayer.ru/embed/movie/{id}", "https://vaplayer.ru/embed/tv/{id}/{se}/{ep}"),
+        ("VidPlus", "https://player.vidplus.to/embed/movie/{id}", "https://player.vidplus.to/embed/tv/{id}/{se}/{ep}"),
+        ("CineSrc", "https://cinesrc.st/embed/movie/{id}", "https://cinesrc.st/embed/tv/{id}?s={se}&e={ep}"),
+        ("Vidzen", "https://vidzen.fun/movie/{id}", "https://vidzen.fun/tv/{id}/{se}/{ep}"),
+        ("Cinemaos", "https://cinemaos.tech/player/{id}", "https://cinemaos.tech/player/{id}/{se}/{ep}"),
+        ("Amri", "https://amri.gg/movie/{id}", "https://amri.gg/tv/{id}/{se}/{ep}"),
+        ("ZxcStream", "https://zxcstream.xyz/embed/movie/{id}", "https://zxcstream.xyz/embed/tv/{id}/{se}/{ep}"),
+        ("VidLux", "https://vidlux.xyz/embed/movie/{id}", "https://vidlux.xyz/embed/tv/{id}/{se}/{ep}"),
+        ("VidSrc WTF v4", "https://vidsrc.wtf/api/4/movie/?id={id}", "https://vidsrc.wtf/api/4/tv/?id={id}&s={se}&e={ep}"),
+        ("VidSrc WTF v3", "https://vidsrc.wtf/api/3/movie/?id={id}", "https://vidsrc.wtf/api/3/tv/?id={id}&s={se}&e={ep}"),
+        ("PrimeSrc", "https://primesrc.me/embed/movie?tmdb={id}", "https://primesrc.me/embed/tv?tmdb={id}&season={se}&episode={ep}"),
+        ("VidZee", "https://player.vidzee.wtf/v2/embed/movie/{id}", "https://player.vidzee.wtf/v2/embed/tv/{id}/{se}/{ep}"),
+        ("Lordflix", "https://lordflix.org/watch/movie/{id}", "https://lordflix.org/watch/tv/{id}/{se}/{ep}"),
+        ("VidSrc", "https://vidsrc.to/embed/movie/{id}", "https://vidsrc.to/embed/tv/{id}/{se}/{ep}"),
+        ("VidSrc.cc", "https://vidsrc.cc/v2/embed/movie/{id}", "https://vidsrc.cc/v2/embed/tv/{id}/{se}/{ep}"),
+        ("AutoEmbed", "https://player.autoembed.cc/embed/movie/{id}", "https://player.autoembed.cc/embed/tv/{id}/{se}/{ep}"),
+        ("2Embed", "https://www.2embed.cc/embed/{id}", "https://www.2embed.cc/embedtv/{id}&s={se}&e={ep}"),
+        ("MultiEmbed", "https://multiembed.mov/?video_id={id}&tmdb=1", "https://multiembed.mov/?video_id={id}&tmdb=1&s={se}&e={ep}"),
+        ("EmbedSU", "https://embed.su/embed/movie/{id}", "https://embed.su/embed/tv/{id}/{se}/{ep}"),
+        ("SmashyStream", "https://player.smashy.stream/movie/{id}", "https://player.smashy.stream/tv/{id}?s={se}&e={ep}"),
+        ("Nxsha", "https://web.nxsha.app/embed/movie/{id}", "https://web.nxsha.app/embed/tv/{id}/{se}/{ep}"),
+        ("ScreenScape", "https://screenscape.me/embed/movie/{id}", "https://screenscape.me/embed/tv/{id}/{se}/{ep}"),
+        ("ChillFlix", "https://chillflix.lol/embed/movie/{id}", "https://chillflix.lol/embed/tv/{id}/{se}/{ep}"),
+        ("MegaPlay", "https://megaplay.buzz/embed/movie/{id}", "https://megaplay.buzz/embed/tv/{id}/{se}/{ep}"),
+    ]
+    out = []
+    for name, m_tpl, t_tpl in templates:
+        try:
+            url = (t_tpl if is_tv else m_tpl).format(id=tid, se=se, ep=ep)
+            out.append({
+                "provider": name,
+                "url": url,
+                "play_url": url,
+                "type": "embed",
+                "format": "EMBED",
+                "phone_friendly": True,
+            })
+        except Exception:
+            continue
+    return out
 
 
 def _embed_sources(tmdb_id: str, media: str, se: int = 1, ep: int = 1):
@@ -1415,6 +1536,357 @@ async def mb_search(q: str = Query(..., min_length=1, description="Search query"
         )
     return {"provider": "moviebox", "query": q, "page": page, "total": data.get("total") or len(items), "items": items}
 
+
+
+def _mb_norm_subject(s: dict) -> dict:
+    """Normalize a MovieBox subject dict into a stable card."""
+    if not isinstance(s, dict):
+        return {}
+    if "subject" in s and isinstance(s["subject"], dict):
+        s = s["subject"]
+    sid = s.get("subjectId") or s.get("id") or s.get("subject_id")
+    cover = s.get("cover") or {}
+    poster = (
+        cover.get("url")
+        if isinstance(cover, dict)
+        else (s.get("coverUrl") or s.get("poster") or s.get("poster_url") or "")
+    )
+    st = s.get("subjectType") or s.get("stype") or s.get("subject_type") or 1
+    try:
+        st = int(st)
+    except Exception:
+        st = 1
+    kind = "series" if st == 2 else ("music" if st == 6 else "movie")
+    return {
+        "subject_id": str(sid) if sid is not None else None,
+        "title": s.get("title") or s.get("name"),
+        "type": kind,
+        "subject_type": st,
+        "year": s.get("releaseDate") or s.get("year") or s.get("release_date"),
+        "rating": s.get("imdbRatingValue") or s.get("imdbRate") or s.get("score") or s.get("rating"),
+        "genre": s.get("genre"),
+        "poster": poster,
+        "country": s.get("countryName") or s.get("country"),
+        "corner": s.get("corner"),
+        "has_resource": s.get("hasResource", True),
+        "play": f"/play?subject_id={sid}" if sid else None,
+        "stream": f"/mb/stream/{sid}" if sid else None,
+    }
+
+
+def _mb_extract_subjects(payload) -> list:
+    out: list = []
+    if isinstance(payload, list):
+        for x in payload:
+            if isinstance(x, dict):
+                out.append(x)
+        return out
+    if not isinstance(payload, dict):
+        return out
+    for key in ("movie", "tv", "list", "items", "subjects", "subjectList"):
+        val = payload.get(key)
+        if isinstance(val, list):
+            for it in val:
+                if isinstance(it, dict):
+                    if isinstance(it.get("subjects"), list):
+                        out.extend([s for s in it["subjects"] if isinstance(s, dict)])
+                    else:
+                        out.append(it)
+    for it in payload.get("items") or []:
+        if isinstance(it, dict):
+            for s in it.get("subjects") or it.get("subjectList") or []:
+                if isinstance(s, dict):
+                    out.append(s)
+    for block in payload.get("results") or []:
+        if isinstance(block, dict):
+            for s in block.get("subjects") or []:
+                if isinstance(s, dict):
+                    out.append(s)
+    return out
+
+
+async def _mb_catalog(kind: str, page: int = 1, per_page: int = 20) -> dict:
+    """kind: movie | series — paginated catalog from rank + tabs + search."""
+    want = 1 if kind == "movie" else 2
+    page = max(1, int(page or 1))
+    per_page = max(1, min(50, int(per_page or 20)))
+    seen = set()
+    items: list = []
+
+    def add_many(raw_list, force_type: bool = False):
+        for s in raw_list or []:
+            if not isinstance(s, dict):
+                continue
+            card = _mb_norm_subject(s)
+            sid = card.get("subject_id")
+            if not sid or sid in seen:
+                continue
+            st = card.get("subject_type")
+            if force_type:
+                card["subject_type"] = want
+                card["type"] = "series" if want == 2 else "movie"
+            else:
+                if st is not None and int(st) != want:
+                    continue
+            seen.add(sid)
+            items.append(card)
+
+    try:
+        rank = await mb_request(
+            "GET", f"/wefeed-mobile-bff/subject-api/search-rank?page={page}"
+        )
+        bucket = rank.get("movie") if kind == "movie" else rank.get("tv")
+        add_many(bucket if isinstance(bucket, list) else [], force_type=True)
+    except Exception:
+        pass
+
+    tab_id = 2 if kind == "movie" else 5
+    try:
+        tab = await mb_request(
+            "GET",
+            f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tab_id}&version=",
+        )
+        add_many(_mb_extract_subjects(tab))
+    except Exception:
+        pass
+
+    if len(items) < per_page:
+        seeds = ["a", "e", "i", "the", "love", "man", "2024", "2025", "india", "night"]
+        seed = seeds[(page - 1) % len(seeds)]
+        try:
+            data = await mb_request(
+                "POST",
+                "/wefeed-mobile-bff/subject-api/search/v2",
+                {"keyword": seed, "page": page, "perPage": max(per_page, 20), "subjectType": want},
+            )
+            raw = _mb_extract_subjects(data)
+            filtered = []
+            for s in raw:
+                if isinstance(s, dict) and "subject" in s:
+                    s = s["subject"]
+                if not isinstance(s, dict):
+                    continue
+                try:
+                    st = int(s.get("subjectType") or s.get("stype") or 0)
+                except Exception:
+                    st = 0
+                if st == want:
+                    filtered.append(s)
+            add_many(filtered)
+        except Exception:
+            pass
+
+    page_items = items[:per_page]
+    return {
+        "provider": "moviebox",
+        "type": kind,
+        "page": page,
+        "per_page": per_page,
+        "count": len(page_items),
+        "has_more": len(items) > per_page or len(page_items) >= per_page,
+        "next_page": page + 1 if len(page_items) >= per_page else None,
+        "items": page_items,
+    }
+
+
+@app.get("/mb/movies", tags=["MovieBox"])
+async def mb_movies(page: int = 1, per_page: int = Query(20, ge=1, le=50)):
+    """Paginated MovieBox **movies** only."""
+    return await _mb_catalog("movie", page=page, per_page=per_page)
+
+
+@app.get("/mb/series", tags=["MovieBox"])
+async def mb_series(page: int = 1, per_page: int = Query(20, ge=1, le=50)):
+    """Paginated MovieBox **series / TV** only."""
+    return await _mb_catalog("series", page=page, per_page=per_page)
+
+
+@app.get("/moviebox/movies", tags=["MovieBox-PaxShape"])
+async def moviebox_movies(page: int = 1, perPage: int = Query(20, ge=1, le=50)):
+    """Movies list with pager (PaxSenix-style path)."""
+    data = await _mb_catalog("movie", page=page, per_page=perPage)
+    return {
+        "ok": True,
+        "creator": "ElitePlex-direct",
+        "type": "movie",
+        "pager": {
+            "page": str(page),
+            "per_page": perPage,
+            "has_more": data.get("has_more"),
+            "next_page": str(data["next_page"]) if data.get("next_page") else None,
+        },
+        "items": data.get("items") or [],
+        "count": data.get("count"),
+    }
+
+
+@app.get("/moviebox/series", tags=["MovieBox-PaxShape"])
+async def moviebox_series(page: int = 1, perPage: int = Query(20, ge=1, le=50)):
+    """Series list with pager (PaxSenix-style path)."""
+    data = await _mb_catalog("series", page=page, per_page=perPage)
+    return {
+        "ok": True,
+        "creator": "ElitePlex-direct",
+        "type": "series",
+        "pager": {
+            "page": str(page),
+            "per_page": perPage,
+            "has_more": data.get("has_more"),
+            "next_page": str(data["next_page"]) if data.get("next_page") else None,
+        },
+        "items": data.get("items") or [],
+        "count": data.get("count"),
+    }
+
+
+
+
+@app.get("/mb/resource/{subject_id}", tags=["MovieBox"])
+async def mb_resource(
+    subject_id: str,
+    se: int = 0,
+    ep: int = 0,
+    page: int = 1,
+    perPage: int = Query(20, ge=1, le=50),
+    resolution: int = Query(0, description="0=all, or 480/720/1080"),
+):
+    """
+    MovieBox community/server **resource** list (from MovieBox-TUI).
+    Higher bitrate mirrors alongside play-info DASH.
+    """
+    q = f"subjectId={subject_id}&page={page}&perPage={perPage}"
+    if se or ep:
+        q += f"&se={se}&ep={ep}"
+    if resolution:
+        q += f"&resolution={resolution}"
+    path = f"/wefeed-mobile-bff/subject-api/resource?{q}"
+    try:
+        data = await mb_request("GET", path)
+    except HTTPException:
+        # older path without resolution
+        path2 = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&page={page}&perPage={perPage}"
+        if se or ep:
+            path2 += f"&se={se}&ep={ep}"
+        data = await mb_request("GET", path2)
+    items = []
+    raw_list = []
+    if isinstance(data, dict):
+        raw_list = data.get("list") or data.get("items") or data.get("resources") or data.get("resourceList") or []
+        if not raw_list and data.get("data"):
+            d = data["data"]
+            if isinstance(d, dict):
+                raw_list = d.get("list") or d.get("items") or []
+            elif isinstance(d, list):
+                raw_list = d
+    elif isinstance(data, list):
+        raw_list = data
+    for it in raw_list:
+        if not isinstance(it, dict):
+            continue
+        url = it.get("url") or it.get("resourceLink") or it.get("downloadUrl") or ""
+        cookie = it.get("signCookie") or it.get("cookie") or ""
+        dash = _dash_from_sign_cookie(cookie) if cookie else None
+        playable = dash or (url if url and not _is_dummy_url(url) else None)
+        headers = {"User-Agent": _mb_ua, "Referer": globals().get("STREAM_REFERER", "https://sportslive.wine")}
+        if cookie:
+            headers["Cookie"] = "; ".join(p.strip() for p in cookie.strip(";").split(";") if p.strip())
+            if playable and ".mpd" in (playable or ""):
+                try:
+                    _mb_proxy_remember(playable, headers["Cookie"], headers["Referer"])
+                except Exception:
+                    pass
+        items.append({
+            "id": str(it.get("id") or it.get("resourceId") or ""),
+            "title": it.get("title") or it.get("name") or it.get("resolution"),
+            "resolution": it.get("resolution") or it.get("quality"),
+            "size": it.get("size"),
+            "format": it.get("format") or ("DASH" if playable and ".mpd" in (playable or "") else "MP4"),
+            "url": url,
+            "dash_url": playable,
+            "proxy_url": f"/mb/proxy/mpd?u={quote(playable, safe='')}" if playable and ".mpd" in (playable or "") else None,
+            "headers": headers,
+            "se": it.get("se") or se,
+            "ep": it.get("ep") or ep,
+        })
+    return {
+        "provider": "moviebox",
+        "subject_id": subject_id,
+        "se": se,
+        "ep": ep,
+        "page": page,
+        "count": len(items),
+        "items": items,
+        "raw_keys": list(data.keys()) if isinstance(data, dict) else [],
+    }
+
+
+@app.get("/mb/suggest", tags=["MovieBox"])
+async def mb_suggest(q: str = Query(..., min_length=1)):
+    """Autocomplete-style search (first page of search/v2)."""
+    data = await mb_search(q=q, page=1)
+    return {
+        "query": q,
+        "suggestions": [
+            {
+                "subject_id": it.get("subject_id"),
+                "title": it.get("name") or it.get("title"),
+                "type": it.get("type"),
+                "year": it.get("year"),
+                "poster": it.get("poster_url") or it.get("poster"),
+            }
+            for it in (data.get("items") or [])[:12]
+        ],
+    }
+
+
+@app.get("/mb/rank", tags=["MovieBox"])
+async def mb_rank(page: int = 1):
+    """Trending rank: movies + TV (search-rank)."""
+    data = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/search-rank?page={page}")
+    movies = [_mb_norm_subject(x) for x in (data.get("movie") or []) if isinstance(x, dict)]
+    series = [_mb_norm_subject(x) for x in (data.get("tv") or []) if isinstance(x, dict)]
+    for m in movies:
+        m["type"] = "movie"
+        m["subject_type"] = 1
+    for s in series:
+        s["type"] = "series"
+        s["subject_type"] = 2
+    return {
+        "provider": "moviebox",
+        "page": page,
+        "movies": movies,
+        "series": series,
+        "count": len(movies) + len(series),
+    }
+
+
+@app.get("/mb/season/{subject_id}", tags=["MovieBox"])
+async def mb_season(subject_id: str):
+    """Season / episode structure for a series."""
+    data = await mb_request(
+        "GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subject_id}"
+    )
+    return {"provider": "moviebox", "subject_id": subject_id, "data": data}
+
+
+@app.get("/mb/play/{subject_id}", tags=["MovieBox"])
+async def mb_play(
+    subject_id: str,
+    se: int = 0,
+    ep: int = 0,
+):
+    """
+    Unified MovieBox play: play-info DASH (proxied) + resource mirrors.
+    Preferred entry for clients.
+    """
+    stream = await mb_stream(subject_id, se=se, ep=ep)
+    try:
+        res = await mb_resource(subject_id, se=se, ep=ep, page=1)
+        stream["resources"] = res.get("items") or []
+    except Exception as e:
+        stream["resources"] = []
+        stream["resource_error"] = str(e)[:120]
+    return stream
 
 @app.get("/mb/detail/{subject_id}", tags=["MovieBox"])
 async def mb_detail(subject_id: str):
@@ -1508,6 +1980,16 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
             if cookie:
                 _mb_proxy_remember(u, cookie, referer)
             proxy_mpd = f"/mb/proxy/mpd?u={quote(u, safe='')}"
+            # HTML parseStreams looks for proxy_url / play_url
+            for src in sources:
+                if (src.get("url") or "") == u or ".mpd" in (src.get("url") or ""):
+                    src["proxy_url"] = proxy_mpd
+                    src["play_url"] = proxy_mpd
+                    src["proxied_url"] = proxy_mpd
+                    src["format"] = "DASH"
+            if sources and proxy_mpd:
+                sources[0]["proxy_url"] = proxy_mpd
+                sources[0]["play_url"] = proxy_mpd
         except Exception as e:
             qualities = [{"error": str(e)[:160]}]
         break
@@ -1579,7 +2061,8 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
         "proxy_mpd": proxy_mpd,
         "play": play,
         "count": len(sources),
-        "note": "mp4=all phones · sources/qualities=HEVC DASH (VLC) · browser=embed all phones",
+        "note": "Use sources[].proxy_url or proxy_mpd in browser (dash.js). Raw CDN needs Cookie.",
+        "proxy_url": proxy_mpd,
     }
 
 
@@ -1652,26 +2135,110 @@ async def fk_stream(
     id: str = Query(..., description="Path from /fk/search"),
     se: int = 0,
     ep: int = 0,
-    resolve: bool = Query(False, description="If true, expand HubCloud mirrors to direct URLs"),
+    resolve: bool = Query(True, description="Expand HubCloud/HubDrive to direct stream URLs (default true)"),
+    limit: int = Query(12, ge=1, le=40, description="Max mirrors to resolve"),
 ):
     """
-    Release list with mirrors.
-    Set resolve=true to call HubCloud resolver on each hubcloud/hubdrive link
-    and attach `direct_links` under that mirror.
+    4KHDHub releases + **direct streaming links**.
+
+    By default (`resolve=true`) every HubCloud / HubDrive / PixelDrain mirror is
+    expanded into playable CDN URLs. Flat list is in `streams` for the player.
     """
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 12
+    resolve = bool(resolve)
     html = await fk_fetch(id)
     releases = fk_parse_releases(html, se, ep)
+    streams: List[dict] = []
+    resolved_n = 0
+
+    async def _expand_mirror(mirror: dict) -> List[dict]:
+        url = (mirror.get("url") or "").strip()
+        if not url:
+            return []
+        # already direct?
+        low = url.lower()
+        if any(x in low for x in (".mp4", ".mkv", ".m3u8", "pixeldrain.com/api/file", "cdn.pixeldrain", "workers.dev", "r2.dev")):
+            return [{
+                "url": url if "pixeldrain.com/u/" not in low else (_pixeldrain_api(url) or url),
+                "label": mirror.get("label") or "Direct",
+                "quality": mirror.get("quality") or "",
+                "source": "direct",
+                "playable": True,
+            }]
+        if not resolve and not mirror.get("needs_resolve"):
+            return [{
+                "url": url,
+                "label": mirror.get("label") or "Mirror",
+                "quality": mirror.get("quality") or "",
+                "source": "unresolved",
+                "playable": False,
+            }]
+        try:
+            links = await resolve_any(url)
+        except Exception as e:
+            mirror["resolve_error"] = str(e)[:160]
+            return []
+        out = []
+        for L in links or []:
+            u = L.get("url") if isinstance(L, dict) else str(L)
+            if not u:
+                continue
+            out.append({
+                "url": u,
+                "label": (L.get("label") if isinstance(L, dict) else None) or mirror.get("label") or "CDN",
+                "quality": mirror.get("quality") or (L.get("quality") if isinstance(L, dict) else "") or "",
+                "source": (L.get("source") if isinstance(L, dict) else None) or "hubcloud",
+                "playable": True,
+                "headers": (L.get("headers") if isinstance(L, dict) else None) or {
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": url,
+                },
+            })
+        return out
 
     if resolve:
+        n = 0
         for rel in releases:
             for mirror in rel.get("mirrors") or []:
-                if not mirror.get("needs_resolve"):
-                    continue
+                if n >= limit:
+                    break
+                n += 1
                 try:
-                    mirror["direct_links"] = await resolve_any(mirror["url"])
+                    direct = await _expand_mirror(mirror)
+                    mirror["direct_links"] = direct
+                    for d in direct:
+                        d["release"] = rel.get("title") or rel.get("name") or ""
+                        streams.append(d)
+                        resolved_n += 1
                 except Exception as e:
                     mirror["direct_links"] = []
-                    mirror["resolve_error"] = str(e)
+                    mirror["resolve_error"] = str(e)[:160]
+            if n >= limit:
+                break
+    else:
+        for rel in releases:
+            for mirror in rel.get("mirrors") or []:
+                streams.append({
+                    "url": mirror.get("url"),
+                    "label": mirror.get("label"),
+                    "quality": mirror.get("quality"),
+                    "source": "unresolved",
+                    "playable": False,
+                    "release": rel.get("title") or "",
+                })
+
+    # de-dupe by url
+    seen = set()
+    unique = []
+    for s in streams:
+        u = s.get("url") or ""
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        unique.append(s)
 
     return {
         "provider": "4khdhub",
@@ -1680,8 +2247,30 @@ async def fk_stream(
         "ep": ep,
         "resolved": resolve,
         "count": len(releases),
+        "stream_count": len(unique),
+        "streams": unique,  # direct playable when resolve=true
         "releases": releases,
-        "hint": "Use /tools/resolve?url= for a single HubCloud link, or resolve=true here.",
+        "hint": "Use streams[].url in VLC/mpv/browser. resolve=false returns raw hubcloud pages only.",
+    }
+
+
+@app.get("/fk/play", tags=["4KHDHub"])
+async def fk_play(
+    id: str = Query(..., description="Path from /fk/search"),
+    se: int = 0,
+    ep: int = 0,
+):
+    """Shortcut: always resolve and return only playable streams."""
+    data = await fk_stream(id=id, se=se, ep=ep, resolve=True)
+    playable = [s for s in (data.get("streams") or []) if s.get("playable")]
+    return {
+        "provider": "4khdhub",
+        "id": id,
+        "se": se,
+        "ep": ep,
+        "count": len(playable),
+        "streams": playable,
+        "best": playable[0] if playable else None,
     }
 
 
@@ -2135,6 +2724,1011 @@ async def api_season(item_id: str, season: int):
 
 
 
+
+
+
+# =============================================================================
+# Direct stream / download — VixSrc + aggregate (Uniflix/Flix-style TMDB players)
+# Sources inspired by TMDB-Embed-API / VixSrc / multi-embed catalogs
+# =============================================================================
+
+_VIXSRC_BASE = "https://vixsrc.to"
+_VIX_HDR = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/html, */*",
+}
+
+
+async def _vixsrc_embed_path(tmdb_id: int, media: str = "movie", se: int = 1, ep: int = 1) -> Optional[str]:
+    if media in ("tv", "series"):
+        api = f"{_VIXSRC_BASE}/api/tv/{tmdb_id}/{se}/{ep}"
+    else:
+        api = f"{_VIXSRC_BASE}/api/movie/{tmdb_id}"
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        r = await client.get(api, headers=_VIX_HDR)
+        if r.status_code != 200:
+            return None
+        try:
+            src = (r.json() or {}).get("src") or ""
+        except Exception:
+            return None
+        if not src:
+            return None
+        return src if src.startswith("http") else f"{_VIXSRC_BASE}{src}"
+
+
+async def _vixsrc_resolve_playlist(embed_url: str) -> Optional[dict]:
+    """Parse embed page → signed HLS master playlist + optional downloadUrl."""
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        r = await client.get(embed_url, headers={**_VIX_HDR, "Referer": _VIXSRC_BASE + "/"})
+        if r.status_code != 200:
+            return None
+        text = r.text
+        streams = []
+        m = re.search(r"window\.streams\s*=\s*(\[.*?\]);", text, re.S)
+        if m:
+            try:
+                streams = json.loads(m.group(1))
+            except Exception:
+                streams = []
+        token = expires = None
+        mt = re.search(r"['\"]token['\"]\s*:\s*['\"]([^'\"]+)['\"]", text)
+        me = re.search(r"['\"]expires['\"]\s*:\s*['\"]([^'\"]+)['\"]", text)
+        if mt:
+            token = mt.group(1)
+        if me:
+            expires = me.group(1)
+        pl_base = None
+        mu = re.search(r"window\.masterPlaylist\s*=\s*\{[^}]*url:\s*['\"]([^'\"]+)['\"]", text, re.S)
+        if mu:
+            pl_base = mu.group(1)
+        if not pl_base and streams:
+            pl_base = (streams[0].get("url") or "").split("?")[0]
+        download = None
+        md = re.search(r"window\.downloadUrl\s*=\s*['\"]([^'\"]+)['\"]", text)
+        if md:
+            download = md.group(1)
+
+        out_streams = []
+        if pl_base and token:
+            # try quality variants
+            for extra in ("h=1&lang=en", "lang=en", ""):
+                qs = f"token={token}&expires={expires or ''}"
+                if extra:
+                    qs = f"{qs}&{extra}"
+                u = f"{pl_base}?{qs}" if "?" not in pl_base else f"{pl_base}&{qs}"
+                try:
+                    pr = await client.get(
+                        u,
+                        headers={**_VIX_HDR, "Referer": embed_url, "Accept": "application/vnd.apple.mpegurl,*/*"},
+                    )
+                    if pr.status_code == 200 and "#EXTM3U" in (pr.text or "")[:200]:
+                        out_streams.append({
+                            "url": u,
+                            "format": "HLS",
+                            "label": "VixSrc HLS",
+                            "playable": True,
+                            "headers": {"Referer": embed_url, "User-Agent": _VIX_HDR["User-Agent"]},
+                        })
+                        break
+                except Exception:
+                    continue
+        for s in streams:
+            su = s.get("url")
+            if su and su not in [x["url"] for x in out_streams]:
+                out_streams.append({
+                    "url": su if su.startswith("http") else f"{_VIXSRC_BASE}{su}",
+                    "format": "HLS",
+                    "label": s.get("name") or "VixSrc Server",
+                    "playable": True,
+                    "headers": {"Referer": embed_url, "User-Agent": _VIX_HDR["User-Agent"]},
+                })
+        if not out_streams and not download:
+            return None
+        return {
+            "embed": embed_url,
+            "streams": out_streams,
+            "download_url": download,
+        }
+
+
+@app.get("/vix/stream", tags=["Direct"])
+async def vix_stream(
+    tmdb_id: int = Query(...),
+    media: str = Query("movie"),
+    se: int = Query(1),
+    ep: int = Query(1),
+):
+    """VixSrc direct HLS (TMDB id) — used by modern embed aggregators."""
+    media = "tv" if media in ("tv", "series") else "movie"
+    embed = await _vixsrc_embed_path(tmdb_id, media, se, ep)
+    if not embed:
+        raise HTTPException(404, "VixSrc: no embed for this id")
+    resolved = await _vixsrc_resolve_playlist(embed)
+    if not resolved:
+        return {
+            "provider": "vixsrc",
+            "tmdb_id": tmdb_id,
+            "media": media,
+            "embed": embed,
+            "streams": [{"url": embed, "format": "EMBED", "label": "VixSrc embed", "playable": True}],
+            "note": "playlist resolve failed — use embed iframe",
+        }
+    return {
+        "provider": "vixsrc",
+        "tmdb_id": tmdb_id,
+        "media": media,
+        "se": se if media == "tv" else 0,
+        "ep": ep if media == "tv" else 0,
+        "embed": resolved.get("embed"),
+        "streams": resolved.get("streams") or [],
+        "download_url": resolved.get("download_url"),
+        "count": len(resolved.get("streams") or []),
+    }
+
+
+@app.get("/direct/stream", tags=["Direct"])
+async def direct_stream(
+    tmdb_id: int = Query(None),
+    title: str = Query(None),
+    media: str = Query("movie"),
+    se: int = 1,
+    ep: int = 1,
+    include_embeds: bool = True,
+    include_vixsrc: bool = True,
+    include_4k: bool = True,
+    include_netmirror: bool = False,
+    include_moviebox: bool = False,
+):
+    """
+    Aggregate **direct** streams + embeds for one title.
+    Order: VixSrc HLS → 4KHDHub direct → embeds → optional NetMirror/MovieBox.
+    """
+    media = "tv" if media in ("tv", "series") else "movie"
+    sources: List[dict] = []
+    errors: Dict[str, str] = {}
+    name = (title or "").strip()
+
+    if not tmdb_id and name:
+        try:
+            meta = await _tmdb_search_id(name, media)
+            if meta and meta.get("tmdb"):
+                tmdb_id = int(meta["tmdb"])
+                name = name or meta.get("name") or ""
+        except Exception as e:
+            errors["tmdb"] = str(e)[:80]
+
+    if include_vixsrc and tmdb_id:
+        try:
+            vx = await vix_stream(tmdb_id=tmdb_id, media=media, se=se, ep=ep)
+            for s in vx.get("streams") or []:
+                sources.append({
+                    "provider": "vixsrc",
+                    "label": s.get("label") or "VixSrc",
+                    "url": s.get("url"),
+                    "format": s.get("format") or "HLS",
+                    "type": "direct" if s.get("format") == "HLS" else "embed",
+                    "playable": True,
+                    "headers": s.get("headers") or {},
+                })
+            if vx.get("download_url"):
+                sources.append({
+                    "provider": "vixsrc",
+                    "label": "VixSrc download",
+                    "url": vx["download_url"],
+                    "format": "FILE",
+                    "type": "download",
+                    "playable": False,
+                })
+        except Exception as e:
+            errors["vixsrc"] = str(e)[:100]
+
+    if include_4k and name:
+        try:
+            html = await fk_fetch(f"?s={name}")
+            items = fk_parse_search(html)
+            if items:
+                fid = items[0].get("id")
+                fk = await fk_stream(
+                    id=fid,
+                    se=se if media == "tv" else 0,
+                    ep=ep if media == "tv" else 0,
+                    resolve=True,
+                    limit=6,
+                )
+                for s in fk.get("streams") or []:
+                    if s.get("url"):
+                        sources.append({
+                            "provider": "4khdhub",
+                            "label": s.get("label") or "4K Hub",
+                            "url": s["url"],
+                            "format": s.get("format") or "FILE",
+                            "type": "direct",
+                            "playable": bool(s.get("playable", True)),
+                            "headers": s.get("headers") or {},
+                        })
+        except Exception as e:
+            errors["4khdhub"] = str(e)[:100]
+
+    if include_netmirror and name:
+        try:
+            nm = await nm_play(q=name, platform="netflix", se=se if media == "tv" else 0, ep=ep if media == "tv" else 0)
+            for s in nm.get("streams") or []:
+                sources.append({
+                    "provider": "netmirror",
+                    "label": "NetMirror",
+                    "url": s.get("url"),
+                    "format": s.get("format") or "HLS",
+                    "type": "direct",
+                    "playable": True,
+                    "headers": s.get("headers") or {},
+                })
+        except Exception as e:
+            errors["netmirror"] = str(e)[:100]
+
+    if include_moviebox and name:
+        try:
+            mb = await mb_search(q=name, page=1)
+            items = mb.get("items") or []
+            if items:
+                sid = items[0].get("subject_id")
+                st = await mb_stream(sid, se=se if media == "tv" else 0, ep=ep if media == "tv" else 0)
+                if st.get("proxy_url") or st.get("proxy_mpd"):
+                    sources.append({
+                        "provider": "moviebox",
+                        "label": "MovieBox DASH",
+                        "url": st.get("proxy_url") or st.get("proxy_mpd"),
+                        "format": "DASH",
+                        "type": "direct",
+                        "playable": True,
+                    })
+        except Exception as e:
+            errors["moviebox"] = str(e)[:100]
+
+    if include_embeds and tmdb_id:
+        for e in _build_embeds(tmdb_id, media, se, ep)[:20]:
+            sources.append({
+                "provider": e.get("provider"),
+                "label": e.get("provider"),
+                "url": e.get("url"),
+                "format": "EMBED",
+                "type": "embed",
+                "playable": True,
+            })
+
+    # dedupe by url
+    seen = set()
+    uniq = []
+    for s in sources:
+        u = s.get("url")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        uniq.append(s)
+
+    direct = [s for s in uniq if s.get("type") == "direct"]
+    return {
+        "tmdb_id": tmdb_id,
+        "title": name,
+        "media": media,
+        "se": se if media == "tv" else 0,
+        "ep": ep if media == "tv" else 0,
+        "count": len(uniq),
+        "direct_count": len(direct),
+        "sources": uniq,
+        "direct": direct,
+        "errors": errors or None,
+    }
+
+
+@app.get("/direct/download", tags=["Direct"])
+async def direct_download(
+    tmdb_id: int = Query(None),
+    title: str = Query(None),
+    media: str = Query("movie"),
+    se: int = 0,
+    ep: int = 0,
+    url: str = Query(None, description="Optional page/file URL to resolve via yt-dlp / HubCloud"),
+):
+    """
+    Direct download links:
+    - 4KHDHub / HubCloud resolve
+    - optional yt-dlp on any `url`
+    - VixSrc downloadUrl when available
+    """
+    media = "tv" if media in ("tv", "series") else "movie"
+    links: List[dict] = []
+    errors: Dict[str, str] = {}
+    name = (title or "").strip()
+
+    if not tmdb_id and name:
+        try:
+            meta = await _tmdb_search_id(name, media)
+            if meta and meta.get("tmdb"):
+                tmdb_id = int(meta["tmdb"])
+        except Exception:
+            pass
+
+    if name:
+        try:
+            html = await fk_fetch(f"?s={name}")
+            items = fk_parse_search(html)
+            if items:
+                fid = items[0].get("id")
+                fk = await fk_stream(
+                    id=fid,
+                    se=se if media == "tv" else 0,
+                    ep=ep if media == "tv" else 0,
+                    resolve=True,
+                    limit=10,
+                )
+                for s in fk.get("streams") or []:
+                    if s.get("url"):
+                        links.append({
+                            "provider": "4khdhub",
+                            "label": s.get("label") or "Hub download",
+                            "url": s["url"],
+                            "format": s.get("format") or "FILE",
+                            "quality": s.get("quality") or "",
+                        })
+        except Exception as e:
+            errors["4khdhub"] = str(e)[:100]
+
+    if tmdb_id:
+        try:
+            vx = await vix_stream(tmdb_id=tmdb_id, media=media, se=max(1, se), ep=max(1, ep))
+            if vx.get("download_url"):
+                links.append({
+                    "provider": "vixsrc",
+                    "label": "VixSrc download",
+                    "url": vx["download_url"],
+                    "format": "FILE",
+                })
+            for s in vx.get("streams") or []:
+                if s.get("format") == "HLS" and s.get("url"):
+                    links.append({
+                        "provider": "vixsrc",
+                        "label": "VixSrc HLS (save)",
+                        "url": s["url"],
+                        "format": "HLS",
+                        "headers": s.get("headers") or {},
+                    })
+        except Exception as e:
+            errors["vixsrc"] = str(e)[:100]
+
+    if url:
+        try:
+            # reuse tools/resolve or dl/any if present
+            if "tools_resolve" in globals() or hasattr(app, "routes"):
+                pass
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                # HubCloud-style
+                if "hubcloud" in url or "hubdrive" in url:
+                    try:
+                        from urllib.parse import quote as _q
+                        # call internal if exists
+                        pass
+                    except Exception:
+                        pass
+                # generic: return url as-is for client download
+                links.append({
+                    "provider": "raw",
+                    "label": "Provided URL",
+                    "url": url,
+                    "format": "FILE",
+                })
+        except Exception as e:
+            errors["url"] = str(e)[:100]
+
+    seen = set()
+    uniq = []
+    for L in links:
+        u = L.get("url")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        uniq.append(L)
+
+    return {
+        "tmdb_id": tmdb_id,
+        "title": name,
+        "count": len(uniq),
+        "downloads": uniq,
+        "errors": errors or None,
+    }
+
+# =============================================================================
+# NetMirror (NewTV) — Netflix / Prime / Hotstar mirrors via rotating API
+# =============================================================================
+
+_NM_PROBE = [
+    "https://mobiledetects.com",
+    "https://mobiledetect.app",
+    "https://mobidetect.art",
+    "https://mobidetect.cc",
+    "https://mobidetects.cc",
+    "https://mobidetects.pro",
+]
+_NM_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+    "X-Requested-With": "NetmirrorNewTV v1.0",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) "
+        "Gecko/20100101 Firefox/136.0 /OS.GatuNewTV v1.0"
+    ),
+    "Accept": "application/json, text/plain, */*",
+}
+_NM_PLATFORMS = {
+    "netflix": "nf",
+    "prime": "pv",
+    "hotstar": "hs",
+    "disney": "hs",
+}
+_nm_api_base: Optional[str] = None
+
+
+_nm_api_bases: List[str] = []
+
+
+async def _nm_resolve_bases() -> List[str]:
+    """Discover all working NewTV API bases (token_hash from probe domains)."""
+    global _nm_api_bases, _nm_api_base
+    if _nm_api_bases:
+        return _nm_api_bases
+    found: List[str] = []
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        for probe in _NM_PROBE:
+            try:
+                r = await client.get(f"{probe}/checknewtv.php", headers=_NM_HEADERS)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                th = data.get("token_hash")
+                if not th:
+                    continue
+                base = base64.b64decode(th + "=" * (-len(th) % 4)).decode("utf-8").rstrip("/")
+                if base.startswith("http") and base not in found:
+                    found.append(base)
+            except Exception:
+                continue
+    # known fallbacks
+    for fb in ("https://tv.imgcdn.kim", "https://tv.imgcdn.cloud"):
+        if fb not in found:
+            found.append(fb)
+    if not found:
+        raise HTTPException(502, "NetMirror API base could not be resolved")
+    _nm_api_bases = found
+    _nm_api_base = found[0]
+    return found
+
+
+async def _nm_resolve_base() -> str:
+    bases = await _nm_resolve_bases()
+    return bases[0]
+
+
+def _nm_headers(ott: str, extra: Optional[dict] = None) -> dict:
+    h = dict(_NM_HEADERS)
+    h["Ott"] = ott
+    if extra:
+        h.update(extra)
+    return h
+
+
+async def _nm_get(path: str, ott: str, params: Optional[dict] = None, extra: Optional[dict] = None) -> dict:
+    """GET with base rotation on 403/5xx (Vercel/cloud IPs often blocked)."""
+    global _nm_api_base, _nm_api_bases
+    bases = await _nm_resolve_bases()
+    last_err = "unknown"
+    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+        for base in bases:
+            try:
+                r = await client.get(
+                    f"{base}{path}",
+                    params=params or {},
+                    headers=_nm_headers(ott, extra),
+                )
+                if r.status_code in (403, 429, 502, 503):
+                    last_err = f"HTTP {r.status_code} @ {base}"
+                    continue
+                if r.status_code >= 400:
+                    last_err = f"HTTP {r.status_code} @ {base}"
+                    continue
+                try:
+                    data = r.json()
+                except Exception:
+                    last_err = f"non-JSON @ {base}"
+                    continue
+                _nm_api_base = base
+                return data
+            except Exception as e:
+                last_err = str(e)[:120]
+                continue
+    # soft signal — callers can convert
+    raise HTTPException(503, f"NetMirror unavailable ({last_err})")
+
+
+@app.get("/nm/search", tags=["NetMirror"])
+async def nm_search(
+    q: str = Query(..., min_length=1),
+    platform: str = Query("netflix", description="netflix|prime|hotstar|disney"),
+):
+    """NetMirror title search (OTT library)."""
+    ott = _NM_PLATFORMS.get(platform.lower(), "nf")
+    data = await _nm_get("/newtv/search.php", ott, {"s": q})
+    items = []
+    for it in data.get("searchResult") or []:
+        if not isinstance(it, dict):
+            continue
+        items.append({
+            "id": str(it.get("id") or ""),
+            "title": it.get("t") or it.get("title") or "",
+            "platform": platform,
+            "ott": ott,
+        })
+    return {
+        "provider": "netmirror",
+        "display_name": "NetMirror",
+        "platform": platform,
+        "query": q,
+        "count": len(items),
+        "items": items,
+        "img_referer": data.get("img_referer"),
+    }
+
+
+@app.get("/nm/detail", tags=["NetMirror"])
+async def nm_detail(
+    id: str = Query(..., description="NetMirror content id from /nm/search"),
+    platform: str = Query("netflix"),
+):
+    """NetMirror post/detail (seasons / episodes metadata)."""
+    ott = _NM_PLATFORMS.get(platform.lower(), "nf")
+    data = await _nm_get(
+        "/newtv/post.php",
+        ott,
+        {"id": id},
+        {"Lastep": "", "Usertoken": ""},
+    )
+    return {
+        "provider": "netmirror",
+        "display_name": "NetMirror",
+        "id": id,
+        "platform": platform,
+        "data": data,
+    }
+
+
+@app.get("/nm/stream", tags=["NetMirror"])
+async def nm_stream(
+    id: str = Query(..., description="Content or episode id"),
+    platform: str = Query("netflix"),
+    title: str = Query(None, description="Optional title — search then play first match"),
+    se: int = 0,
+    ep: int = 0,
+):
+    """
+    NetMirror direct stream (usually HLS .m3u8).
+    Pass `id` from search, or `title` to search+play in one call.
+    """
+    ott = _NM_PLATFORMS.get(platform.lower(), "nf")
+    content_id = id
+    if title and not id:
+        sr = await _nm_get("/newtv/search.php", ott, {"s": title})
+        results = sr.get("searchResult") or []
+        if not results:
+            raise HTTPException(404, "NetMirror: no search results")
+        content_id = str(results[0].get("id"))
+    # detail for series episode mapping
+    if se or ep:
+        try:
+            post = await _nm_get(
+                "/newtv/post.php",
+                ott,
+                {"id": content_id},
+                {"Lastep": "", "Usertoken": ""},
+            )
+            # try match episode list
+            for e in post.get("episodes") or []:
+                if not e:
+                    continue
+                e_ep = e.get("ep") or (e.get("epNum") or "").replace("E", "")
+                try:
+                    e_ep_i = int(e_ep)
+                except Exception:
+                    continue
+                if ep and e_ep_i == ep:
+                    content_id = str(e.get("id") or content_id)
+                    break
+            else:
+                content_id = str(post.get("main_id") or content_id)
+        except Exception:
+            pass
+    else:
+        try:
+            post = await _nm_get(
+                "/newtv/post.php",
+                ott,
+                {"id": content_id},
+                {"Lastep": "", "Usertoken": ""},
+            )
+            content_id = str(post.get("main_id") or content_id)
+        except Exception:
+            pass
+
+    player = await _nm_get(
+        "/newtv/player.php",
+        ott,
+        {"id": content_id},
+        {"Usertoken": ""},
+    )
+    link = player.get("video_link") or player.get("url") or ""
+    if not link:
+        raise HTTPException(404, f"NetMirror: no video_link ({player.get('status')})")
+    base = await _nm_resolve_base()
+    return {
+        "provider": "netmirror",
+        "display_name": "NetMirror",
+        "platform": platform,
+        "id": content_id,
+        "title": player.get("title") or title,
+        "status": player.get("status"),
+        "stream": {
+            "url": link,
+            "format": "HLS" if ".m3u8" in link else "FILE",
+            "playable": True,
+            "headers": {
+                "Referer": player.get("referer") or "https://net52.cc",
+                "User-Agent": _NM_HEADERS["User-Agent"],
+            },
+        },
+        "streams": [
+            {
+                "url": link,
+                "label": f"NetMirror ({platform})",
+                "format": "HLS" if ".m3u8" in link else "FILE",
+                "playable": True,
+                "headers": {
+                    "Referer": player.get("referer") or "https://net52.cc",
+                    "User-Agent": _NM_HEADERS["User-Agent"],
+                },
+            }
+        ],
+        "api_base": base,
+    }
+
+
+@app.get("/nm/play", tags=["NetMirror"])
+async def nm_play(
+    q: str = Query(..., description="Title to search"),
+    platform: str = Query("netflix"),
+    se: int = 0,
+    ep: int = 0,
+):
+    """Search + stream in one call (NetMirror)."""
+    return await nm_stream(id="", platform=platform, title=q, se=se, ep=ep)
+
+
+# Named UI sources (as shown in Select Source Server dialog)
+_NAMED_SOURCES = [
+    {
+        "id": "netmirror",
+        "display_name": "NetMirror",
+        "badge": "Beta Experimental",
+        "description": "OTT mirror (Netflix / Prime / Hotstar) — direct HLS",
+        "endpoint": "/nm/play?q={title}&platform=netflix",
+    },
+    {
+        "id": "spacedom",
+        "display_name": "SpaceDom",
+        "badge": "Beta Experimental",
+        "description": "Experimental multi-source embed (Cinemaos + Zxc)",
+        "endpoint": "/providers/embeds?tmdb_id={tmdb_id}&media={media}",
+    },
+    {
+        "id": "source3",
+        "display_name": "Source 3",
+        "badge": "Reliable Multi-lang Always-Work",
+        "description": "MultiEmbed + VidSrc + AutoEmbed (multi language)",
+        "providers": ["MultiEmbed", "VidSrc", "AutoEmbed", "2Embed"],
+    },
+    {
+        "id": "source6",
+        "display_name": "Source 6",
+        "badge": "Multi-lang Sometimes works best",
+        "description": "VidSrc WTF v4 + PrimeSrc + VidZee",
+        "providers": ["VidSrc WTF v4", "PrimeSrc", "VidZee", "VidSrc WTF v3"],
+    },
+]
+
+
+@app.get("/sources", tags=["Providers"])
+async def sources_catalog():
+    """UI source server list (NetMirror, SpaceDom, Source 3, Source 6, …)."""
+    return {
+        "count": len(_NAMED_SOURCES) + len(_KIDUYU_EMBEDS),
+        "named": _NAMED_SOURCES,
+        "embeds": [{"id": n, "display_name": n} for n, _, _ in _KIDUYU_EMBEDS],
+    }
+
+
+@app.get("/sources/play", tags=["Providers"])
+async def sources_play(
+    source: str = Query(..., description="netmirror|spacedom|source3|source6|or embed id"),
+    tmdb_id: int = Query(None),
+    title: str = Query(None),
+    media: str = Query("movie"),
+    se: int = 1,
+    ep: int = 1,
+    platform: str = Query("netflix"),
+):
+    """Play via a named source server."""
+    sid = source.lower().strip()
+    media = "tv" if media in ("tv", "series") else "movie"
+    if sid in ("netmirror", "nm"):
+        if not title:
+            raise HTTPException(400, "title required for NetMirror")
+        return await nm_play(q=title, platform=platform, se=se if media == "tv" else 0, ep=ep if media == "tv" else 0)
+    if sid in ("spacedom", "space"):
+        if not tmdb_id:
+            raise HTTPException(400, "tmdb_id required for SpaceDom")
+        embeds = _build_embeds(tmdb_id, media, se, ep)
+        # prefer experimental hosts
+        prefer = {"cinemaos", "zxcstream", "vidnest", "peachify", "megaplay"}
+        ranked = sorted(embeds, key=lambda e: (0 if e["provider"] in prefer else 1))
+        return {
+            "provider": "spacedom",
+            "display_name": "SpaceDom",
+            "badge": "Beta Experimental",
+            "count": len(ranked),
+            "sources": ranked,
+        }
+    if sid in ("source3", "source_3", "s3"):
+        if not tmdb_id:
+            raise HTTPException(400, "tmdb_id required")
+        want = {"multiembed", "vidsrc", "autoembed", "2embed", "embedsu"}
+        embeds = [e for e in _build_embeds(tmdb_id, media, se, ep) if e["provider"] in want]
+        return {
+            "provider": "source3",
+            "display_name": "Source 3",
+            "badge": "Reliable Multi-lang Always-Work",
+            "count": len(embeds),
+            "sources": embeds,
+        }
+    if sid in ("source6", "source_6", "s6"):
+        if not tmdb_id:
+            raise HTTPException(400, "tmdb_id required")
+        want = {"vidsrc_wtf_v4", "vidsrc_wtf_v3", "primesrc", "vidzee"}
+        embeds = [e for e in _build_embeds(tmdb_id, media, se, ep) if e["provider"] in want]
+        return {
+            "provider": "source6",
+            "display_name": "Source 6",
+            "badge": "Multi-lang Sometimes works best",
+            "count": len(embeds),
+            "sources": embeds,
+        }
+    # fallback: single embed by provider id
+    if tmdb_id:
+        embeds = _build_embeds(tmdb_id, media, se, ep)
+        hit = [e for e in embeds if e["provider"] == sid or e["provider"].lower() == sid]
+        return {"provider": sid, "display_name": sid, "count": len(hit), "sources": hit or embeds[:5]}
+    raise HTTPException(400, "Need title (NetMirror) or tmdb_id (other sources)")
+
+# =============================================================================
+# FilmSnaps + KiduyuTv embed / provider catalog (from their open-source lists)
+# Kiduyu backend (sflatransport) is often CF-challenged; embeds always work.
+# =============================================================================
+
+# KiduyuTv StreamProvider templates (movie / tv with season episode)
+_KIDUYU_EMBEDS = [
+    ("videasy", "https://player.videasy.net/movie/{id}", "https://player.videasy.net/tv/{id}/{se}/{ep}"),
+    ("vidrock", "https://vidrock.net/movie/{id}", "https://vidrock.net/tv/{id}/{se}/{ep}"),
+    ("vidlink", "https://vidlink.pro/movie/{id}", "https://vidlink.pro/tv/{id}/{se}/{ep}"),
+    ("vidfast", "https://vidfast.pro/movie/{id}", "https://vidfast.pro/tv/{id}/{se}/{ep}"),
+    ("vidking", "https://www.vidking.net/embed/movie/{id}", "https://www.vidking.net/embed/tv/{id}/{se}/{ep}"),
+    ("vidnest", "https://vidnest.fun/movie/{id}", "https://vidnest.fun/tv/{id}/{se}/{ep}"),
+    ("vidup", "https://vidup.to/movie/{id}", "https://vidup.to/tv/{id}/{se}/{ep}"),
+    ("111movies", "https://111movies.com/movie/{id}", "https://111movies.com/tv/{id}/{se}/{ep}"),
+    ("flixer", "https://flixer.su/watch/movie/{id}", "https://flixer.su/watch/tv/{id}/{se}/{ep}"),
+    ("vidcore", "https://vidcore.net/movie/{id}", "https://vidcore.net/tv/{id}/{se}/{ep}"),
+    ("moviesapi", "https://moviesapi.to/movie/{id}", "https://moviesapi.to/tv/{id}-{se}-{ep}"),
+    ("peachify", "https://peachify.top/embed/movie/{id}", "https://peachify.top/embed/tv/{id}/{se}/{ep}"),
+    ("vidapi", "https://vaplayer.ru/embed/movie/{id}", "https://vaplayer.ru/embed/tv/{id}/{se}/{ep}"),
+    ("vidplus", "https://player.vidplus.to/embed/movie/{id}", "https://player.vidplus.to/embed/tv/{id}/{se}/{ep}"),
+    ("cinesrc", "https://cinesrc.st/embed/movie/{id}", "https://cinesrc.st/embed/tv/{id}?s={se}&e={ep}"),
+    ("vidzen", "https://vidzen.fun/movie/{id}", "https://vidzen.fun/tv/{id}/{se}/{ep}"),
+    ("cinemaos", "https://cinemaos.tech/player/{id}", "https://cinemaos.tech/player/{id}/{se}/{ep}"),
+    ("amri", "https://amri.gg/movie/{id}", "https://amri.gg/tv/{id}/{se}/{ep}"),
+    ("zxcstream", "https://zxcstream.xyz/embed/movie/{id}", "https://zxcstream.xyz/embed/tv/{id}/{se}/{ep}"),
+    ("vidlux", "https://vidlux.xyz/embed/movie/{id}", "https://vidlux.xyz/embed/tv/{id}/{se}/{ep}"),
+    ("vidsrc_wtf_v4", "https://vidsrc.wtf/api/4/movie/?id={id}", "https://vidsrc.wtf/api/4/tv/?id={id}&s={se}&e={ep}"),
+    ("vidsrc_wtf_v3", "https://vidsrc.wtf/api/3/movie/?id={id}", "https://vidsrc.wtf/api/3/tv/?id={id}&s={se}&e={ep}"),
+    ("primesrc", "https://primesrc.me/embed/movie?tmdb={id}", "https://primesrc.me/embed/tv?tmdb={id}&season={se}&episode={ep}"),
+    ("vidzee", "https://player.vidzee.wtf/v2/embed/movie/{id}", "https://player.vidzee.wtf/v2/embed/tv/{id}/{se}/{ep}"),
+    ("lordflix", "https://lordflix.org/watch/movie/{id}", "https://lordflix.org/watch/tv/{id}/{se}/{ep}"),
+    ("vidsrc", "https://vidsrc.to/embed/movie/{id}", "https://vidsrc.to/embed/tv/{id}/{se}/{ep}"),
+    ("vidsrc_cc", "https://vidsrc.cc/v2/embed/movie/{id}", "https://vidsrc.cc/v2/embed/tv/{id}/{se}/{ep}"),
+    ("autoembed", "https://player.autoembed.cc/embed/movie/{id}", "https://player.autoembed.cc/embed/tv/{id}/{se}/{ep}"),
+    ("2embed", "https://www.2embed.cc/embed/{id}", "https://www.2embed.cc/embedtv/{id}&s={se}&e={ep}"),
+    ("multiembed", "https://multiembed.mov/?video_id={id}&tmdb=1", "https://multiembed.mov/?video_id={id}&tmdb=1&s={se}&e={ep}"),
+    ("embedsu", "https://embed.su/embed/movie/{id}", "https://embed.su/embed/tv/{id}/{se}/{ep}"),
+    ("smashystream", "https://player.smashy.stream/movie/{id}", "https://player.smashy.stream/tv/{id}?s={se}&e={ep}"),
+]
+
+# FilmSnaps providers.json host ids (for documentation / allowlist)
+_FILMSNAPS_HOSTS = [
+    "web.nxsha.app", "nxcdn.app", "peachify.top", "screenscape.me", "nhdapi.com",
+    "zxcstream.xyz", "player.zxcstream.xyz", "cinemaos.live", "chillflix.lol",
+    "vidapi.cloud", "vidnest.fun", "toustream.xyz", "streamguide.cfd",
+    "player.vidzee.wtf", "megaplay.buzz", "player.videasy.net", "www.vidking.net",
+]
+
+
+def _build_embeds(tmdb_id: int, media: str = "movie", se: int = 1, ep: int = 1) -> List[dict]:
+    se = se or 1
+    ep = ep or 1
+    out = []
+    for name, m_tpl, t_tpl in _KIDUYU_EMBEDS:
+        try:
+            if media in ("tv", "series"):
+                url = t_tpl.format(id=tmdb_id, se=se, ep=ep)
+            else:
+                url = m_tpl.format(id=tmdb_id, se=se, ep=ep)
+            out.append({
+                "type": "embed",
+                "provider": name,
+                "url": url,
+                "playable": True,
+                "phone_friendly": True,
+                "source": "kiduyu+filmsnaps",
+            })
+        except Exception:
+            continue
+    return out
+
+
+@app.get("/providers/list", tags=["Providers"])
+async def providers_list():
+    """All embed providers (KiduyuTv + FilmSnaps style) + FilmSnaps CDN hosts."""
+    return {
+        "ok": True,
+        "embed_count": len(_KIDUYU_EMBEDS),
+        "embeds": [{"id": n, "movie": m, "tv": tv} for n, m, tv in _KIDUYU_EMBEDS],
+        "filmsnaps_hosts": _FILMSNAPS_HOSTS,
+        "note": "Use /providers/embeds?tmdb_id=19995&media=movie",
+    }
+
+
+@app.get("/providers/embeds", tags=["Providers"])
+async def providers_embeds(
+    tmdb_id: int = Query(..., description="TMDB id"),
+    media: str = Query("movie", description="movie | tv"),
+    se: int = Query(1, description="season (tv)"),
+    ep: int = Query(1, description="episode (tv)"),
+):
+    """KiduyuTv + FilmSnaps-style embed URLs for a title."""
+    embeds = _build_embeds(tmdb_id, media, se, ep)
+    return {
+        "ok": True,
+        "tmdb_id": tmdb_id,
+        "media": media,
+        "se": se,
+        "ep": ep,
+        "count": len(embeds),
+        "embeds": embeds,
+    }
+
+
+@app.get("/providers/streams", tags=["Providers"])
+async def providers_streams(
+    tmdb_id: int = Query(...),
+    media: str = Query("movie"),
+    se: int = 1,
+    ep: int = 1,
+    include_embeds: bool = True,
+    include_moviebox: bool = False,
+    include_4k: bool = False,
+    title: str = Query(None),
+):
+    """
+    Aggregate play sources:
+    - full embed catalog (Kiduyu + FilmSnaps hosts)
+    - optional MovieBox DASH proxy (if title/subject resolved)
+    - optional 4KHDHub direct streams (if title search hits)
+    """
+    media = "tv" if media in ("tv", "series") else "movie"
+    sources = _build_embeds(tmdb_id, media, se, ep) if include_embeds else []
+    errors = {}
+
+    if include_moviebox and title:
+        try:
+            mb = await mb_search(q=title, page=1)
+            items = mb.get("items") or []
+            if items:
+                sid = items[0].get("subject_id")
+                st = await mb_stream(sid, se=se if media == "tv" else 0, ep=ep if media == "tv" else 0)
+                if st.get("proxy_url") or st.get("proxy_mpd"):
+                    sources.append({
+                        "type": "dash",
+                        "provider": "moviebox",
+                        "url": st.get("proxy_url") or st.get("proxy_mpd"),
+                        "playable": True,
+                        "phone_friendly": False,
+                        "subject_id": sid,
+                    })
+                for b in st.get("browser") or []:
+                    sources.append({"type": "embed", "provider": b.get("provider"), "url": b.get("url"), "playable": True})
+        except Exception as e:
+            errors["moviebox"] = str(e)[:120]
+
+    if include_4k and title:
+        try:
+            html = await fk_fetch(f"?s={title}")
+            items = fk_parse_search(html)
+            if items:
+                fid = items[0].get("id")
+                fk = await fk_stream(id=fid, se=se if media == "tv" else 0, ep=ep if media == "tv" else 0, resolve=True, limit=6)
+                for s in fk.get("streams") or []:
+                    if s.get("playable"):
+                        sources.append({
+                            "type": "direct",
+                            "provider": "4khdhub",
+                            "url": s.get("url"),
+                            "label": s.get("label"),
+                            "playable": True,
+                            "phone_friendly": True,
+                        })
+        except Exception as e:
+            errors["4khdhub"] = str(e)[:120]
+
+    return {
+        "ok": True,
+        "tmdb_id": tmdb_id,
+        "media": media,
+        "se": se,
+        "ep": ep,
+        "count": len(sources),
+        "sources": sources,
+        "errors": errors or None,
+    }
+
+
+@app.get("/providers/subtitles", tags=["Providers"])
+async def providers_subtitles(
+    tmdb_id: int = Query(None),
+    imdb_id: str = Query(None),
+    query: str = Query(None),
+    se: int = 0,
+    ep: int = 0,
+):
+    """Wyzie-style open subtitle lookup (FilmSnaps uses sub.wyzie.io)."""
+    urls = []
+    if imdb_id:
+        urls.append(f"https://sub.wyzie.io/search?id={imdb_id}")
+    if tmdb_id:
+        urls.append(f"https://sub.wyzie.io/search?id={tmdb_id}")
+        if se and ep:
+            urls.append(f"https://sub.wyzie.io/search?id={tmdb_id}&season={se}&episode={ep}")
+    if query:
+        urls.append(f"https://sub.wyzie.io/search?query={quote(query)}")
+    results = []
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        for u in urls[:3]:
+            try:
+                r = await client.get(u, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, list):
+                        results.extend(data)
+                    elif isinstance(data, dict):
+                        results.extend(data.get("subtitles") or data.get("data") or [])
+            except Exception:
+                continue
+    return {"ok": True, "count": len(results), "subtitles": results[:40]}
+
+
 @app.get("/api/play", tags=["Playback"])
 async def api_play(
     subject_id: str = Query(None, description="Legacy MovieBox id — ignored on web path"),
@@ -2520,6 +4114,167 @@ async def _ytdlp_audio(video_id: str) -> Tuple[Optional[str], Optional[str], Opt
     return await asyncio.to_thread(_extract)
 
 
+
+
+
+@app.get("/movie/search", tags=["Movies"])
+async def movie_search(q: str = Query(..., min_length=1), page: int = 1):
+    """Unified movie search: TMDB + MovieBox + 4KHDHub (parallel)."""
+    import asyncio as _aio
+
+    async def tmdb():
+        try:
+            d = await _tmdb_get("/search/multi", {"query": q, "page": page})
+            out = []
+            for r in d.get("results") or []:
+                if r.get("media_type") not in ("movie", "tv"):
+                    continue
+                out.append({
+                    "provider": "tmdb",
+                    "id": r["id"],
+                    "media": r["media_type"],
+                    "title": r.get("title") or r.get("name"),
+                    "year": (r.get("release_date") or r.get("first_air_date") or "")[:4],
+                    "poster": f"https://image.tmdb.org/t/p/w500{r['poster_path']}" if r.get("poster_path") else None,
+                    "rating": r.get("vote_average"),
+                })
+            return out
+        except Exception:
+            return []
+
+    async def mb():
+        try:
+            d = await mb_search(q=q, page=page)
+            return [
+                {
+                    "provider": "moviebox",
+                    "id": it.get("subject_id"),
+                    "media": it.get("type") or "movie",
+                    "title": it.get("name") or it.get("title"),
+                    "year": it.get("year"),
+                    "poster": it.get("poster_url") or it.get("poster"),
+                    "rating": it.get("rating"),
+                }
+                for it in (d.get("items") or [])
+            ]
+        except Exception:
+            return []
+
+    async def fk():
+        try:
+            html = await fk_fetch(f"?s={q}")
+            return [
+                {
+                    "provider": "4khdhub",
+                    "id": it.get("id"),
+                    "media": "movie",
+                    "title": it.get("name") or it.get("title"),
+                    "year": it.get("year"),
+                    "poster": it.get("poster"),
+                }
+                for it in fk_parse_search(html)[:15]
+            ]
+        except Exception:
+            return []
+
+    tmdb_i, mb_i, fk_i = await _aio.gather(tmdb(), mb(), fk())
+    return {
+        "query": q,
+        "page": page,
+        "tmdb": tmdb_i,
+        "moviebox": mb_i,
+        "fourkhdhub": fk_i,
+        "count": len(tmdb_i) + len(mb_i) + len(fk_i),
+    }
+
+
+@app.get("/movie/play", tags=["Movies"])
+async def movie_play(
+    title: str = Query(None, description="Title to match"),
+    tmdb_id: int = Query(None),
+    media: str = Query("movie", description="movie|tv"),
+    subject_id: str = Query(None, description="MovieBox subject id"),
+    fk_id: str = Query(None, description="4KHDHub path id"),
+    se: int = 0,
+    ep: int = 0,
+):
+    """
+    Aggregate play sources: embed servers + MovieBox DASH proxy + 4K direct streams.
+    """
+    sources = []
+    errors = {}
+    # embeds via TMDB
+    tid = tmdb_id
+    if not tid and title:
+        try:
+            tr = await _tmdb_get("/search/multi", {"query": title})
+            for r in tr.get("results") or []:
+                if r.get("media_type") in ("movie", "tv"):
+                    tid = r["id"]
+                    media = r["media_type"]
+                    break
+        except Exception as e:
+            errors["tmdb"] = str(e)[:100]
+    if tid:
+        path = f"{media}/{tid}"
+        if media == "tv":
+            path = f"tv/{tid}/{se or 1}/{ep or 1}"
+        embeds = [
+            ("vidsrc", f"https://vidsrc.to/embed/{path if media=='movie' else f'tv/{tid}/{se or 1}/{ep or 1}'}"),
+            ("vidlink", f"https://vidlink.pro/{media}/{tid}" + (f"/{se or 1}/{ep or 1}" if media == "tv" else "")),
+            ("videasy", f"https://player.videasy.net/{media}/{tid}" + (f"/{se or 1}/{ep or 1}" if media == "tv" else "")),
+            ("vidking", f"https://www.vidking.net/embed/{media}/{tid}" + (f"/{se or 1}/{ep or 1}" if media == "tv" else "")),
+            ("autoembed", f"https://player.autoembed.cc/embed/{media}/{tid}" + (f"/{se or 1}/{ep or 1}" if media == "tv" else "")),
+        ]
+        for name, url in embeds:
+            sources.append({"type": "embed", "provider": name, "url": url, "playable": True, "phone_friendly": True})
+    # MovieBox
+    if subject_id:
+        try:
+            mb = await mb_stream(subject_id, se=se, ep=ep)
+            if mb.get("proxy_mpd") or mb.get("proxy_url"):
+                sources.append({
+                    "type": "dash",
+                    "provider": "moviebox",
+                    "url": mb.get("proxy_url") or mb.get("proxy_mpd"),
+                    "playable": True,
+                    "phone_friendly": False,
+                    "note": "HEVC DASH via cookie proxy",
+                })
+            for b in mb.get("browser") or []:
+                sources.append({"type": "embed", "provider": b.get("provider"), "url": b.get("url"), "playable": True, "phone_friendly": True})
+        except Exception as e:
+            errors["moviebox"] = str(e)[:120]
+    # 4K direct
+    if fk_id:
+        try:
+            fk = await fk_stream(id=fk_id, se=se, ep=ep, resolve=True, limit=8)
+            for s in fk.get("streams") or []:
+                if s.get("playable"):
+                    sources.append({
+                        "type": "direct",
+                        "provider": "4khdhub",
+                        "url": s.get("url"),
+                        "label": s.get("label"),
+                        "quality": s.get("quality"),
+                        "playable": True,
+                        "phone_friendly": True,
+                        "headers": s.get("headers"),
+                    })
+        except Exception as e:
+            errors["4khdhub"] = str(e)[:120]
+    return {
+        "title": title,
+        "tmdb_id": tid,
+        "media": media,
+        "subject_id": subject_id,
+        "fk_id": fk_id,
+        "se": se,
+        "ep": ep,
+        "count": len(sources),
+        "sources": sources,
+        "errors": errors or None,
+    }
 
 @app.get("/music/search", tags=["Music"])
 async def music_search(q: str = Query(..., min_length=1)):
@@ -4225,298 +5980,442 @@ async def anime_tracks(hash: Optional[str] = Query(None), url: Optional[str] = Q
 
 @app.get("/docs", include_in_schema=False)
 async def custom_swagger_ui():
-    return HTMLResponse("""<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>ElitePlex API Docs</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css"/>
+    return HTMLResponse(r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#06080f"/>
+<title>ElitePlex API · Docs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <style>
-  body{margin:0;background:#0b0d12}
-  .swagger-ui .topbar{display:none}
-  .swagger-ui{background:#0b0d12}
-  .swagger-ui .info .title{color:#e8eaf0;font-family:system-ui}
-  .swagger-ui .info p,.swagger-ui .info li,.swagger-ui .info table{color:#a0a6b8}
-  .swagger-ui .scheme-container{background:#12151c;box-shadow:none;border-bottom:1px solid #222}
-  .swagger-ui .opblock-tag{color:#e8eaf0;border-bottom:1px solid #222}
-  .swagger-ui .opblock{background:#12151c;border-radius:12px;border:1px solid #2a2f3a;box-shadow:none;margin:0 0 12px}
-  .swagger-ui .opblock .opblock-summary-description{color:#8b92a8}
-  .swagger-ui .opblock.opblock-get{border-color:#1a6b8a;background:rgba(0,120,180,.08)}
-  .swagger-ui .opblock.opblock-get .opblock-summary-method{background:#0a8ec0}
-  .swagger-ui .opblock.opblock-post{border-color:#2a7a4a;background:rgba(0,140,80,.08)}
-  .swagger-ui .btn.execute{background:linear-gradient(135deg,#00a4dc,#7c5cff);border:none;border-radius:8px}
-  .swagger-ui input[type=text],.swagger-ui select,.swagger-ui textarea{background:#0b0d12;color:#e8eaf0;border:1px solid #333;border-radius:8px}
-  .swagger-ui .parameter__name,.swagger-ui table thead td,.swagger-ui .response-col_status{color:#c8cdd8}
-  .swagger-ui .model-box,.swagger-ui section.models{background:#12151c;border-color:#2a2f3a}
-  .swagger-ui .model{color:#a0a6b8}
-  .swagger-ui .response-col_description{color:#a0a6b8}
-  .swagger-ui .highlight-code{background:#0b0d12}
-  .swagger-ui .microlight{color:#d0d4e0}
-  .sh-banner{padding:22px 28px;background:linear-gradient(135deg,#07080c,#0f172a 40%,#1e1b4b);border-bottom:1px solid rgba(255,255,255,.08);color:#f1f5f9;font-family:system-ui,sans-serif}
-  .sh-banner h1{margin:0 0 8px;font-size:1.45rem;font-weight:800;background:linear-gradient(90deg,#5eead4,#a78bfa);-webkit-background-clip:text;background-clip:text;color:transparent}
-  .sh-banner p{margin:0;color:#8b92a8;font-size:.9rem}
-  .sh-banner a{color:#00d4ff;margin-right:14px}
-
-/* Motion + glass 2026 */
-:root{--a:#5eead4;--a2:#a78bfa;--bg:#07080c;--card:rgba(22,24,32,.72);--line:rgba(255,255,255,.08);--text:#f1f5f9;--mute:#94a3b8}
-body{background:var(--bg);background-image:radial-gradient(ellipse 80% 50% at 20% -10%,rgba(94,234,212,.12),transparent),radial-gradient(ellipse 60% 40% at 100% 0%,rgba(167,139,250,.1),transparent);color:var(--text)}
-.side{backdrop-filter:blur(20px);background:rgba(10,12,18,.85);border-right:1px solid var(--line)}
-.top{backdrop-filter:blur(16px);background:rgba(10,12,18,.7);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:40}
-.card{background:var(--card);backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:16px;overflow:hidden;transition:transform .25s cubic-bezier(.22,.61,.36,1),box-shadow .25s,border-color .2s}
-.card:hover{transform:translateY(-6px) scale(1.01);box-shadow:0 20px 40px rgba(0,0,0,.4);border-color:rgba(94,234,212,.35)}
-.btn{background:linear-gradient(135deg,#2dd4bf,#8b5cf6);border:none;color:#041018;font-weight:700;border-radius:12px;box-shadow:0 8px 24px rgba(45,212,191,.25);transition:transform .2s,box-shadow .2s}
-.btn:hover{transform:translateY(-2px);box-shadow:0 12px 32px rgba(139,92,246,.35)}
-.btn.ghost{background:transparent;color:var(--text);border:1px solid var(--line);box-shadow:none}
-.hero{border-radius:24px;overflow:hidden;animation:fadeUp .6s cubic-bezier(.22,.61,.36,1)}
-.sec-head h2{letter-spacing:-.02em}
-.nav a{border-radius:10px;margin:2px 8px;transition:background .2s,transform .15s}
-.nav a.on{background:linear-gradient(90deg,rgba(45,212,191,.2),rgba(139,92,246,.12));border-left:3px solid var(--a)}
-.dl-hero{background:linear-gradient(135deg,rgba(45,212,191,.15),rgba(139,92,246,.12));border:1px solid var(--line);backdrop-filter:blur(12px)}
-.dl-fmt{backdrop-filter:blur(8px);transition:transform .15s,border-color .15s}
-.dl-fmt:hover{transform:translateX(4px)}
-.dl-fmt.muxed{border-color:rgba(45,212,191,.5);box-shadow:0 0 20px rgba(45,212,191,.08)}
-.now-bar{backdrop-filter:blur(20px);background:rgba(10,12,18,.9);border-top:1px solid var(--line)}
-@keyframes fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
-@keyframes pulseGlow{0%,100%{box-shadow:0 0 0 0 rgba(45,212,191,.2)}50%{box-shadow:0 0 24px 4px rgba(45,212,191,.15)}}
-.player-wrap{animation:pulseGlow 4s ease-in-out infinite;border-radius:16px}
-.empty{animation:fadeUp .4s ease}
-.api-card{transition:transform .2s,border-color .2s}
-.api-card:hover{transform:translateY(-3px);border-color:rgba(45,212,191,.4)}
-@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
-
-/* ===== ElitePlex UI 2026 — liquid glass + motion (SimpMusic / vivi inspired) ===== */
 :root{
-  --bg:#05060a;--bg2:#0c0e14;--card:rgba(18,20,28,.65);--card-solid:#12141c;
-  --line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.12);
-  --text:#f4f6fb;--mute:#8b93a7;--a:#2dd4bf;--a2:#a78bfa;--a3:#f472b6;
-  --radius:18px;--ease:cubic-bezier(.22,.61,.36,1);
-  --shadow:0 12px 40px rgba(0,0,0,.45);
+  --bg:#06080f;--bg2:#0b0e18;--panel:rgba(16,18,30,.72);--panel2:rgba(22,25,40,.85);
+  --line:rgba(255,255,255,.08);--line2:rgba(255,255,255,.14);
+  --text:#f4f6ff;--mute:#8b93b0;--dim:#5c6480;
+  --c1:#22d3ee;--c2:#a78bfa;--c3:#f472b6;--c4:#34d399;--c5:#fbbf24;
+  --get:#22d3ee;--post:#34d399;--put:#fbbf24;--del:#f87171;--patch:#c084fc;
+  --r:18px;--ease:cubic-bezier(.22,1,.36,1);
+  --glow:0 0 60px rgba(34,211,238,.12);
 }
-*{box-sizing:border-box}
+*{box-sizing:border-box;margin:0;padding:0}
 html{scroll-behavior:smooth}
 body{
-  margin:0;font-family:"Outfit",ui-sans-serif,system-ui,sans-serif;
-  background:var(--bg);color:var(--text);min-height:100vh;line-height:1.45;
+  font-family:"IBM Plex Sans",system-ui,sans-serif;
+  background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5;
   background-image:
-    radial-gradient(ellipse 90% 60% at 10% -20%,rgba(45,212,191,.14),transparent 55%),
-    radial-gradient(ellipse 70% 50% at 100% 0%,rgba(167,139,250,.12),transparent 50%),
-    radial-gradient(ellipse 50% 40% at 50% 100%,rgba(244,114,182,.06),transparent 50%);
-  background-attachment:fixed;
+    radial-gradient(ellipse 100% 80% at 0% -30%,rgba(34,211,238,.16),transparent 50%),
+    radial-gradient(ellipse 80% 60% at 100% 0%,rgba(167,139,250,.14),transparent 45%),
+    radial-gradient(ellipse 60% 50% at 50% 120%,rgba(244,114,182,.08),transparent 50%);
+  background-attachment:fixed;overflow-x:hidden;
 }
-.layout{display:flex;min-height:100vh}
+body::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.4;
+  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
+}
+.shell{position:relative;z-index:1;display:grid;grid-template-columns:280px 1fr;min-height:100vh}
+@media(max-width:900px){.shell{grid-template-columns:1fr}}
+
+/* Sidebar */
 .side{
-  width:240px;flex-shrink:0;padding:18px 12px;display:flex;flex-direction:column;gap:6px;
-  background:rgba(8,10,16,.82);backdrop-filter:blur(24px) saturate(1.4);
-  border-right:1px solid var(--line);position:sticky;top:0;height:100vh;z-index:30;
+  position:sticky;top:0;height:100vh;overflow:auto;padding:20px 14px 40px;
+  background:rgba(8,10,18,.78);backdrop-filter:blur(28px) saturate(1.5);
+  border-right:1px solid var(--line);
+  animation:slideIn .6s var(--ease);
 }
-.brand{font-size:1.25rem;font-weight:800;padding:8px 12px 18px;letter-spacing:-.03em}
-.brand span{background:linear-gradient(120deg,var(--a),var(--a2),var(--a3));-webkit-background-clip:text;background-clip:text;color:transparent}
-.nav a{
-  display:flex;align-items:center;gap:10px;padding:11px 14px;border-radius:12px;
-  color:var(--mute);text-decoration:none;font-weight:600;font-size:.92rem;
-  transition:background .2s var(--ease),color .2s,transform .15s var(--ease);
+@keyframes slideIn{from{opacity:0;transform:translateX(-12px)}to{opacity:1;transform:none}}
+.logo{
+  font-family:Syne,sans-serif;font-weight:800;font-size:1.35rem;letter-spacing:-.03em;
+  padding:6px 10px 16px;display:flex;align-items:center;gap:10px;
 }
-.nav a:hover{background:rgba(255,255,255,.05);color:var(--text);transform:translateX(3px)}
-.nav a.on{
-  background:linear-gradient(105deg,rgba(45,212,191,.18),rgba(167,139,250,.1));
-  color:var(--text);border-left:3px solid var(--a);box-shadow:inset 0 0 20px rgba(45,212,191,.05);
+.logo .mark{
+  width:36px;height:36px;border-radius:12px;
+  background:linear-gradient(135deg,var(--c1),var(--c2),var(--c3));
+  box-shadow:0 8px 24px rgba(34,211,238,.35);animation:pulse 3s ease-in-out infinite;
 }
-.main{flex:1;min-width:0;display:flex;flex-direction:column}
-.top{
-  display:flex;align-items:center;gap:10px;padding:12px 18px;
-  background:rgba(8,10,16,.7);backdrop-filter:blur(20px);
-  border-bottom:1px solid var(--line);position:sticky;top:0;z-index:25;
-}
-.top input,.search input{
-  flex:1;background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:999px;
-  padding:11px 18px;color:var(--text);font-size:.95rem;outline:none;
+@keyframes pulse{0%,100%{box-shadow:0 8px 24px rgba(34,211,238,.3)}50%{box-shadow:0 8px 32px rgba(167,139,250,.45)}}
+.logo span{background:linear-gradient(120deg,var(--c1),var(--c2) 50%,var(--c3));-webkit-background-clip:text;background-clip:text;color:transparent}
+.creator{font-size:.72rem;color:var(--dim);padding:0 10px 14px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.search-wrap{padding:0 6px 14px;position:sticky;top:0;background:rgba(8,10,18,.9);backdrop-filter:blur(12px);z-index:2}
+.search-wrap input{
+  width:100%;padding:11px 14px 11px 38px;border-radius:12px;border:1px solid var(--line);
+  background:rgba(255,255,255,.04);color:var(--text);font-size:.88rem;outline:none;
   transition:border-color .2s,box-shadow .2s;
 }
-.top input:focus{border-color:rgba(45,212,191,.45);box-shadow:0 0 0 3px rgba(45,212,191,.12)}
-.content{padding:18px 20px 100px;animation:pageIn .45s var(--ease)}
-@keyframes pageIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-@keyframes fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
-@keyframes scaleIn{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
-@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
-.hero{
-  position:relative;border-radius:24px;overflow:hidden;min-height:220px;margin-bottom:22px;
-  animation:scaleIn .5s var(--ease);box-shadow:var(--shadow);
+.search-wrap input:focus{border-color:rgba(34,211,238,.5);box-shadow:0 0 0 3px rgba(34,211,238,.12)}
+.search-wrap{position:relative}
+.search-wrap::after{content:"⌕";position:absolute;left:18px;top:50%;transform:translateY(-50%);color:var(--mute);font-size:1rem;pointer-events:none}
+.tag-list{display:flex;flex-direction:column;gap:2px;padding:0 4px}
+.tag-btn{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:10px 12px;border-radius:12px;border:none;background:transparent;
+  color:var(--mute);font-weight:600;font-size:.86rem;cursor:pointer;text-align:left;
+  transition:all .2s var(--ease);font-family:inherit;
 }
-.hero img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.45;filter:saturate(1.1)}
-.hero .hbody{position:relative;padding:28px 24px;max-width:560px}
-.hero h1{font-size:clamp(1.4rem,3vw,2rem);margin:0 0 8px;letter-spacing:-.03em}
+.tag-btn:hover{background:rgba(255,255,255,.05);color:var(--text);transform:translateX(3px)}
+.tag-btn.on{
+  background:linear-gradient(105deg,rgba(34,211,238,.16),rgba(167,139,250,.1));
+  color:var(--text);border-left:3px solid var(--c1);
+}
+.tag-btn .n{font-size:.7rem;background:rgba(255,255,255,.08);padding:2px 7px;border-radius:999px;color:var(--mute)}
+.side-foot{margin-top:auto;padding:16px 10px 0;font-size:.75rem;color:var(--dim)}
+.side-foot a{color:var(--c1);text-decoration:none;margin-right:10px}
+.side-foot a:hover{text-decoration:underline}
+
+/* Main */
+.main{min-width:0;padding:0 0 80px}
+.hero{
+  margin:20px 20px 0;padding:28px 28px 32px;border-radius:24px;position:relative;overflow:hidden;
+  background:linear-gradient(135deg,rgba(16,20,36,.9),rgba(20,16,40,.85));
+  border:1px solid var(--line);box-shadow:var(--glow);
+  animation:fadeUp .7s var(--ease);
+}
+@keyframes fadeUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
+.hero::before{
+  content:"";position:absolute;inset:-40% -20% auto auto;width:60%;height:120%;
+  background:radial-gradient(circle,rgba(34,211,238,.2),transparent 60%);pointer-events:none;
+}
+.hero h1{font-family:Syne,sans-serif;font-size:clamp(1.6rem,4vw,2.4rem);font-weight:800;letter-spacing:-.04em;position:relative}
+.hero h1 em{font-style:normal;background:linear-gradient(90deg,var(--c1),var(--c2),var(--c3));-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p{color:var(--mute);margin-top:8px;max-width:540px;position:relative;font-size:.95rem}
+.hero-stats{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px;position:relative}
+.stat{
+  padding:10px 14px;border-radius:14px;background:rgba(255,255,255,.04);border:1px solid var(--line);
+  font-size:.8rem;font-weight:600;animation:fadeUp .6s var(--ease) both;
+}
+.stat b{display:block;font-family:Syne,sans-serif;font-size:1.15rem;color:var(--c1)}
+.stat:nth-child(2) b{color:var(--c2)}
+.stat:nth-child(3) b{color:var(--c3)}
+.stat:nth-child(4) b{color:var(--c4)}
+.hero-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px;position:relative}
 .btn{
-  display:inline-flex;align-items:center;gap:6px;padding:11px 18px;border:none;border-radius:12px;
-  background:linear-gradient(135deg,var(--a),#0d9488 40%,var(--a2));color:#041016;font-weight:700;
-  cursor:pointer;font-size:.9rem;box-shadow:0 8px 28px rgba(45,212,191,.22);
+  display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border-radius:12px;border:none;
+  font-weight:700;font-size:.88rem;cursor:pointer;font-family:inherit;
   transition:transform .2s var(--ease),box-shadow .2s;
 }
-.btn:hover{transform:translateY(-2px) scale(1.02);box-shadow:0 12px 36px rgba(167,139,250,.3)}
-.btn.ghost{background:rgba(255,255,255,.06);color:var(--text);box-shadow:none;border:1px solid var(--line)}
-.btn.ghost:hover{background:rgba(255,255,255,.1);border-color:var(--line2)}
-.sec{margin:22px 0;animation:fadeUp .5s var(--ease) both}
-.sec-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.sec-head h2{margin:0;font-size:1.15rem;letter-spacing:-.02em}
-.row{display:flex;gap:12px;overflow-x:auto;padding-bottom:8px;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch}
-.row::-webkit-scrollbar{height:4px}
-.row::-webkit-scrollbar-thumb{background:rgba(255,255,255,.15);border-radius:4px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:14px}
-.card{
-  background:var(--card);backdrop-filter:blur(14px);border:1px solid var(--line);border-radius:var(--radius);
-  overflow:hidden;cursor:pointer;scroll-snap-align:start;min-width:130px;flex-shrink:0;
-  transition:transform .28s var(--ease),box-shadow .28s,border-color .2s;
+.btn-primary{
+  background:linear-gradient(135deg,var(--c1),var(--c2));color:#061018;
+  box-shadow:0 10px 30px rgba(34,211,238,.25);
 }
-.card:hover{transform:translateY(-6px) scale(1.02);box-shadow:0 16px 40px rgba(0,0,0,.4);border-color:rgba(45,212,191,.35)}
-.card .p{aspect-ratio:2/3;background:var(--card-solid) center/cover no-repeat}
-.card .t{padding:9px 10px;font-size:.8rem;font-weight:600;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-/* Music list rows — SimpMusic style */
-.m-row{
-  display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:14px;
-  border:1px solid transparent;cursor:pointer;width:100%;max-width:100%;
-  transition:background .2s,border-color .2s,transform .15s var(--ease);
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 14px 36px rgba(167,139,250,.3)}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text);border:1px solid var(--line)}
+.btn-ghost:hover{background:rgba(255,255,255,.09);transform:translateY(-1px)}
+
+.toolbar{
+  display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:16px 20px 8px;position:sticky;top:0;z-index:10;
+  background:linear-gradient(var(--bg),rgba(6,8,15,.92));backdrop-filter:blur(12px);
 }
-.m-row:hover{background:rgba(255,255,255,.06);border-color:var(--line);transform:translateX(3px)}
-.m-row img,.m-row .thumb{
-  width:52px!important;height:52px!important;min-width:52px!important;max-width:52px!important;
-  border-radius:10px;object-fit:cover;background:#151821;flex-shrink:0;
-  box-shadow:0 4px 12px rgba(0,0,0,.35);
+.chip{
+  padding:7px 12px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.03);
+  color:var(--mute);font-size:.78rem;font-weight:600;cursor:pointer;transition:all .2s;
 }
-.m-row .meta{flex:1;min-width:0;overflow:hidden}
-.m-row .meta .t{font-weight:650;font-size:.92rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
-.m-row .meta .a{color:var(--mute);font-size:.78rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.m-row .play-mini{
-  width:40px;height:40px;min-width:40px;border-radius:50%;border:none;cursor:pointer;
-  background:linear-gradient(135deg,var(--a),var(--a2));color:#041016;font-size:14px;font-weight:800;
-  display:flex;align-items:center;justify-content:center;flex-shrink:0;
-  box-shadow:0 4px 14px rgba(45,212,191,.25);
+.chip:hover,.chip.on{border-color:rgba(34,211,238,.4);color:var(--c1);background:rgba(34,211,238,.1)}
+
+.ops{padding:8px 20px 40px;display:flex;flex-direction:column;gap:10px}
+.op{
+  border-radius:var(--r);border:1px solid var(--line);background:var(--panel);
+  backdrop-filter:blur(16px);overflow:hidden;
+  transition:border-color .25s,transform .25s var(--ease),box-shadow .25s;
+  animation:fadeUp .5s var(--ease) both;
 }
-.m-list{display:flex;flex-direction:column;gap:2px;width:100%}
-.m-chips button{color:var(--text)!important;background:rgba(255,255,255,.08)!important;border:1px solid var(--line)!important}
-.m-chips button:hover{background:rgba(45,212,191,.2)!important;color:var(--a)!important}
-.m-chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
-.m-chips button{
-  border-radius:999px;padding:8px 14px;font-size:.8rem;font-weight:600;cursor:pointer;
-  background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--text);
-  transition:background .2s,border-color .2s,transform .15s;
+.op:hover{border-color:var(--line2);box-shadow:0 12px 40px rgba(0,0,0,.25)}
+.op.open{border-color:rgba(34,211,238,.25);box-shadow:0 16px 48px rgba(0,0,0,.3)}
+.op-head{
+  display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;
+  padding:14px 16px;cursor:pointer;user-select:none;
 }
-.m-chips button:hover,.m-chips button.on{background:rgba(45,212,191,.15);border-color:rgba(45,212,191,.4);color:var(--a);transform:scale(1.04)}
-/* Now playing bar — glass */
-.now-bar{
-  position:fixed;left:0;right:0;bottom:0;z-index:50;
-  display:none;align-items:center;gap:12px;padding:10px 16px 12px;
-  background:rgba(10,12,18,.88);backdrop-filter:blur(28px) saturate(1.5);
-  border-top:1px solid var(--line);box-shadow:0 -8px 32px rgba(0,0,0,.35);
+.method{
+  font-family:"JetBrains Mono",monospace;font-size:.72rem;font-weight:700;letter-spacing:.04em;
+  padding:6px 10px;border-radius:8px;min-width:56px;text-align:center;color:#041018;
 }
-.now-bar.on{display:flex;animation:fadeUp .35s var(--ease)}
-.now-bar img{width:48px;height:48px;border-radius:10px;object-fit:cover}
-.now-meta{flex:1;min-width:0}
-.now-meta .t{font-weight:700;font-size:.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.now-meta .a{color:var(--mute);font-size:.78rem}
-.now-fill{position:absolute;left:0;top:0;height:2px;background:linear-gradient(90deg,var(--a),var(--a2));width:0;transition:width .2s linear}
-/* Player page */
-.mp-wrap{max-width:480px;margin:0 auto;text-align:center;animation:scaleIn .4s var(--ease)}
-.mp-art{
-  width:min(280px,70vw);aspect-ratio:1;border-radius:20px;margin:0 auto 18px;
-  background:#111 center/cover;box-shadow:0 20px 60px rgba(0,0,0,.5),0 0 40px rgba(45,212,191,.1);
-  animation:artFloat 6s ease-in-out infinite;
+.method.GET{background:var(--get)}
+.method.POST{background:var(--post)}
+.method.PUT{background:var(--put)}
+.method.DELETE{background:var(--del)}
+.method.PATCH{background:var(--patch)}
+.path{font-family:"JetBrains Mono",monospace;font-size:.88rem;font-weight:500;word-break:break-all}
+.summary{color:var(--mute);font-size:.82rem;margin-top:3px}
+.chev{color:var(--dim);transition:transform .3s var(--ease);font-size:1.1rem}
+.op.open .chev{transform:rotate(180deg);color:var(--c1)}
+
+.op-body{display:none;padding:0 16px 18px;border-top:1px solid var(--line)}
+.op.open .op-body{display:block;animation:fadeUp .35s var(--ease)}
+.desc{color:var(--mute);font-size:.9rem;padding:12px 0;white-space:pre-wrap}
+.params{display:flex;flex-direction:column;gap:10px;margin:8px 0}
+.param{
+  display:grid;grid-template-columns:140px 1fr;gap:10px;align-items:start;
+  padding:10px 12px;border-radius:12px;background:rgba(0,0,0,.25);border:1px solid var(--line);
 }
-@keyframes artFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
-.mp-title{font-size:1.35rem;font-weight:800;margin:0 0 4px;letter-spacing:-.02em}
-.mp-artist{color:var(--mute);margin-bottom:16px}
-.mp-controls{display:flex;justify-content:center;align-items:center;gap:14px;margin:16px 0}
-.mp-controls button{
-  width:48px;height:48px;border-radius:50%;border:1px solid var(--line);
-  background:rgba(255,255,255,.06);color:var(--text);font-size:1.1rem;cursor:pointer;
-  transition:transform .15s,background .2s;
+@media(max-width:600px){.param{grid-template-columns:1fr}}
+.param .name{font-family:"JetBrains Mono",monospace;font-size:.8rem;color:var(--c1)}
+.param .name .req{color:var(--c3);font-size:.65rem;margin-left:4px}
+.param .meta{font-size:.75rem;color:var(--dim);margin-top:2px}
+.param input,.param select{
+  width:100%;padding:9px 12px;border-radius:10px;border:1px solid var(--line);
+  background:rgba(255,255,255,.04);color:var(--text);font-size:.88rem;outline:none;font-family:inherit;
 }
-.mp-controls button:hover{transform:scale(1.08);background:rgba(45,212,191,.2)}
-.mp-controls button.play{
-  width:60px;height:60px;background:linear-gradient(135deg,var(--a),var(--a2));color:#041016;border:none;
-  box-shadow:0 8px 24px rgba(45,212,191,.3);
+.param input:focus,.param select:focus{border-color:rgba(34,211,238,.45);box-shadow:0 0 0 3px rgba(34,211,238,.1)}
+.try-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:12px}
+.try-row .btn{padding:10px 16px}
+.resp{
+  margin-top:14px;border-radius:14px;background:#0a0c14;border:1px solid var(--line);overflow:hidden;
 }
-.lrc-box{
-  height:min(42vh,320px);overflow:hidden;position:relative;margin:16px 0;
-  mask-image:linear-gradient(transparent,black 12%,black 88%,transparent);
-  -webkit-mask-image:linear-gradient(transparent,black 12%,black 88%,transparent);
+.resp-bar{
+  display:flex;justify-content:space-between;align-items:center;padding:8px 12px;
+  background:rgba(255,255,255,.03);font-size:.78rem;font-weight:600;color:var(--mute);
 }
-.lrc-track{transition:transform .3s var(--ease);will-change:transform}
-.lrc-line{padding:10px 8px;font-size:1rem;color:rgba(255,255,255,.22);transition:color .25s,font-size .25s,transform .25s}
-.lrc-line.on{color:#fff;font-size:1.25rem;font-weight:700}
-.lrc-line.near{color:rgba(255,255,255,.5)}
-.player-wrap{border-radius:16px;overflow:hidden;box-shadow:var(--shadow);border:1px solid var(--line);background:#000;aspect-ratio:16/9}
-.dl-hero,.api-card{
-  background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:20px;
-  animation:fadeUp .45s var(--ease);
+.resp-bar .ok{color:var(--c4)}.resp-bar .bad{color:var(--del)}
+.resp pre{
+  padding:14px;margin:0;max-height:360px;overflow:auto;
+  font-family:"JetBrains Mono",monospace;font-size:.78rem;line-height:1.55;color:#d4d8ec;
+  white-space:pre-wrap;word-break:break-word;
 }
-#toast{
-  position:fixed;bottom:80px;left:50%;transform:translateX(-50%) translateY(20px);
-  background:rgba(20,22,30,.95);backdrop-filter:blur(12px);border:1px solid var(--line);
-  padding:10px 18px;border-radius:12px;opacity:0;pointer-events:none;z-index:100;
-  transition:opacity .25s,transform .25s var(--ease);font-size:.88rem;font-weight:600;
+.section-title{
+  font-family:Syne,sans-serif;font-size:1.1rem;font-weight:700;padding:18px 4px 8px;
+  letter-spacing:-.02em;display:flex;align-items:center;gap:10px;
 }
-#toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
-@media(max-width:800px){
-  .side{position:fixed;left:0;top:0;bottom:0;transform:translateX(-105%);transition:transform .3s var(--ease)}
-  .side.open{transform:none;box-shadow:20px 0 40px rgba(0,0,0,.5)}
-  .content{padding:14px 12px 110px}
-  .grid{grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
+.section-title::after{content:"";flex:1;height:1px;background:var(--line)}
+.empty{text-align:center;padding:48px 20px;color:var(--mute)}
+.mobile-bar{
+  display:none;position:fixed;bottom:0;left:0;right:0;z-index:50;padding:10px 14px;
+  background:rgba(8,10,18,.92);backdrop-filter:blur(20px);border-top:1px solid var(--line);
+  gap:8px;justify-content:space-around;
 }
+@media(max-width:900px){
+  .side{position:fixed;left:0;top:0;bottom:0;width:min(300px,88vw);z-index:60;transform:translateX(-105%);transition:transform .35s var(--ease)}
+  .side.open{transform:none;box-shadow:24px 0 48px rgba(0,0,0,.5)}
+  .mobile-bar{display:flex}
+  .hero{margin:12px 12px 0;padding:22px}
+  .ops{padding:8px 12px 100px}
+  .toolbar{padding:12px}
+  .scrim{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:55}
+  .scrim.on{display:block}
+}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.15);border-radius:6px}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
-
-
-.badge-dub{
-  position:absolute;left:8px;top:8px;z-index:2;
-  background:linear-gradient(135deg,#7c3aed,#ec4899);color:#fff;
-  font-size:.65rem;font-weight:800;letter-spacing:.04em;text-transform:uppercase;
-  padding:4px 8px;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.35);
-}
-.card .p{position:relative}
-.player-shell{border-radius:14px;overflow:hidden;border:1px solid var(--line);background:#0a0a0f;box-shadow:var(--shadow)}
-.player-bar{
-  display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:10px 12px;
-  background:rgba(12,14,20,.95);border-top:1px solid var(--line);
-}
-.pb-group{display:flex;align-items:center;gap:6px}
-.pb-group label{font-size:.72rem;color:var(--mute);font-weight:600;text-transform:uppercase}
-.pb-group select{
-  background:rgba(255,255,255,.06);border:1px solid var(--line);color:var(--text);
-  border-radius:8px;padding:6px 10px;font-size:.82rem;outline:none;
-}
-.pb-group select:focus{border-color:rgba(167,139,250,.5)}
-
-.player-bar{flex-direction:column;align-items:stretch;gap:10px}
-@media(min-width:600px){.player-bar{flex-direction:row;align-items:center}}
-.pb-group select{min-width:120px;background:#1a1d28!important;color:#fff!important}
-.player-shell video{display:block;width:100%}
-</style><script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
-</head><body>
-<div class="sh-banner">
-  <h1>ElitePlex API</h1>
-  <p>Catalog · Play · Music · Downloader (yt-dlp + ffmpeg merge) · MovieBox · 4K</p>
-  <p style="margin-top:8px">
-    <a href="/">← Web App</a>
-    <a href="/site">SPA</a>
-    <a href="/openapi.json">OpenAPI JSON</a>
-    <a href="/health">Health</a>
-  </p>
+</style>
+</head>
+<body>
+<div class="scrim" id="scrim" onclick="closeSide()"></div>
+<div class="shell">
+  <aside class="side" id="side">
+    <div class="logo"><div class="mark"></div><span>ElitePlex</span></div>
+    <div class="creator">API Docs · made by shawon</div>
+    <div class="search-wrap"><input id="q" type="search" placeholder="Search endpoints…" autocomplete="off"/></div>
+    <div class="tag-list" id="tags"></div>
+    <div class="side-foot">
+      <a href="/">App</a>
+      <a href="/openapi.json">OpenAPI</a>
+      <a href="/health">Health</a>
+    </div>
+  </aside>
+  <div class="main">
+    <section class="hero">
+      <h1>Build with <em>ElitePlex</em></h1>
+      <p>Movies · Series · Anime · Music · NetMirror · VixSrc · 4K Hub · Direct download. Interactive docs — try every endpoint live.</p>
+      <div class="hero-stats" id="stats"></div>
+      <div class="hero-actions">
+        <button class="btn btn-primary" onclick="document.getElementById('q').focus()">Explore APIs</button>
+        <a class="btn btn-ghost" href="/openapi.json" target="_blank">OpenAPI JSON</a>
+        <a class="btn btn-ghost" href="/">Open Web App</a>
+      </div>
+    </section>
+    <div class="toolbar" id="filters"></div>
+    <div class="ops" id="ops"></div>
+  </div>
 </div>
-<div id="swagger-ui"></div>
-<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<div class="mobile-bar">
+  <button class="btn btn-ghost" onclick="toggleSide()">Menu</button>
+  <button class="btn btn-primary" onclick="document.getElementById('q').focus()">Search</button>
+</div>
 <script>
-SwaggerUIBundle({
-  url: '/openapi.json',
-  dom_id: '#swagger-ui',
-  deepLinking: true,
-  docExpansion: 'list',
-  defaultModelsExpandDepth: -1,
-  tryItOutEnabled: true,
-  persistAuthorization: true,
+const BASE = location.origin;
+let SPEC = null;
+let ACTIVE_TAG = "All";
+let METHOD_F = "ALL";
+
+function toggleSide(){document.getElementById("side").classList.toggle("open");document.getElementById("scrim").classList.toggle("on")}
+function closeSide(){document.getElementById("side").classList.remove("open");document.getElementById("scrim").classList.remove("on")}
+
+function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
+
+function collectOps(spec){
+  const ops=[];
+  const paths=spec.paths||{};
+  for(const [path,item] of Object.entries(paths)){
+    for(const method of Object.keys(item)){
+      if(!["get","post","put","delete","patch"].includes(method)) continue;
+      const op=item[method];
+      ops.push({
+        path, method: method.toUpperCase(),
+        summary: op.summary||op.operationId||"",
+        description: op.description||"",
+        tags: op.tags||["Other"],
+        parameters: op.parameters||[],
+        id: (op.operationId||(method+path)).replace(/[^\w]/g,"_"),
+      });
+    }
+  }
+  ops.sort((a,b)=>a.path.localeCompare(b.path)||a.method.localeCompare(b.method));
+  return ops;
+}
+
+function render(){
+  if(!SPEC) return;
+  const ops=collectOps(SPEC);
+  const q=(document.getElementById("q").value||"").toLowerCase().trim();
+  const tags=new Map();
+  tags.set("All", ops.length);
+  ops.forEach(o=>o.tags.forEach(t=>tags.set(t,(tags.get(t)||0)+1)));
+
+  const tagEl=document.getElementById("tags");
+  tagEl.innerHTML="";
+  [...tags.entries()].forEach(([t,n])=>{
+    const b=document.createElement("button");
+    b.className="tag-btn"+(ACTIVE_TAG===t?" on":"");
+    b.innerHTML=`<span>${esc(t)}</span><span class="n">${n}</span>`;
+    b.onclick=()=>{ACTIVE_TAG=t;closeSide();render()};
+    tagEl.appendChild(b);
+  });
+
+  document.getElementById("filters").innerHTML=
+    ["ALL","GET","POST","PUT","DELETE"].map(m=>
+      `<button class="chip${METHOD_F===m?" on":""}" data-m="${m}">${m}</button>`
+    ).join("");
+  document.querySelectorAll(".chip").forEach(c=>c.onclick=()=>{METHOD_F=c.dataset.m;render()});
+
+  const filtered=ops.filter(o=>{
+    if(ACTIVE_TAG!=="All" && !o.tags.includes(ACTIVE_TAG)) return false;
+    if(METHOD_F!=="ALL" && o.method!==METHOD_F) return false;
+    if(q && !(o.path+o.summary+o.description+o.tags.join(" ")).toLowerCase().includes(q)) return false;
+    return true;
+  });
+
+  const byTag={};
+  filtered.forEach(o=>{
+    const t=o.tags[0]||"Other";
+    (byTag[t]=byTag[t]||[]).push(o);
+  });
+
+  const root=document.getElementById("ops");
+  root.innerHTML="";
+  if(!filtered.length){
+    root.innerHTML=`<div class="empty">No endpoints match your filters.</div>`;
+    return;
+  }
+  Object.entries(byTag).forEach(([tag,list],ti)=>{
+    const h=document.createElement("div");
+    h.className="section-title";
+    h.textContent=tag;
+    h.style.animationDelay=(ti*0.05)+"s";
+    root.appendChild(h);
+    list.forEach((op,i)=>{
+      const el=document.createElement("div");
+      el.className="op";
+      el.style.animationDelay=((ti*0.05)+(i*0.03))+"s";
+      el.innerHTML=`
+        <div class="op-head">
+          <span class="method ${op.method}">${op.method}</span>
+          <div><div class="path">${esc(op.path)}</div><div class="summary">${esc(op.summary)}</div></div>
+          <span class="chev">▾</span>
+        </div>
+        <div class="op-body">
+          ${op.description?`<div class="desc">${esc(op.description)}</div>`:""}
+          <div class="params" id="p-${op.id}"></div>
+          <div class="try-row">
+            <button class="btn btn-primary" data-try="${op.id}">Try it</button>
+            <button class="btn btn-ghost" data-copy="${op.id}">Copy URL</button>
+          </div>
+          <div class="resp" id="r-${op.id}" style="display:none">
+            <div class="resp-bar"><span class="status">—</span><span>JSON</span></div>
+            <pre></pre>
+          </div>
+        </div>`;
+      const paramsBox=el.querySelector(".params");
+      const params=(op.parameters||[]).filter(p=>p.in==="query"||p.in==="path");
+      if(!params.length){
+        paramsBox.innerHTML=`<div style="color:var(--dim);font-size:.85rem">No parameters</div>`;
+      }else{
+        params.forEach(p=>{
+          const name=p.name;
+          const req=p.required;
+          const schema=p.schema||{};
+          const ph=schema.default!=null?String(schema.default):(schema.example!=null?String(schema.example):"");
+          const row=document.createElement("div");
+          row.className="param";
+          row.innerHTML=`
+            <div><div class="name">${esc(name)}${req?`<span class="req">required</span>`:""}</div>
+            <div class="meta">${esc(p.in)} · ${esc(schema.type||"string")}</div>
+            <div class="meta">${esc(p.description||"")}</div></div>
+            <div><input data-op="${op.id}" data-name="${esc(name)}" data-in="${p.in}" placeholder="${esc(ph)}" value="${esc(ph)}"/></div>`;
+          paramsBox.appendChild(row);
+        });
+      }
+      el.querySelector(".op-head").onclick=()=>el.classList.toggle("open");
+      el.querySelector("[data-try]").onclick=(e)=>{e.stopPropagation();runTry(op)};
+      el.querySelector("[data-copy]").onclick=(e)=>{e.stopPropagation();copyUrl(op)};
+      root.appendChild(el);
+    });
+  });
+
+  document.getElementById("stats").innerHTML=`
+    <div class="stat"><b>${ops.length}</b>Endpoints</div>
+    <div class="stat"><b>${tags.size-1}</b>Groups</div>
+    <div class="stat"><b>${SPEC.info?.version||"—"}</b>Version</div>
+    <div class="stat"><b>shawon</b>Creator</div>`;
+}
+
+function buildUrl(op){
+  let path=op.path;
+  const q=[];
+  document.querySelectorAll(`input[data-op="${op.id}"]`).forEach(inp=>{
+    const v=inp.value.trim();
+    if(!v) return;
+    if(inp.dataset.in==="path") path=path.replace("{"+inp.dataset.name+"}",encodeURIComponent(v));
+    else q.push(encodeURIComponent(inp.dataset.name)+"="+encodeURIComponent(v));
+  });
+  return BASE+path+(q.length?"?"+q.join("&"):"");
+}
+
+async function runTry(op){
+  const box=document.getElementById("r-"+op.id);
+  const pre=box.querySelector("pre");
+  const st=box.querySelector(".status");
+  box.style.display="block";
+  st.textContent="Loading…"; st.className="status";
+  pre.textContent="";
+  const url=buildUrl(op);
+  const t0=performance.now();
+  try{
+    const r=await fetch(url,{headers:{"Accept":"application/json"}});
+    const ms=Math.round(performance.now()-t0);
+    let text=await r.text();
+    try{text=JSON.stringify(JSON.parse(text),null,2)}catch(_){}
+    st.innerHTML=`<span class="${r.ok?"ok":"bad"}">${r.status} ${r.statusText}</span> · ${ms}ms · ${esc(url)}`;
+    pre.textContent=text.slice(0,120000);
+  }catch(err){
+    st.innerHTML=`<span class="bad">Error</span>`;
+    pre.textContent=String(err);
+  }
+}
+
+function copyUrl(op){
+  const url=buildUrl(op);
+  navigator.clipboard?.writeText(url);
+  const b=document.querySelector(`[data-copy="${op.id}"]`);
+  if(b){const t=b.textContent;b.textContent="Copied!";setTimeout(()=>b.textContent=t,1200)}
+}
+
+document.getElementById("q").addEventListener("input",()=>{clearTimeout(window.__qt);window.__qt=setTimeout(render,120)});
+
+fetch(BASE+"/openapi.json").then(r=>r.json()).then(s=>{SPEC=s;render()}).catch(e=>{
+  document.getElementById("ops").innerHTML=`<div class="empty">Failed to load OpenAPI: ${esc(e.message)}</div>`;
 });
 </script>
-</body></html>""")
-
-
-
+</body>
+</html>""")
 
 # =============================================================================
 # MPD expand + cookie proxy + Netplay (phone MP4)
@@ -4618,7 +6517,11 @@ async def _mb_expand_mpd(mpd_url: str, cookie: str = "", referer: str = "") -> d
 
 @app.get("/mb/proxy/mpd", tags=["MovieBox"])
 async def mb_proxy_mpd(u: str = Query(...), cookie: str = "", referer: str = ""):
-    """Proxy MPD with cookies; absolutize segment paths."""
+    """
+    Proxy MPD with CDN cookies and rewrite init/media templates so every
+    segment is fetched via /mb/proxy/segment (cookies applied server-side).
+    dash.js can then play without browser Cookie headers.
+    """
     host = urlparse(u).hostname or ""
     ck = cookie or _MB_PROXY_JAR.get(host, "")
     ref = referer or _MB_PROXY_REF.get(host, globals().get("STREAM_REFERER", "https://sportslive.wine"))
@@ -4632,14 +6535,36 @@ async def mb_proxy_mpd(u: str = Query(...), cookie: str = "", referer: str = "")
             raise HTTPException(r.status_code, "MPD fetch failed")
         xml = r.text
 
+        def to_proxy(abs_url: str) -> str:
+            # Keep $Number$ / $RepresentationID$ tokens for dash.js templates
+            return "/mb/proxy/segment?u=" + quote(abs_url, safe="/$%")
+
         def rew(m):
             name, val = m.group(1), m.group(2)
-            if val.startswith("http"):
-                return m.group(0)
-            return f'{name}="{_mpd_abs(u, val)}"'
+            abs_u = val if val.startswith("http") else _mpd_abs(u, val)
+            return f'{name}="{to_proxy(abs_u)}"'
 
         xml = re.sub(r'\b(initialization|media)="([^"]+)"', rew, xml, flags=re.I)
-        return Response(content=xml, media_type="application/dash+xml", headers={"Access-Control-Allow-Origin": "*"})
+        # also rewrite any BaseURL relative paths
+        def rew_base(m):
+            val = m.group(1).strip()
+            if not val or val.startswith("http"):
+                abs_u = val
+            else:
+                abs_u = _mpd_abs(u, val)
+            if abs_u:
+                return f"<BaseURL>{to_proxy(abs_u)}</BaseURL>"
+            return m.group(0)
+
+        xml = re.sub(r"<BaseURL>([^<]*)</BaseURL>", rew_base, xml, flags=re.I)
+        return Response(
+            content=xml,
+            media_type="application/dash+xml",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store",
+            },
+        )
 
 
 @app.get("/mb/proxy/segment", tags=["MovieBox"])
@@ -4797,6 +6722,292 @@ async def np_stream(video_id: str, se: int = 0, ep: int = 0):
     }
 
 
+
+# =============================================================================
+# PaxSenix-compatible MovieBox routes (direct aoneroom — no API key, unlimited)
+# Same upstream as api.paxsenix.org/moviebox/* but without their rate limit.
+# NOTE: "MP4" label from upstream is often a dummy notice file; real video is
+# HEVC DASH inside sign_cookie → we always resolve `dash_url` for you.
+# =============================================================================
+
+
+@app.get("/moviebox/play-info", tags=["MovieBox-PaxShape"])
+async def moviebox_play_info(
+    subjectId: str = Query(..., description="MovieBox subject id"),
+    season: int = Query(0, alias="season"),
+    episode: int = Query(0, alias="episode"),
+    se: int = Query(None, description="alias of season"),
+    ep: int = Query(None, description="alias of episode"),
+):
+    """
+    PaxSenix-compatible play-info.
+    Upstream still serves HEVC DASH; `url` may be a dummy MP4 notice.
+    Use `dash_url` + `headers.Cookie` (or our `/mb/proxy/mpd`).
+    """
+    s = se if se is not None else season
+    e = ep if ep is not None else episode
+    if s == 0 and e == 0:
+        path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subjectId}"
+    else:
+        path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subjectId}&se={s}&ep={e}"
+    try:
+        data = await mb_request("GET", path)
+    except HTTPException:
+        data = await mb_request("GET", path.replace("/play-info/v2", "/play-info"))
+    if not isinstance(data, dict):
+        data = {}
+    raw_streams = data.get("streams") or data.get("streamList") or []
+    streams = []
+    for st in raw_streams:
+        if not isinstance(st, dict):
+            continue
+        cookie = st.get("signCookie") or st.get("sign_cookie") or st.get("cookie") or ""
+        raw_url = st.get("url") or ""
+        dash = _dash_from_sign_cookie(cookie)
+        playable = dash or (None if _is_dummy_url(raw_url) else raw_url)
+        headers = {
+            "User-Agent": _mb_ua,
+            "Referer": globals().get("STREAM_REFERER", "https://sportslive.wine"),
+        }
+        if cookie:
+            headers["Cookie"] = "; ".join(
+                p.strip() for p in cookie.strip(";").split(";") if p.strip()
+            )
+            if playable and ".mpd" in (playable or ""):
+                try:
+                    _mb_proxy_remember(playable, headers["Cookie"], headers["Referer"])
+                except Exception:
+                    pass
+        streams.append({
+            "format": st.get("format") or ("DASH" if playable and ".mpd" in playable else "MP4"),
+            "id": str(st.get("id") or ""),
+            "url": raw_url,  # upstream field (often dummy)
+            "dash_url": playable,  # real playable
+            "resolutions": st.get("resolutions") or st.get("resolution") or "",
+            "size": st.get("size"),
+            "duration": st.get("duration"),
+            "codec_name": st.get("codecName") or st.get("codec_name") or st.get("codec") or "hevc",
+            "sign_cookie": cookie,
+            "headers": headers,
+            "proxy_mpd": f"/mb/proxy/mpd?u={quote(playable, safe='')}" if playable and ".mpd" in (playable or "") else None,
+            "id_type": st.get("idType") or st.get("id_type") or "",
+        })
+    # also flatten via our parser for any extras
+    if not streams:
+        for s in _parse_mb_play_info(data, _mb_ua):
+            streams.append({
+                "format": s.get("format"),
+                "id": str(s.get("id") or ""),
+                "url": s.get("url"),
+                "dash_url": s.get("url"),
+                "resolutions": s.get("resolution"),
+                "size": s.get("size"),
+                "duration": s.get("duration"),
+                "codec_name": s.get("codec") or "hevc",
+                "sign_cookie": (s.get("headers") or {}).get("Cookie") or "",
+                "headers": s.get("headers"),
+                "proxy_mpd": f"/mb/proxy/mpd?u={quote(s['url'], safe='')}" if s.get("url") and ".mpd" in s["url"] else None,
+                "id_type": "",
+            })
+    return {
+        "ok": True,
+        "creator": "ElitePlex-direct",
+        "title": data.get("title"),
+        "subject_id": subjectId,
+        "season": s,
+        "episode": e,
+        "streams": streams,
+        "cdn_throttle_level": data.get("cdnThrottleLevel") or 0,
+        "note": (
+            "Unlimited direct MovieBox BFF (no PaxSenix key). "
+            "codec is usually HEVC DASH — use dash_url + Cookie or proxy_mpd. "
+            "browser embeds: GET /mb/stream/{subjectId}"
+        ),
+    }
+
+
+@app.get("/moviebox/search", tags=["MovieBox-PaxShape"])
+async def moviebox_search(
+    q: str = Query(..., min_length=1),
+    page: int = 1,
+):
+    """PaxSenix-compatible search → direct search/v2."""
+    mb = await mb_search(q=q, page=page)
+    items = []
+    for it in mb.get("items") or []:
+        items.append({
+            "subject_id": it.get("subject_id"),
+            "subject_type": 2 if it.get("type") == "series" else 1,
+            "title": it.get("name") or it.get("title"),
+            "description": it.get("description") or "",
+            "release_date": it.get("year"),
+            "imdb_rating_value": it.get("rating"),
+            "has_resource": True,
+            "cover": it.get("poster_url") or it.get("poster"),
+            "type": it.get("type"),
+        })
+    return {
+        "ok": True,
+        "creator": "ElitePlex-direct",
+        "query": q,
+        "pager": {
+            "page": str(page),
+            "per_page": 20,
+            "has_more": len(items) >= 15,
+            "next_page": str(page + 1),
+            "total_count": mb.get("total") or len(items),
+        },
+        "items": items,
+        "results": items,
+    }
+
+
+@app.get("/moviebox/info", tags=["MovieBox-PaxShape"])
+async def moviebox_info(subjectId: str = Query(...)):
+    """PaxSenix-compatible title info."""
+    data = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subjectId}")
+    subj = data.get("subject") or data
+    if (subj.get("subjectType") or subj.get("stype") or 1) == 2:
+        try:
+            subj["seasons"] = await mb_request(
+                "GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subjectId}"
+            )
+        except Exception:
+            pass
+    cover = subj.get("cover") or {}
+    poster = cover.get("url") if isinstance(cover, dict) else subj.get("coverUrl")
+    return {
+        "ok": True,
+        "creator": "ElitePlex-direct",
+        "subject_id": subjectId,
+        "subject_type": subj.get("subjectType") or subj.get("stype"),
+        "title": subj.get("title") or subj.get("name"),
+        "description": subj.get("description") or subj.get("desc") or "",
+        "release_date": subj.get("releaseDate") or subj.get("year"),
+        "duration": subj.get("duration"),
+        "genre": subj.get("genre"),
+        "imdb_rating_value": subj.get("imdbRate") or subj.get("score"),
+        "cover": poster,
+        "has_resource": subj.get("hasResource", True),
+        "data": subj,
+    }
+
+
+@app.get("/moviebox/home", tags=["MovieBox-PaxShape"])
+async def moviebox_home(tabId: int = Query(1), page: int = 1):
+    """PaxSenix-compatible home (tab-operating)."""
+    data = await mb_request(
+        "GET",
+        f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tabId}&version=",
+    )
+    return {
+        "ok": True,
+        "creator": "ElitePlex-direct",
+        "tab_id": tabId,
+        "page": page,
+        "items": data.get("items") or data.get("list") or data.get("subjectList") or data,
+        "raw": data if isinstance(data, dict) else {"data": data},
+    }
+
+
+@app.get("/moviebox/list", tags=["MovieBox-PaxShape"])
+async def moviebox_list(page: int = 1, perPage: int = 20, tabId: int = 1):
+    """PaxSenix-compatible list (same operating feed)."""
+    data = await mb_request(
+        "GET",
+        f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tabId}&version=",
+    )
+    items = data.get("items") or data.get("list") or []
+    return {
+        "ok": True,
+        "creator": "ElitePlex-direct",
+        "pager": {
+            "page": str(page),
+            "per_page": perPage,
+            "has_more": bool(items),
+            "next_page": str(page + 1),
+        },
+        "items": items,
+    }
+
+
+@app.get("/moviebox/trending", tags=["MovieBox-PaxShape"])
+async def moviebox_trending(page: int = 1):
+    """Trending via tab-operating / search-rank fallback."""
+    try:
+        data = await mb_request(
+            "GET", f"/wefeed-mobile-bff/subject-api/search-rank?page={page}"
+        )
+        items = data.get("movie") or data.get("list") or data.get("items") or []
+        if isinstance(items, dict):
+            items = items.get("list") or []
+    except Exception:
+        data = await mb_request(
+            "GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId=1&version="
+        )
+        items = data.get("items") or data.get("list") or []
+    return {
+        "ok": True,
+        "creator": "ElitePlex-direct",
+        "pager": {"page": str(page), "has_more": True, "next_page": str(page + 1)},
+        "items": items,
+    }
+
+
+@app.get("/moviebox/recommendations", tags=["MovieBox-PaxShape"])
+async def moviebox_recommendations(subjectId: str = Query(...), page: int = 1):
+    """Related titles (detail-rec)."""
+    try:
+        data = await mb_request(
+            "GET",
+            f"/wefeed-mobile-bff/subject-api/detail-rec?subjectId={subjectId}&page={page}",
+        )
+    except HTTPException:
+        data = await mb_request(
+            "GET", f"/wefeed-mobile-bff/subject-api/detail-rec?subjectId={subjectId}"
+        )
+    items = data.get("list") or data.get("items") or data.get("subjects") or data
+    return {
+        "ok": True,
+        "creator": "ElitePlex-direct",
+        "subject_id": subjectId,
+        "pager": {"page": str(page), "has_more": True, "next_page": str(page + 1)},
+        "items": items,
+    }
+
+
+@app.get("/moviebox/captions", tags=["MovieBox-PaxShape"])
+async def moviebox_captions(
+    subjectId: str = Query(...),
+    streamId: str = Query("", description="stream id from play-info"),
+):
+    """Subtitles (get-ext-captions)."""
+    rid = (streamId or "").strip()
+    if not rid:
+        pi = await moviebox_play_info(subjectId=subjectId, season=0, episode=0)
+        for st in pi.get("streams") or []:
+            if st.get("id"):
+                rid = str(st["id"])
+                break
+    if not rid:
+        return {"ok": True, "creator": "ElitePlex-direct", "ext_captions": [], "subject_id": subjectId}
+    try:
+        data = await mb_request(
+            "GET",
+            f"/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId={subjectId}&resourceId={rid}",
+        )
+        captions = data.get("extCaptions") or data.get("captions") or data.get("list") or []
+    except Exception:
+        captions = []
+    return {
+        "ok": True,
+        "creator": "ElitePlex-direct",
+        "subject_id": subjectId,
+        "stream_id": rid,
+        "ext_captions": captions,
+    }
+
+
 @app.get("/play", tags=["Play"])
 async def unified_play(
     subject_id: str = Query(None, description="MovieBox subject_id from /mb/search"),
@@ -4827,2029 +7038,56 @@ async def unified_play(
 
 
 
-SPA_HTML = r"""<!DOCTYPE html>
+
+# Frontend: load from web/index.html (fallback: minimal page)
+from pathlib import Path as _Path
+
+def _load_spa() -> str:
+    candidates = [
+        _Path(__file__).resolve().parent / "web" / "index.html",
+        _Path(__file__).resolve().parent / "index.html",
+        _Path.cwd() / "web" / "index.html",
+        _Path.cwd() / "index.html",
+    ]
+    for p in candidates:
+        try:
+            if p.is_file():
+                return p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+    return """<!DOCTYPE html>
 <html lang="en"><head>
-<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>ElitePlex</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
-<script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.css"/>
-<script src="https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.polyfilled.min.js"></script>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ElitePlex API</title>
 <style>
-:root{
-  --bg:#0b0b0e;--bg2:#15151a;--card:#1c1c22;--card2:#24242c;--line:#2a2a34;
-  --text:#f0f0f3;--mute:#9a9aa6;--a:#00c2e6;--a2:#0b6e99;--danger:#ef5b5b;
-  --grad:linear-gradient(135deg,#00c2e6 0%,#7b6bff 100%);
-  --a-soft:rgba(0,194,230,.14);
-  --rad:10px;--nav:64px;--side:220px;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif}
-::-webkit-scrollbar{width:10px;height:8px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
-::-webkit-scrollbar-thumb:hover{background:var(--a2)}
-*{scrollbar-color:var(--line) transparent;scrollbar-width:thin}
-a{color:inherit;text-decoration:none}
-button,input,select{font:inherit;color:inherit}
-img{display:block;max-width:100%}
-.app{display:flex;min-height:100%}
-.side{width:var(--side);background:var(--bg2);border-right:1px solid var(--line);padding:18px 12px;position:sticky;top:0;height:100vh;flex-shrink:0;display:flex;flex-direction:column;gap:6px;z-index:20}
-.brand{font-weight:800;font-size:1.2rem;padding:8px 12px 20px;letter-spacing:-.02em;display:flex;align-items:center;gap:8px}
-.brand span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
-.nav a,.nav button{position:relative;display:flex;align-items:center;gap:10px;width:100%;padding:11px 12px;border-radius:8px;border:0;background:transparent;color:var(--mute);cursor:pointer;text-align:left;transition:background .15s,color .15s}
-.nav a.on,.nav button.on,.nav a:hover,.nav button:hover{background:var(--a-soft);color:var(--text)}
-.nav a.on::before{content:'';position:absolute;left:-12px;top:8px;bottom:8px;width:3px;border-radius:3px;background:var(--grad)}
-.main{flex:1;min-width:0;display:flex;flex-direction:column}
-.top{height:var(--nav);display:flex;align-items:center;gap:12px;padding:0 18px;border-bottom:1px solid var(--line);background:rgba(14,14,16,.85);backdrop-filter:blur(10px);position:sticky;top:0;z-index:15}
-.search{flex:1;max-width:420px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:10px 16px;outline:none;transition:border-color .15s,box-shadow .15s}
-.search:focus{border-color:var(--a);box-shadow:0 0 0 3px var(--a-soft)}
-.content{padding:18px 18px 48px;flex:1}
-.hero{position:relative;border-radius:14px;overflow:hidden;min-height:220px;margin-bottom:22px;background:var(--card)}
-.hero img{width:100%;height:280px;object-fit:cover;opacity:.55}
-.hero .hbody{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:flex-end;padding:22px;background:linear-gradient(transparent 20%,rgba(0,0,0,.85))}
-.hero h1{font-size:clamp(1.3rem,3vw,2rem);margin-bottom:6px}
-.hero p{color:var(--mute);max-width:560px;font-size:.92rem;line-height:1.45;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.sec{margin:22px 0}
-.sec h2{font-size:1.05rem;font-weight:600;margin-bottom:12px;padding-left:2px}
-.row{display:flex;gap:12px;overflow-x:auto;padding-bottom:8px;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch}
-.row::-webkit-scrollbar{height:6px}
-.row::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
-.card{flex:0 0 140px;scroll-snap-align:start;cursor:pointer;transition:transform .15s}
-.card:hover{transform:translateY(-3px)}
-.card .p{aspect-ratio:2/3;border-radius:var(--rad);background:var(--card) center/cover no-repeat;border:1px solid var(--line)}
-.card .t{font-size:.8rem;margin-top:7px;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.card .y{font-size:.72rem;color:var(--mute);margin-top:2px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:14px}
-.empty{padding:40px;text-align:center;color:var(--mute)}
-.err{color:var(--danger)}
-.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--line);padding:10px 16px;border-radius:999px;z-index:99;font-size:.85rem;box-shadow:0 8px 30px rgba(0,0,0,.4)}
-.detail{display:grid;grid-template-columns:200px 1fr;gap:22px}
-.detail .poster{border-radius:12px;aspect-ratio:2/3;background:var(--card) center/cover;border:1px solid var(--line)}
-.detail h1{font-size:1.6rem;margin-bottom:8px}
-.meta{color:var(--mute);font-size:.9rem;margin-bottom:12px}
-.overview{line-height:1.55;color:#c8c8d0;margin-bottom:16px}
-.btn{display:inline-flex;align-items:center;gap:8px;background:var(--a);color:#041018;border:0;padding:11px 18px;border-radius:8px;font-weight:600;cursor:pointer}
-.btn.ghost{background:var(--card);color:var(--text);border:1px solid var(--line)}
-.player-wrap{background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--line);aspect-ratio:16/9;max-height:70vh}
-#frame{width:100%;height:100%;background:#000}
-.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0;color:var(--mute);font-size:.85rem}
-.src,.ep{background:var(--card);border:1px solid var(--line);padding:8px 12px;border-radius:8px;cursor:pointer}
-.src.on,.ep.on{background:rgba(0,164,220,.2);border-color:var(--a);color:var(--a)}
-.hubbox{margin-top:14px}
-.hubbox h3{font-size:.85rem;color:var(--mute);margin-bottom:8px}
-.hubbox .src{display:block;width:100%;text-align:left;margin:5px 0}
-.se-select{background:var(--card);border:1px solid var(--line);padding:8px 10px;border-radius:8px}
-.menu-btn{display:none;background:var(--card);border:1px solid var(--line);padding:8px 12px;border-radius:8px}
-@media (max-width:860px){
-  .side{position:fixed;left:0;top:0;transform:translateX(-105%);transition:transform .2s;box-shadow:8px 0 30px rgba(0,0,0,.5)}
-  .side.open{transform:none}
-  .menu-btn{display:inline-flex}
-  .detail{grid-template-columns:1fr}
-  .detail .poster{max-width:160px}
-  .card{flex-basis:110px}
-  .hero img{height:200px}
-}
-
-.badge{display:inline-block;background:var(--a);color:#041018;font-size:.7rem;font-weight:700;padding:3px 8px;border-radius:6px;margin-bottom:8px;letter-spacing:.04em}
-.sec-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
-.sec-head h2{margin:0}
-.pager{display:flex;align-items:center;gap:10px}
-.pager .src:disabled{opacity:.35;cursor:not-allowed}
-.page-n{font-size:.85rem;color:var(--mute)}
-.card{position:relative}
-.card::after{content:'';position:absolute;inset:0;border-radius:var(--rad);box-shadow:inset 0 0 0 1px rgba(255,255,255,.04);pointer-events:none}
-.hero{box-shadow:0 12px 40px rgba(0,0,0,.35)}
-.btn{transition:transform .12s,box-shadow .12s}
-.btn:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,164,220,.35)}
-.src:hover,.ep:hover{border-color:var(--a)}
-.player-wrap{box-shadow:0 16px 48px rgba(0,0,0,.45)}
-@media (max-width:860px){
-  .content{padding:12px 12px 40px}
-  .pager{width:100%;justify-content:space-between}
-  .brand{font-size:1.05rem}
-}
-
-.dlbox{margin-top:18px}
-.dlbox h3,.hubbox h3{font-size:.8rem;color:var(--mute);margin-bottom:10px;text-transform:uppercase;letter-spacing:.06em}
-.dl-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
-.dl-card{display:flex;gap:12px;align-items:center;padding:12px 14px;background:linear-gradient(145deg,#1a1a22,#141418);border:1px solid var(--line);border-radius:12px;transition:border-color .15s,transform .15s}
-.dl-card:hover{border-color:var(--a);transform:translateY(-2px)}
-.dl-ico{width:40px;height:40px;border-radius:10px;background:rgba(0,164,220,.15);color:var(--a);display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0}
-.dl-title{font-size:.88rem;font-weight:600;line-height:1.25}
-.dl-sub{font-size:.72rem;color:var(--mute);margin-top:3px}
-
-.player-shell{background:#0a0a0c;border-radius:14px;overflow:hidden;border:1px solid var(--line);box-shadow:0 20px 60px rgba(0,0,0,.5)}
-.player-wrap{aspect-ratio:16/9;max-height:72vh;background:#000;position:relative}
-.plyr{height:100%}
-.plyr__video-wrapper{background:#000}
-.ext-panel{padding:16px 18px;background:linear-gradient(180deg,#14141a,#0e0e12);border-top:1px solid var(--line)}
-.ext-panel h4{font-size:.95rem;margin-bottom:6px}
-.ext-panel p{font-size:.82rem;color:var(--mute);line-height:1.45;margin-bottom:12px}
-.ext-actions{display:flex;flex-wrap:wrap;gap:8px}
-.ext-actions a,.ext-actions button{border-radius:10px;padding:10px 14px;font-weight:600;font-size:.85rem;border:1px solid var(--line);background:var(--card);cursor:pointer;color:var(--text)}
-.ext-actions a.primary,.ext-actions button.primary{background:var(--a);color:#041018;border-color:var(--a)}
-.fmt-tag{display:inline-block;font-size:.68rem;padding:2px 7px;border-radius:6px;background:rgba(0,164,220,.15);color:var(--a);margin-left:6px}
-
-/* Music */
-.music-layout{display:flex;flex-direction:column;gap:16px;padding-bottom:100px}
-.m-search{display:flex;gap:10px;margin-bottom:8px}
-.m-search input{flex:1;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px;color:var(--text);font-size:1rem}
-.m-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px}
-.m-card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;cursor:pointer;transition:transform .15s,border-color .15s,box-shadow .15s}
-.m-card:hover{transform:translateY(-3px);border-color:var(--a);box-shadow:0 14px 34px rgba(0,0,0,.4)}
-.m-card .art{position:relative}
-.m-card img{width:100%;aspect-ratio:1;object-fit:cover;display:block;background:#111}
-.m-card .art::after{content:'▶';position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:1.4rem;color:#fff;background:rgba(0,0,0,.38);opacity:0;transition:opacity .15s}
-.m-card:hover .art::after{opacity:1}
-.m-card .mi{padding:10px 12px}
-.m-card .mt{font-size:.88rem;font-weight:600;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.m-card .ma{font-size:.75rem;color:var(--mute);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.now-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;background:linear-gradient(180deg,rgba(16,16,20,.92),#0c0c10);border-top:1px solid var(--line);backdrop-filter:blur(16px);padding:10px 16px;display:none;align-items:center;gap:14px}
-.now-bar.on{display:flex}
-.now-bar img{width:52px;height:52px;border-radius:8px;object-fit:cover}
-.now-meta{flex:1;min-width:0}
-.now-meta .t{font-weight:600;font-size:.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.now-meta .a{font-size:.75rem;color:var(--mute)}
-.now-actions{display:flex;gap:8px;align-items:center}
-.now-player{width:min(420px,40vw);height:52px;border-radius:8px;overflow:hidden;background:#000;flex-shrink:0}
-.now-player iframe{width:100%;height:100%;border:0}
-@media (max-width:860px){
-  .now-player{width:120px;height:48px}
-  .m-grid{grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
-}
-
-.api-table{display:flex;flex-direction:column;gap:8px}
-.api-row{display:grid;grid-template-columns:100px 1fr 1.2fr;gap:10px;align-items:center;padding:12px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;font-size:.85rem}
-.api-g{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--a)}
-.api-e{font-size:.8rem;color:#e8e8f0;word-break:break-all}
-.api-d{color:var(--mute);font-size:.8rem}
-@media (max-width:860px){.api-row{grid-template-columns:1fr;gap:4px}}
-.side a.on{background:rgba(0,164,220,.15);color:var(--a)}
-
-.m-hero{margin-bottom:6px;padding:26px 22px;border-radius:18px;position:relative;overflow:hidden;background:radial-gradient(120% 160% at 0% 0%,rgba(0,194,230,.22),transparent 60%),radial-gradient(120% 160% at 100% 0%,rgba(123,107,255,.20),transparent 55%),var(--bg2);border:1px solid var(--line)}
-.m-hero h1{font-size:1.9rem;margin:0 0 4px;letter-spacing:-.02em}
-.m-hero p{color:var(--mute);font-size:.9rem;margin:0}
-.m-search{margin-top:16px}
-.m-chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px}
-.chip{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:999px;padding:7px 14px;font-size:.8rem;cursor:pointer;transition:border-color .15s,color .15s,background .15s,transform .1s}
-.chip:hover{border-color:var(--a);color:var(--a);transform:translateY(-1px)}
-.chip:active{transform:translateY(0)}
-.chip.on{background:var(--grad);color:#04121a;border-color:transparent;font-weight:600}
-
-/* Full music player */
-.m-player-page{display:grid;grid-template-columns:1fr 1fr;gap:20px;padding-bottom:120px}
-@media (max-width:900px){.m-player-page{grid-template-columns:1fr}}
-.m-stage{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden}
-.m-stage .yt{aspect-ratio:16/9;background:#000}
-.m-stage .yt iframe{width:100%;height:100%;border:0}
-.m-info{padding:16px 18px}
-.m-info h1{font-size:1.25rem;margin-bottom:6px}
-.m-info .ar{color:var(--mute);margin-bottom:14px}
-.m-actions{display:flex;flex-wrap:wrap;gap:8px}
-.m-lyrics{background:linear-gradient(180deg,#14141a 0%,#0e0e14 100%);border:1px solid var(--line);border-radius:20px;padding:14px 12px 18px;display:flex;flex-direction:column;max-width:520px;margin:8px auto 0;width:100%}
-.m-lyrics-head{display:flex;align-items:center;justify-content:space-between;padding:0 8px 10px}
-.m-lyrics-head h3{font-size:.8rem;color:var(--mute);text-transform:uppercase;letter-spacing:.08em;margin:0}
-.m-lyrics-head .tag{font-size:.68rem;color:var(--a);opacity:.9;background:var(--a-soft);padding:3px 9px;border-radius:999px}
-.lrc-tools{display:flex;align-items:center;gap:8px}
-.lrc-sync{display:inline-flex;align-items:center;gap:6px;background:var(--card2);border-radius:999px;padding:2px 4px;font-size:.72rem;color:var(--mute)}
-.lrc-sync button{width:20px;height:20px;border-radius:50%;border:0;background:var(--line);color:var(--text);cursor:pointer;font-size:.85rem;line-height:1;display:inline-flex;align-items:center;justify-content:center}
-.lrc-sync button:hover{background:var(--a);color:#041018}
-.lrc-sync span{min-width:38px;text-align:center}
-.lrc-box{height:min(42vh,320px);overflow-y:auto;overflow-x:hidden;scroll-behavior:smooth;padding:40% 12px;mask-image:linear-gradient(180deg,transparent 0%,#000 18%,#000 82%,transparent 100%);-webkit-mask-image:linear-gradient(180deg,transparent 0%,#000 18%,#000 82%,transparent 100%);-webkit-overflow-scrolling:touch}
-.lrc-line{text-align:center;padding:10px 8px;font-size:1.05rem;line-height:1.45;color:rgba(255,255,255,.28);font-weight:500;transition:color .2s,transform .2s,font-size .2s;cursor:default}
-.lrc-line.on{color:#fff;font-size:1.28rem;font-weight:700;transform:scale(1.02);text-shadow:0 0 18px var(--a-soft)}
-.lrc-line.near{color:rgba(255,255,255,.55);font-size:1.08rem}
-.lrc-line:empty{min-height:8px}
-.lrc-line.gap{opacity:.35;font-size:.85rem}
-.m-lyrics pre{white-space:pre-wrap;font-family:Inter,system-ui,sans-serif;font-size:.92rem;line-height:1.65;color:#d4d4dc;padding:8px}
-.sm-rec-list{display:flex;flex-direction:column;gap:6px;max-width:520px;margin:0 auto;width:100%}
-.sm-rec-row{display:flex;align-items:center;gap:12px;padding:8px 10px;border-radius:12px;background:var(--card);border:1px solid var(--line);cursor:pointer;transition:background .15s}
-.sm-rec-row:hover,.sm-rec-row:active{background:var(--card2)}
-.sm-rec-row img{width:48px;height:48px;border-radius:8px;object-fit:cover;background:#222;flex-shrink:0}
-.sm-rec-row .t{font-size:.9rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sm-rec-row .a{font-size:.75rem;color:var(--mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sm-rec-row .meta{flex:1;min-width:0}
-.sm-player .sec{max-width:520px;margin:18px auto 0;width:100%;padding:0 4px}
-.sm-player .sec h2{font-size:1rem;margin-bottom:10px}
-
-.now-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;background:linear-gradient(180deg,rgba(16,16,20,.96),#0a0a0e);border-top:1px solid var(--line);backdrop-filter:blur(16px);padding:10px 14px;display:none;align-items:center;gap:12px}
-.now-bar.on{display:flex}
-.now-fill{position:absolute;left:0;top:-1px;height:2px;width:0;background:var(--grad);transition:width .2s linear}
-.now-bar img{width:48px;height:48px;border-radius:8px;object-fit:cover;cursor:pointer}
-#nb-toggle{font-size:.95rem;min-width:38px}
-.now-meta{flex:1;min-width:0;cursor:pointer}
-.now-meta .t{font-weight:600;font-size:.88rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.now-meta .a{font-size:.72rem;color:var(--mute)}
-.now-actions{display:flex;gap:6px;align-items:center;flex-shrink:0}
-.now-actions .src{padding:8px 10px;font-size:.8rem}
-.top-nav-music{display:none}
-@media (max-width:860px){
-  .top-nav-music{display:inline-flex}
-  .side{position:fixed;left:0;top:0;transform:translateX(-105%);transition:transform .2s;z-index:30;height:100vh;box-shadow:8px 0 30px rgba(0,0,0,.5)}
-  .side.open{transform:none}
-}
-
-/* SimpMusic-style player */
-.sm-player{max-width:480px;margin:0 auto;padding:12px 12px 120px;display:flex;flex-direction:column;align-items:center;gap:18px}
-.sm-hero{position:relative;width:100%;border-radius:24px;overflow:hidden;padding:28px 20px 22px;display:flex;flex-direction:column;align-items:center;gap:14px;border:1px solid var(--line)}
-.sm-hero-bg{position:absolute;inset:0;background-image:var(--art);background-size:cover;background-position:center;filter:blur(42px) saturate(1.6) brightness(.55);transform:scale(1.35);z-index:0}
-.sm-hero-bg::after{content:'';position:absolute;inset:0;background:linear-gradient(180deg,rgba(10,10,14,.25) 0%,rgba(10,10,14,.82) 100%)}
-.sm-hero>*{position:relative;z-index:1}
-.sm-art-wrap{width:min(100%,300px)}
-.sm-art{width:100%;aspect-ratio:1;object-fit:cover;border-radius:16px;box-shadow:0 20px 50px rgba(0,0,0,.5);background:var(--card)}
-.sm-meta{text-align:center;width:100%}
-.sm-title{font-size:1.3rem;font-weight:700;margin:0 0 4px;line-height:1.3}
-.sm-artist{color:var(--mute);font-size:.92rem}
-.sm-progress{width:100%;padding:0 4px}
-.sm-time{display:flex;justify-content:space-between;font-size:.75rem;color:var(--mute);margin-top:4px}
-.sm-controls{display:flex;align-items:center;justify-content:center;gap:16px;width:100%}
-.sm-icons{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;flex-wrap:wrap}
-.sm-icons button{width:38px;height:38px;border-radius:50%;border:1px solid var(--line);background:var(--card);color:var(--mute);font-size:.95rem;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;transition:border-color .15s,color .15s,background .15s}
-.sm-icons button:hover{border-color:var(--a);color:var(--a)}
-.sm-icons button.on{color:var(--a);border-color:var(--a);background:var(--a-soft)}
-#sm-like.on{color:#ff5c8a;border-color:#ff5c8a;background:rgba(255,92,138,.12)}
-.queue-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:59;opacity:0;transition:opacity .2s}
-.queue-sheet{position:fixed;left:0;right:0;bottom:0;max-height:72vh;background:var(--bg2);border-top:1px solid var(--line);border-radius:18px 18px 0 0;z-index:60;transform:translateY(100%);transition:transform .22s ease;display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom,0)}
-.queue-backdrop.open,.queue-sheet.open{opacity:1;transform:translateY(0)}
-.queue-sheet.open{transform:translateY(0)}
-.queue-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--line)}
-.queue-head h3{font-size:.95rem;margin:0}
-.queue-head button{width:30px;height:30px;border-radius:50%;border:0;background:var(--card2);color:var(--text);cursor:pointer}
-.queue-list{overflow-y:auto;padding:6px}
-.queue-row{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:10px;cursor:pointer}
-.queue-row:hover{background:var(--card2)}
-.queue-row.on{background:var(--a-soft)}
-.queue-row img{width:42px;height:42px;border-radius:8px;object-fit:cover;background:#111}
-.queue-row .meta{flex:1;min-width:0}
-.queue-row .meta .t{font-size:.88rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.queue-row .meta .a{font-size:.76rem;color:var(--mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.queue-row .qrm{width:26px;height:26px;border-radius:50%;border:0;background:transparent;color:var(--mute);cursor:pointer}
-.queue-row .qrm:hover{color:var(--danger)}
-.queue-row .eq{margin-right:2px}
-.sm-btn{width:48px;height:48px;border-radius:50%;border:1px solid var(--line);background:var(--card);color:var(--text);font-size:1.1rem;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;transition:border-color .15s,transform .12s,box-shadow .15s}
-.sm-btn.sm-play{width:64px;height:64px;background:var(--grad);color:#041018;border-color:transparent;font-size:1.4rem;box-shadow:0 10px 30px rgba(0,194,230,.35)}
-.sm-btn:hover{border-color:var(--a);transform:translateY(-1px)}
-.sm-btn.on{color:var(--a);border-color:var(--a)}
-.sm-extra{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
-.sm-player .m-lyrics{width:100%;max-height:40vh}
-.sm-vol{display:flex;align-items:center;gap:10px;width:100%;padding:0 4px;color:var(--mute)}
-.sm-vol input[type=range]{flex:1}
-
-/* shared range slider look */
-.sm-progress input[type=range],.sm-vol input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:5px;border-radius:6px;background:linear-gradient(90deg,var(--a) 0%,var(--a) var(--val,0%),var(--line) var(--val,0%),var(--line) 100%);outline:none;cursor:pointer}
-.sm-progress input[type=range]::-webkit-slider-thumb,.sm-vol input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 0 0 4px var(--a-soft);cursor:pointer}
-.sm-progress input[type=range]::-moz-range-thumb,.sm-vol input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#fff;border:0;box-shadow:0 0 0 4px var(--a-soft);cursor:pointer}
-
-.sm-now{font-size:.7rem;letter-spacing:.12em;color:var(--mute);text-transform:uppercase;margin-bottom:2px;display:flex;align-items:center;justify-content:center;gap:7px}
-.eq{display:none;align-items:flex-end;gap:2px;height:12px}
-.eq.on{display:inline-flex}
-.eq span{width:3px;background:var(--a);border-radius:2px;height:4px;animation:eqPulse 1s ease-in-out infinite}
-.eq span:nth-child(2){animation-delay:.15s}
-.eq span:nth-child(3){animation-delay:.3s}
-.eq span:nth-child(4){animation-delay:.45s}
-@keyframes eqPulse{0%,100%{height:3px}50%{height:12px}}
-.yt-hidden{display:none}
-.yt-box{width:100%;max-width:340px;margin:10px auto 0;border-radius:12px;overflow:hidden;aspect-ratio:16/9;background:#000}
-.yt-box iframe{width:100%;height:100%;border:0}
-.lyric-lines{max-height:42vh;overflow-y:auto;text-align:center;padding:8px 4px}
-.lyric-lines .ll{padding:8px 6px;color:var(--mute);font-size:.95rem;line-height:1.45;transition:color .2s,transform .2s}
-.lyric-lines .ll.on{color:#fff;font-weight:700;font-size:1.05rem;transform:scale(1.03)}
-.lyric-lines .ll.past{color:#6a6a75}
-.lyric-plain{white-space:pre-wrap;font-family:Inter,system-ui,sans-serif;font-size:.9rem;line-height:1.65;color:#d4d4dc}
-.m-lyrics{border-radius:16px;background:linear-gradient(180deg,#1a1a22,#121218)}
-
-/* Player responsive */
-.player-shell{width:100%;max-width:1100px;margin:0 auto}
-.player-wrap{aspect-ratio:16/9;max-height:min(72vh,620px);width:100%}
-@media (max-width:860px){
-  .player-wrap{max-height:56vw;border-radius:10px}
-  .player-shell{border-radius:10px}
-  .bar{gap:6px;font-size:.8rem}
-  .src,.ep{padding:8px 10px;font-size:.8rem}
-  .content{padding-bottom:88px}
-  .top{padding:0 10px;gap:8px}
-  .search{max-width:none;font-size:.9rem;padding:9px 12px}
-  .btn{padding:9px 12px;font-size:.85rem}
-  .m-hero h1{font-size:1.35rem}
-  .sm-player{padding-bottom:100px}
-  .now-bar{padding:8px 10px}
-}
-@media (min-width:861px){
-  .content{padding:22px 28px 48px}
-  .side{padding:20px 14px}
-}
-.player-wrap iframe{width:100%;height:100%;border:0;display:block}
-
-.sm-vol{display:flex;align-items:center;gap:10px;width:100%;max-width:320px;margin:0 auto}
-.sm-vol input{flex:1;accent-color:var(--a)}
-.sm-btn.on{border-color:var(--a);color:var(--a);background:rgba(0,164,220,.12)}
-.sm-extra .btn{min-width:120px;justify-content:center}
-
-body.watching .now-bar{display:none!important}
-body.watching .content{padding-bottom:24px}
-.player-shell{max-width:1100px;margin:0 auto}
-.player-wrap{border-radius:14px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.45);border:1px solid var(--line);background:#000;aspect-ratio:16/9}
-.player-wrap iframe{width:100%;height:100%;border:0;display:block}
-.bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0 8px;padding:0 2px}
-.bar #st{font-size:.8rem;color:var(--mute);margin-right:auto}
-#srcs{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 12px}
-#srcs .src{border-radius:999px;padding:8px 14px;font-weight:600}
-#srcs .src.on{background:var(--a);color:#041018;border-color:var(--a)}
-.hubbox{margin:10px 0;padding:12px;border:1px dashed var(--line);border-radius:12px}
-@media (max-width:700px){
-  .player-wrap{border-radius:10px;max-height:56vw}
-  .top .search{flex:1;min-width:0}
-  .top-nav-music{display:none}
-}
-
-.lrc-box{height:min(48vh,360px)!important;overflow:hidden!important;position:relative;padding:0!important}
-.lrc-track{position:absolute;left:0;right:0;top:0;padding:0 14px;will-change:transform;transition:transform .25s cubic-bezier(.22,.61,.36,1)}
-.lrc-line{text-align:center;padding:12px 6px;font-size:1.02rem;line-height:1.4;color:rgba(255,255,255,.22);font-weight:500}
-.lrc-line.on{color:#fff;font-size:1.35rem;font-weight:700}
-.lrc-line.near{color:rgba(255,255,255,.5);font-size:1.08rem}
-.lrc-line.far{opacity:.5}
-
-/* Downloader — OmniGet inspired */
-.dl-wrap{max-width:720px;margin:0 auto}
-.dl-hero{background:linear-gradient(135deg,#0d1b2a 0%,#1b2838 50%,#0f3460 100%);border:1px solid var(--line);border-radius:20px;padding:28px 22px;margin-bottom:20px;text-align:center}
-.dl-hero h1{font-size:1.6rem;margin:0 0 6px;letter-spacing:-.02em}
-.dl-hero p{color:var(--mute);margin:0 0 18px;font-size:.9rem}
-.dl-box{display:flex;gap:10px;flex-wrap:wrap}
-.dl-box input{flex:1;min-width:200px;background:rgba(0,0,0,.35);border:1px solid var(--line);border-radius:12px;padding:14px 16px;color:var(--text);font-size:1rem}
-.dl-box button{border-radius:12px;padding:14px 20px;font-weight:700}
-.dl-preview{display:flex;gap:16px;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:16px;align-items:flex-start}
-.dl-preview img{width:160px;max-width:40%;border-radius:12px;aspect-ratio:16/9;object-fit:cover;background:#111}
-.dl-preview .meta h2{font-size:1.1rem;margin:0 0 6px}
-.dl-preview .meta .sub{color:var(--mute);font-size:.85rem;margin-bottom:8px}
-.dl-formats{display:flex;flex-direction:column;gap:8px}
-.dl-fmt{display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;transition:border-color .15s}
-.dl-fmt:hover{border-color:var(--a)}
-.dl-fmt .lab{flex:1;font-weight:600;font-size:.9rem}
-.dl-fmt .sz{color:var(--mute);font-size:.75rem}
-.dl-fmt a.btn{padding:8px 14px;font-size:.85rem;text-decoration:none}
-.dl-chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;justify-content:center}
-.dl-chips button{border-radius:999px;padding:8px 14px;font-size:.8rem;background:rgba(255,255,255,.06);border:1px solid var(--line);color:var(--text);cursor:pointer}
-.dl-chips button:hover{border-color:var(--a);color:var(--a)}
-@media (max-width:600px){.dl-preview{flex-direction:column}.dl-preview img{width:100%;max-width:100%}}
-
-/* Shine polish */
-.brand span{background:linear-gradient(90deg,#00d4ff,#7c5cff);-webkit-background-clip:text;background-clip:text;color:transparent}
-.nav a{transition:background .2s,transform .15s}
-.nav a:hover{transform:translateX(4px)}
-.nav a.on{background:linear-gradient(90deg,rgba(0,164,220,.25),rgba(124,92,255,.15));border-left:3px solid var(--a)}
-.btn{background:linear-gradient(135deg,#00a4dc,#0066aa);box-shadow:0 4px 14px rgba(0,164,220,.25);transition:transform .15s,box-shadow .15s}
-.btn:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,164,220,.35)}
-.card{transition:transform .2s,box-shadow .2s}
-.card:hover{transform:translateY(-4px);box-shadow:0 12px 28px rgba(0,0,0,.35)}
-.hero{animation:fadeUp .5s ease}
-@keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-.api-guide{max-width:900px;margin:0 auto}
-.api-card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px 20px;margin-bottom:14px;animation:fadeUp .4s ease both}
-.api-card h3{margin:0 0 8px;font-size:1.05rem;display:flex;align-items:center;gap:8px}
-.api-card .ep{font-family:ui-monospace,monospace;font-size:.82rem;color:var(--a);background:rgba(0,164,220,.1);padding:4px 8px;border-radius:6px;display:inline-block;margin:4px 0}
-.api-card p{color:var(--mute);font-size:.9rem;line-height:1.55;margin:8px 0 0}
-.api-card .how{margin-top:10px;padding-top:10px;border-top:1px solid var(--line);font-size:.85rem;color:#c8c8d0}
-.anime-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:14px}
-.anime-card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;cursor:pointer;transition:transform .2s}
-.anime-card:hover{transform:translateY(-3px)}
-.anime-card img{width:100%;aspect-ratio:2/3;object-fit:cover;background:#111}
-.anime-card .t{padding:8px 10px;font-size:.82rem;font-weight:600;line-height:1.3}
-.dl-fmt.muxed{border-color:rgba(0,200,120,.45);background:rgba(0,200,120,.06)}
-.dl-note{background:rgba(0,164,220,.1);border:1px solid rgba(0,164,220,.3);border-radius:12px;padding:12px 14px;margin-bottom:14px;font-size:.88rem;line-height:1.5}
-
-/* Motion + glass 2026 */
-:root{--a:#5eead4;--a2:#a78bfa;--bg:#07080c;--card:rgba(22,24,32,.72);--line:rgba(255,255,255,.08);--text:#f1f5f9;--mute:#94a3b8}
-body{background:var(--bg);background-image:radial-gradient(ellipse 80% 50% at 20% -10%,rgba(94,234,212,.12),transparent),radial-gradient(ellipse 60% 40% at 100% 0%,rgba(167,139,250,.1),transparent);color:var(--text)}
-.side{backdrop-filter:blur(20px);background:rgba(10,12,18,.85);border-right:1px solid var(--line)}
-.top{backdrop-filter:blur(16px);background:rgba(10,12,18,.7);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:40}
-.card{background:var(--card);backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:16px;overflow:hidden;transition:transform .25s cubic-bezier(.22,.61,.36,1),box-shadow .25s,border-color .2s}
-.card:hover{transform:translateY(-6px) scale(1.01);box-shadow:0 20px 40px rgba(0,0,0,.4);border-color:rgba(94,234,212,.35)}
-.btn{background:linear-gradient(135deg,#2dd4bf,#8b5cf6);border:none;color:#041018;font-weight:700;border-radius:12px;box-shadow:0 8px 24px rgba(45,212,191,.25);transition:transform .2s,box-shadow .2s}
-.btn:hover{transform:translateY(-2px);box-shadow:0 12px 32px rgba(139,92,246,.35)}
-.btn.ghost{background:transparent;color:var(--text);border:1px solid var(--line);box-shadow:none}
-.hero{border-radius:24px;overflow:hidden;animation:fadeUp .6s cubic-bezier(.22,.61,.36,1)}
-.sec-head h2{letter-spacing:-.02em}
-.nav a{border-radius:10px;margin:2px 8px;transition:background .2s,transform .15s}
-.nav a.on{background:linear-gradient(90deg,rgba(45,212,191,.2),rgba(139,92,246,.12));border-left:3px solid var(--a)}
-.dl-hero{background:linear-gradient(135deg,rgba(45,212,191,.15),rgba(139,92,246,.12));border:1px solid var(--line);backdrop-filter:blur(12px)}
-.dl-fmt{backdrop-filter:blur(8px);transition:transform .15s,border-color .15s}
-.dl-fmt:hover{transform:translateX(4px)}
-.dl-fmt.muxed{border-color:rgba(45,212,191,.5);box-shadow:0 0 20px rgba(45,212,191,.08)}
-.now-bar{backdrop-filter:blur(20px);background:rgba(10,12,18,.9);border-top:1px solid var(--line)}
-@keyframes fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
-@keyframes pulseGlow{0%,100%{box-shadow:0 0 0 0 rgba(45,212,191,.2)}50%{box-shadow:0 0 24px 4px rgba(45,212,191,.15)}}
-.player-wrap{animation:pulseGlow 4s ease-in-out infinite;border-radius:16px}
-.empty{animation:fadeUp .4s ease}
-.api-card{transition:transform .2s,border-color .2s}
-.api-card:hover{transform:translateY(-3px);border-color:rgba(45,212,191,.4)}
-@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
-
-/* === Music list (SimpMusic-style) === */
-.m-list{display:flex;flex-direction:column;gap:4px;width:100%;padding:0 2px}
-.m-row{
-  display:flex!important;flex-direction:row!important;align-items:center!important;
-  gap:12px;padding:8px 10px;border-radius:12px;width:100%;box-sizing:border-box;
-  cursor:pointer;border:1px solid transparent;background:transparent;
-}
-.m-row:hover,.m-row:active{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.08)}
-.m-row img.thumb,.m-row img{
-  width:48px!important;height:48px!important;min-width:48px!important;max-width:48px!important;
-  border-radius:8px!important;object-fit:cover!important;flex-shrink:0!important;
-  display:block!important;background:#1a1d28;
-}
-.m-row .meta{flex:1 1 auto!important;min-width:0!important;overflow:hidden;display:flex;flex-direction:column;gap:2px}
-.m-row .meta .t{font-size:.9rem;font-weight:600;color:#f4f6fb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3}
-.m-row .meta .a{font-size:.75rem;color:#8b93a7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.m-row .play-mini{
-  flex-shrink:0!important;width:36px!important;height:36px!important;min-width:36px!important;
-  border-radius:50%!important;border:none!important;cursor:pointer;
-  background:linear-gradient(135deg,#2dd4bf,#a78bfa)!important;color:#041016!important;
-  font-size:12px!important;font-weight:800;display:flex!important;align-items:center;justify-content:center;
-  box-shadow:0 4px 12px rgba(45,212,191,.3);
-}
-.m-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
-.m-chips button{
-  border-radius:999px!important;padding:8px 14px!important;font-size:.78rem!important;font-weight:600!important;
-  cursor:pointer;border:1px solid rgba(255,255,255,.12)!important;
-  background:rgba(255,255,255,.08)!important;color:#f4f6fb!important;
-}
-.m-chips button:hover{background:rgba(45,212,191,.2)!important;border-color:rgba(45,212,191,.4)!important;color:#2dd4bf!important}
-.sec-head h2{font-size:1.05rem;font-weight:700;margin:0}
-.sec{margin:18px 0}
-
-
-/* Anime detail + VLC-style player */
-.an-detail{max-width:1000px;margin:0 auto}
-.an-hero{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:20px}
-.an-poster{width:180px;max-width:40vw;aspect-ratio:2/3;border-radius:16px;background:#111 center/cover;box-shadow:0 12px 40px rgba(0,0,0,.45);flex-shrink:0}
-.an-info{flex:1;min-width:200px}
-.an-info h1{margin:10px 0 8px;font-size:1.5rem;letter-spacing:-.02em}
-.an-meta{color:var(--mute);font-size:.85rem;margin:0 0 10px}
-.an-ov{color:rgba(255,255,255,.75);font-size:.9rem;line-height:1.5}
-.an-actions{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
-.an-ep-title{margin:18px 0 10px;font-size:1.05rem}
-.an-eps{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
-.an-watch{max-width:1100px;margin:0 auto}
-.an-watch-top{display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap}
-.an-watch-title{font-weight:700;font-size:1rem}
-.an-nav-ep{display:flex;gap:10px;margin:12px 0 24px}
-.vlc-bar{background:rgba(10,12,18,.95);border:1px solid var(--line);border-top:none;border-radius:0 0 14px 14px;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
-.vlc-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
-.vlc-btn{background:rgba(255,255,255,.08);border:1px solid var(--line);color:#fff;border-radius:8px;padding:8px 12px;cursor:pointer;font-size:.85rem;text-decoration:none}
-.vlc-btn:hover{background:rgba(45,212,191,.2);border-color:rgba(45,212,191,.4)}
-.vlc-seek{flex:1;min-width:120px}
-.vlc-time{font-size:.75rem;color:var(--mute);font-variant-numeric:tabular-nums;min-width:36px}
-.vlc-bar label{font-size:.72rem;color:var(--mute);display:flex;align-items:center;gap:6px}
-.vlc-bar select,.vlc-bar input[type=range]{accent-color:#2dd4bf}
-.vlc-bar select{background:#1a1d28;color:#fff;border:1px solid var(--line);border-radius:8px;padding:6px 8px}
-.player-shell{border-radius:14px 14px 0 0;overflow:hidden;border:1px solid var(--line);background:#000}
-
-
-/* VLC-style integrated anime player */
-.vlc-shell{position:relative;border-radius:16px;overflow:hidden;background:#000;border:1px solid rgba(255,255,255,.08);box-shadow:0 20px 60px rgba(0,0,0,.55)}
-.vlc-stage{position:relative;width:100%;aspect-ratio:16/9;background:#000}
-.vlc-stage video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
-.vlc-overlay{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;
-  background:linear-gradient(180deg,rgba(0,0,0,.65) 0%,transparent 28%,transparent 55%,rgba(0,0,0,.85) 100%);
-  opacity:0;transition:opacity .25s ease;pointer-events:none}
-.vlc-overlay.show,.vlc-shell:hover .vlc-overlay{opacity:1;pointer-events:auto}
-.vlc-top{display:flex;align-items:center;gap:10px;padding:12px 14px}
-.vlc-badge{font-size:.65rem;font-weight:800;letter-spacing:.06em;background:linear-gradient(135deg,#2dd4bf,#a78bfa);color:#041016;padding:3px 8px;border-radius:6px}
-.vlc-live-title{font-size:.85rem;font-weight:600;color:#fff;text-shadow:0 1px 4px #000;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.vlc-center{flex:1;display:flex;align-items:center;justify-content:center}
-.vlc-big{width:72px;height:72px;border-radius:50%;border:none;cursor:pointer;
-  background:rgba(255,255,255,.15);backdrop-filter:blur(8px);color:#fff;font-size:28px;
-  box-shadow:0 8px 32px rgba(0,0,0,.4);transition:transform .15s,background .15s}
-.vlc-big:hover{transform:scale(1.08);background:rgba(45,212,191,.35)}
-.vlc-bottom{padding:8px 12px 12px;pointer-events:auto}
-.vlc-progress-wrap{margin-bottom:8px}
-.vlc-seek{width:100%;height:6px;accent-color:#2dd4bf;cursor:pointer}
-.vlc-times{display:flex;justify-content:space-between;font-size:.7rem;color:rgba(255,255,255,.7);margin-top:4px;font-variant-numeric:tabular-nums}
-.vlc-controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
-.vlc-ico{width:36px;height:36px;border-radius:10px;border:1px solid rgba(255,255,255,.12);
-  background:rgba(255,255,255,.08);color:#fff;cursor:pointer;font-size:14px;display:inline-flex;align-items:center;justify-content:center}
-.vlc-ico:hover{background:rgba(45,212,191,.25);border-color:rgba(45,212,191,.4)}
-.vlc-vol{display:flex;align-items:center;gap:4px}
-.vlc-vol input{width:72px;accent-color:#2dd4bf}
-.vlc-spacer{flex:1;min-width:8px}
-.vlc-menu{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-.vlc-menu label{font-size:.65rem;color:rgba(255,255,255,.65);display:flex;align-items:center;gap:4px;text-transform:uppercase;letter-spacing:.03em}
-.vlc-menu select{background:#12151e;color:#fff;border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:5px 8px;font-size:.75rem;max-width:110px}
-.an-watch{max-width:1100px;margin:0 auto;padding-bottom:40px}
-.an-watch-top{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
-.an-watch-title{font-weight:700;font-size:1rem}
-.an-nav-ep{display:flex;gap:10px;margin:14px 0}
-.an-eps{display:flex;flex-wrap:wrap;gap:8px}
-@media(max-width:600px){
-  .vlc-menu label{font-size:.6rem}
-  .vlc-menu select{max-width:88px;padding:4px 6px}
-  .vlc-big{width:56px;height:56px;font-size:22px}
-}
-
-
-.vlc-shell:fullscreen,.vlc-shell:-webkit-full-screen{
-  width:100vw!important;height:100vh!important;border-radius:0!important;background:#000;
-}
-.vlc-shell:fullscreen .vlc-stage,.vlc-shell:-webkit-full-screen .vlc-stage{
-  width:100%!important;height:100%!important;aspect-ratio:auto!important;max-height:100vh;
-}
-.vlc-shell:fullscreen video,.vlc-shell:-webkit-full-screen video{
-  width:100%!important;height:100%!important;object-fit:contain!important;
-}
-.vlc-shell:fullscreen .vlc-overlay,.vlc-shell:-webkit-full-screen .vlc-overlay{opacity:1}
-
-
-/* Anime player polish */
-.vlc-shell{border-radius:18px;overflow:hidden;background:#000;border:1px solid rgba(255,255,255,.1);box-shadow:0 24px 80px rgba(0,0,0,.55)}
-.vlc-stage{position:relative;width:100%;aspect-ratio:16/9;background:#000}
-.vlc-stage video{width:100%;height:100%;object-fit:contain;background:#000;display:block}
-.vlc-overlay{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;
-  background:linear-gradient(180deg,rgba(0,0,0,.7) 0%,transparent 30%,transparent 50%,rgba(0,0,0,.88) 100%);
-  opacity:0;transition:opacity .2s ease;pointer-events:none}
-.vlc-overlay.show,.vlc-shell:hover .vlc-overlay{opacity:1;pointer-events:auto}
-.vlc-top{display:flex;align-items:center;gap:10px;padding:12px 14px}
-.vlc-badge{font-size:.62rem;font-weight:800;background:linear-gradient(135deg,#2dd4bf,#38bdf8);color:#041016;padding:3px 9px;border-radius:7px;letter-spacing:.04em}
-.vlc-live-title{flex:1;font-size:.82rem;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.vlc-fs-top{width:40px!important;height:40px!important;border-radius:12px!important}
-.vlc-center{flex:1;display:flex;align-items:center;justify-content:center}
-.vlc-big{width:68px;height:68px;border-radius:50%;border:none;cursor:pointer;background:rgba(45,212,191,.25);backdrop-filter:blur(10px);color:#fff;font-size:26px;box-shadow:0 8px 32px rgba(0,0,0,.45)}
-.vlc-big:hover{transform:scale(1.06);background:rgba(45,212,191,.4)}
-.vlc-bottom{padding:6px 12px 12px}
-.vlc-seek{width:100%;height:5px;accent-color:#2dd4bf}
-.vlc-times{display:flex;justify-content:space-between;font-size:.68rem;color:rgba(255,255,255,.65);margin-top:3px;font-variant-numeric:tabular-nums}
-.vlc-controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:6px}
-.vlc-ico{width:36px;height:36px;border-radius:11px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.08);color:#fff;cursor:pointer;font-size:13px;display:inline-flex;align-items:center;justify-content:center}
-.vlc-ico:hover{background:rgba(45,212,191,.28);border-color:rgba(45,212,191,.45)}
-.vlc-vol{display:flex;align-items:center;gap:4px}
-.vlc-vol input{width:70px;accent-color:#2dd4bf}
-.vlc-spacer{flex:1}
-.vlc-menu{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,.08)}
-.vlc-menu label{font-size:.62rem;color:rgba(255,255,255,.55);display:flex;align-items:center;gap:5px;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
-.vlc-menu select{background:#12151e;color:#fff;border:1px solid rgba(255,255,255,.14);border-radius:9px;padding:6px 10px;font-size:.78rem;min-width:88px;max-width:130px}
-.vlc-shell:fullscreen,.vlc-shell:-webkit-full-screen{width:100vw!important;height:100vh!important;border-radius:0!important}
-.vlc-shell:fullscreen .vlc-stage,.vlc-shell:-webkit-full-screen .vlc-stage{height:100%!important;aspect-ratio:auto!important}
-.vlc-shell:fullscreen video,.vlc-shell:-webkit-full-screen video{height:100%!important}
-.an-watch{max-width:1080px;margin:0 auto;padding-bottom:48px}
-.an-eps .ep.on{background:linear-gradient(135deg,#2dd4bf,#38bdf8);color:#041016;border-color:transparent;font-weight:700}
-
-
-.vlc-stage video{z-index:1}
-.vlc-overlay{z-index:2}
-.vlc-shell .empty{padding:48px 16px;color:var(--mute)}
-.an-watch-top .btn{border-radius:12px}
-.an-eps .ep{min-width:52px;justify-content:center}
-
-
-/* Clean anime player */
-.an-load{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:220px;gap:12px;color:var(--mute)}
-.an-spin{width:36px;height:36px;border:3px solid rgba(45,212,191,.25);border-top-color:#2dd4bf;border-radius:50%;animation:an-rot .7s linear infinite}
-@keyframes an-rot{to{transform:rotate(360deg)}}
-.an-iframe{width:100%;aspect-ratio:16/9;border:0;background:#000;border-radius:16px}
-.vlc-shell,.an-watch #anime-player{border-radius:16px;overflow:hidden;background:#000;border:1px solid rgba(255,255,255,.08);box-shadow:0 16px 48px rgba(0,0,0,.45)}
-.vlc-stage{position:relative;width:100%;aspect-ratio:16/9;background:#000}
-.vlc-stage video{width:100%;height:100%;object-fit:contain;background:#000;display:block}
-/* hide any native controls if browser forces them */
-.vlc-stage video::-webkit-media-controls{display:none!important}
-.vlc-overlay{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;
-  background:linear-gradient(180deg,rgba(0,0,0,.75) 0%,transparent 35%,transparent 55%,rgba(0,0,0,.9) 100%);
-  opacity:0;transition:opacity .2s ease;pointer-events:none;z-index:5}
-.vlc-overlay.show{opacity:1;pointer-events:auto}
-.vlc-top{display:flex;align-items:center;gap:8px;padding:10px 12px}
-.vlc-badge{font-size:.6rem;font-weight:800;background:linear-gradient(135deg,#2dd4bf,#38bdf8);color:#041016;padding:3px 8px;border-radius:6px}
-.vlc-live-title{flex:1;font-size:.8rem;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.vlc-center{flex:1;display:flex;align-items:center;justify-content:center;pointer-events:auto}
-.vlc-big{width:64px;height:64px;border-radius:50%;border:none;cursor:pointer;
-  background:rgba(255,255,255,.18);backdrop-filter:blur(12px);color:#fff;font-size:24px;
-  box-shadow:0 8px 28px rgba(0,0,0,.4);transition:transform .15s,background .15s}
-.vlc-big:hover,.vlc-big.playing{background:rgba(45,212,191,.35);transform:scale(1.05)}
-.vlc-bottom{padding:4px 10px 10px;pointer-events:auto}
-.vlc-progress-wrap input[type=range]{width:100%;height:4px;accent-color:#2dd4bf;cursor:pointer}
-.vlc-times{display:flex;justify-content:space-between;font-size:.65rem;color:rgba(255,255,255,.7);margin-top:2px;font-variant-numeric:tabular-nums}
-.vlc-controls{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-top:6px}
-.vlc-ico{width:34px;height:34px;border-radius:10px;border:1px solid rgba(255,255,255,.1);
-  background:rgba(255,255,255,.08);color:#fff;cursor:pointer;font-size:13px;
-  display:inline-flex;align-items:center;justify-content:center;padding:0}
-.vlc-ico:hover,.vlc-play-main{background:rgba(45,212,191,.22);border-color:rgba(45,212,191,.35)}
-.vlc-vol{display:flex;align-items:center;gap:2px}
-.vlc-vol input{width:64px;accent-color:#2dd4bf}
-.vlc-spacer{flex:1;min-width:4px}
-.vlc-sel{font-size:.58rem;color:rgba(255,255,255,.5);display:flex;align-items:center;gap:3px;font-weight:700;text-transform:uppercase}
-.vlc-sel select{background:#141820;color:#fff;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:5px 6px;font-size:.72rem;max-width:72px}
-.vlc-shell:fullscreen,.vlc-shell:-webkit-full-screen,
-#anime-player:fullscreen,#anime-player:-webkit-full-screen{width:100vw!important;height:100vh!important;border-radius:0!important;background:#000}
-#anime-player:fullscreen .vlc-stage,#anime-player:-webkit-full-screen .vlc-stage{height:100%!important;aspect-ratio:auto!important}
-#anime-player:fullscreen video,#anime-player:-webkit-full-screen video{height:100%!important}
-.an-watch{max-width:960px;margin:0 auto;padding-bottom:40px}
-.an-watch-top{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
-.an-watch-title{font-weight:700;font-size:1.05rem;line-height:1.3}
-.an-nav-ep{display:flex;gap:8px;margin:12px 0}
-.an-ep-title{margin:16px 0 8px;font-size:1rem}
-.an-eps{display:flex;flex-wrap:wrap;gap:6px}
-.an-eps .ep{min-width:48px;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer;font-size:.78rem}
-.an-eps .ep.on{background:linear-gradient(135deg,#2dd4bf,#38bdf8);color:#041016;border-color:transparent;font-weight:700}
-.an-eps .ep:hover{border-color:rgba(45,212,191,.4)}
-@media(max-width:520px){
-  .vlc-big{width:56px;height:56px;font-size:20px}
-  .vlc-sel select{max-width:64px;padding:4px 5px;font-size:.68rem}
-  .vlc-vol input{width:48px}
-}
-
-</style></head>
-<body>
-<div class="app">
-  <aside class="side" id="side">
-    <div class="brand">🎬 Stream<span>Hub</span></div>
-    <nav class="nav">
-      <a href="#/" id="n-home">🏠 Home</a>
-      <a href="#/movies" id="n-movies">🎞️ Movies</a>
-      <a href="#/series" id="n-series">📺 Series</a>
-      <a href="#/music" id="n-music">🎵 Music</a>
-      <a href="#/anime" id="n-anime">🎌 Anime</a>
-      <a href="#/api" id="n-api">🧩 API Docs</a>
-    </nav>
-    <div style="flex:1"></div>
-    <div style="font-size:.72rem;color:var(--mute);padding:8px 12px;line-height:1.4">TMDB · Music · 4K · Downloader<br/>/docs · Merge MP4</div>
-  </aside>
-  <div class="main">
-    <div class="top">
-      <button class="menu-btn" type="button" onclick="document.getElementById('side').classList.toggle('open')">☰</button>
-      <button class="btn ghost top-nav-music" type="button" onclick="location.hash='#/music'">♪ Music</button>
-      <input class="search" id="q" placeholder="Search movies, series, music…" onkeydown="if(event.key==='Enter')goSearch()"/>
-      <button class="btn ghost" type="button" onclick="goSearch()">Search</button>
-    </div>
-    <div class="content" id="root"><div class="empty">Loading…</div></div>
-  </div>
-</div>
-<script>
-const root=document.getElementById('root');
-const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function toast(m,ms=2800){let t=document.querySelector('.toast');if(!t){t=document.createElement('div');t.className='toast';document.body.appendChild(t)}t.textContent=m;clearTimeout(t._x);t._x=setTimeout(()=>t.remove(),ms)}
-async function api(path){const r=await fetch(path);if(!r.ok)throw new Error(path+' → '+r.status);return r.json()}
-function setNav(k){
-  ['home','movies','series','music','anime','api'].forEach(id=>{const el=document.getElementById('n-'+id);if(el)el.classList.toggle('on',id===k)});
-  const side=document.getElementById('side');if(side)side.classList.remove('open');
-  const q=document.getElementById('q');
-  if(q){
-    q.placeholder=k==='music'?'Search songs, artists…':'Search movies, series…';
-    if(k!=='music' && location.hash.indexOf('#/music')!==0){ /* keep typed query */ }
-  }
-  // Mini music bar only on music routes (don't cover movie player)
-  const bar=document.getElementById('nowbar');
-  if(bar){
-    const onMusic = (location.hash||'').indexOf('#/music')===0;
-    if(onMusic && MSTATE && MSTATE.id) bar.classList.add('on');
-    else bar.classList.remove('on');
-  }
-  document.body.classList.toggle('watching', k==='' && (location.hash||'').indexOf('#/watch')===0);
-  document.body.classList.toggle('on-music', (location.hash||'').indexOf('#/music')===0);
-}
-function card(it){
-  const media=it.type==='tv'?'tv':'movie';
-  const id=it.tmdb_id||it.id;
-  const poster=it.poster?`background-image:url('${esc(it.poster)}')`:'';
-  return `<div class="card" onclick="location.hash='#/title/${media}/${id}'"><div class="p" style="${poster}"></div><div class="t">${esc(it.name)}</div><div class="y">${esc(it.year||'')}${it.rating?(' · ★ '+Number(it.rating).toFixed(1)):''}</div></div>`;
-}
-function row(title,items){if(!items||!items.length)return'';return `<section class="sec"><h2>${esc(title)}</h2><div class="row">${items.map(card).join('')}</div></section>`}
-
-
-
-
-
-
-let MSTATE={id:'',vid:'',title:'',artist:'',thumb:'',audioUrl:null,lines:[],queue:[],qIdx:0,loop:'off',shuffle:false,_lrcIdx:-1,_playToken:0,lyricsOffset:0};
-
-function htmlDecode(s){try{const d=document.createElement('textarea');d.innerHTML=s||'';return d.value}catch(e){return s||''}}
-function getAudio(){return document.getElementById('g-audio')}
-function setPlayIcon(playing){
-  const t=document.getElementById('sm-toggle'); if(t) t.textContent=playing?'⏸':'▶';
-  const nb=document.getElementById('nb-toggle'); if(nb) nb.textContent=playing?'⏸':'▶';
-  const eq=document.getElementById('sm-eq'); if(eq) eq.classList.toggle('on',playing);
-}
-function nbToggle(){
-  const audio=getAudio();
-  if(!audio||!audio.src){if(MSTATE.id)location.hash='#/music/play/'+encodeURIComponent(MSTATE.id);return}
-  if(audio.paused){audio.play().catch(()=>{})}else{audio.pause()}
-}
-function copyStreamLink(){
-  const u=MSTATE.audioUrl||'';
-  if(!u){toast('No stream URL');return}
-  const full=/^https?:\/\//i.test(u)?u:(location.origin+u);
-  navigator.clipboard.writeText(full).then(()=>toast('Stream link copied')).catch(()=>toast('Copy failed'));
-}
-function getLiked(){try{return JSON.parse(localStorage.getItem('likedSongs')||'{}')}catch(e){return {}}}
-function isLiked(id){return !!getLiked()[id]}
-function toggleLike(){
-  if(!MSTATE.id) return;
-  const liked=getLiked();
-  const btn=document.getElementById('sm-like');
-  if(liked[MSTATE.id]){
-    delete liked[MSTATE.id];
-    if(btn){btn.classList.remove('on');btn.textContent='♡'}
-    toast('Removed from Liked Songs');
-  }else{
-    liked[MSTATE.id]={id:MSTATE.id,title:MSTATE.title,artist:MSTATE.artist,thumb:MSTATE.thumb};
-    if(btn){btn.classList.add('on');btn.textContent='♥'}
-    toast('Added to Liked Songs');
-  }
-  try{localStorage.setItem('likedSongs',JSON.stringify(liked))}catch(e){}
-}
-function likedSongsList(){try{return Object.values(getLiked())}catch(e){return []}}
-function toggleLyricsPanel(){
-  const panel=document.getElementById('m-lyrics-panel');
-  const btn=document.getElementById('sm-lyrics-toggle');
-  if(!panel) return;
-  const hide=panel.style.display!=='none';
-  panel.style.display=hide?'none':'';
-  if(btn) btn.classList.toggle('on',!hide);
-}
-function showTrackInfo(){
-  const bits=[];
-  if(MSTATE.audioUrl) bits.push('JioSaavn audio stream');
-  else if(MSTATE.vid) bits.push('YouTube stream');
-  bits.push('Lyrics via LRCLIB');
-  toast((MSTATE.title||'Track')+' — '+bits.join(' · '));
-}
-function queueRowsHtml(){
-  const q=MSTATE.queue||[];
-  if(!q.length) return '<p class="empty" style="padding:20px">Queue is empty</p>';
-  return q.map((it,i)=>{
-    const rid=it.id||it.video_id||'';
-    const active=i===MSTATE.qIdx;
-    return `<div class="queue-row${active?' on':''}" onclick="location.hash='#/music/play/'+encodeURIComponent('${esc(rid)}')">
-      <img src="${esc(it.thumb||'')}" alt="" loading="lazy"/>
-      <div class="meta"><div class="t">${esc(it.title||'')}</div><div class="a">${esc(it.artist||'')}</div></div>
-      ${active?'<span class="eq on"><span></span><span></span><span></span><span></span></span>':`<button type="button" class="qrm" onclick="event.stopPropagation();removeFromQueue(${i})" title="Remove">✕</button>`}
-    </div>`;
-  }).join('');
-}
-function openQueue(){
-  if(document.getElementById('queue-sheet')) return;
-  document.body.insertAdjacentHTML('beforeend',
-    `<div class="queue-backdrop" id="queue-backdrop" onclick="closeQueue()"></div>
-     <div class="queue-sheet" id="queue-sheet">
-       <div class="queue-head"><h3>Queue · ${(MSTATE.queue||[]).length}</h3><button type="button" onclick="closeQueue()">✕</button></div>
-       <div class="queue-list" id="queue-list">${queueRowsHtml()}</div>
-     </div>`);
-  requestAnimationFrame(()=>{
-    const s=document.getElementById('queue-sheet'), b=document.getElementById('queue-backdrop');
-    if(s) s.classList.add('open'); if(b) b.classList.add('open');
-  });
-}
-function closeQueue(){
-  const s=document.getElementById('queue-sheet'), b=document.getElementById('queue-backdrop');
-  if(s) s.classList.remove('open'); if(b) b.classList.remove('open');
-  setTimeout(()=>{if(s)s.remove();if(b)b.remove()},220);
-}
-function removeFromQueue(i){
-  if(!MSTATE.queue) return;
-  MSTATE.queue.splice(i,1);
-  if(MSTATE.qIdx>i) MSTATE.qIdx--;
-  const list=document.getElementById('queue-list');
-  if(list) list.innerHTML=queueRowsHtml();
-}
-let _audioBound=false;
-function bindGlobalAudio(){
-  if(_audioBound) return; _audioBound=true;
-  const audio=getAudio();
-  if(!audio) return;
-  // One set of listeners for the life of the app — the audio element itself
-  // lives outside #root so it (and playback) survives hash navigation;
-  // DOM lookups inside these handlers simply no-op on pages without them.
-  audio.addEventListener('timeupdate',()=>{
-    const dur=audio.duration;
-    const fill=document.getElementById('nowfill');
-    if(fill&&dur) fill.style.width=((audio.currentTime/dur)*100)+'%';
-    const seek=document.getElementById('sm-seek');
-    if(seek&&!seek._seeking&&dur){
-      seek.value=Math.floor((audio.currentTime/dur)*1000);
-      seek.style.setProperty('--val',(seek.value/10)+'%');
-      const cur=document.getElementById('sm-cur'); if(cur) cur.textContent=fmtTime(audio.currentTime);
-      const du=document.getElementById('sm-dur'); if(du) du.textContent=fmtTime(dur);
-    }
-    renderSyncLyrics(audio.currentTime);
-  });
-  audio.addEventListener('play',()=>setPlayIcon(true));
-  audio.addEventListener('pause',()=>setPlayIcon(false));
-  audio.addEventListener('ended',()=>{
-    if(MSTATE.loop==='one'){audio.currentTime=0;audio.play();return}
-    if(MSTATE.loop==='all'||(MSTATE.queue&&MSTATE.queue.length>1)){musicNext();return}
-    setPlayIcon(false);
-  });
-}
-
-
-async function animeHome(){
-  setNav('anime');root.innerHTML='<div class="empty">Loading anime…</div>';
-  try{
-    const d=await api('/anime/home');
-    const card=it=>`<div class="card" onclick="location.hash='#/anime/title/${esc(it.slug||'')}'">
-      <div class="p" style="background-image:url('${esc(it.poster||'')}')"><span class="badge-dub">Hindi Dub</span></div>
-      <div class="t">${esc(it.title||'')}</div></div>`;
-    const sec=(title,items)=>{
-      if(!items||!items.length)return '';
-      return `<section class="sec"><div class="sec-head"><h2>${esc(title)}</h2></div>
-        <div class="row">${items.map(card).join('')}</div></section>`;
-    };
-    root.innerHTML=`<div class="dl-hero" style="margin-bottom:16px;padding:22px;background:linear-gradient(135deg,rgba(167,139,250,.14),rgba(45,212,191,.08))">
-      <h1 style="margin:0 0 6px">🎌 Anime · Hindi Dub</h1>
-      <p style="color:var(--mute);margin:0 0 12px">Catalog · episodes · multi-audio player</p>
-      <div class="dl-box">
-        <input id="aq" placeholder="Search anime…" onkeydown="if(event.key==='Enter')animeSearchGo()"/>
-        <button class="btn" type="button" onclick="animeSearchGo()">Search</button>
-        <button class="btn ghost" type="button" onclick="animeCatalog()">Catalog</button>
-      </div>
-    </div>
-    ${sec('Top airing',d.top_airing)}
-    ${sec('Most popular',d.most_popular)}
-    ${sec('Latest episodes',d.latest_episodes)}
-    ${sec('Latest movies',d.latest_movies)}
-    ${sec('Completed',d.completed)}`;
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-async function animeOpen(slug){
-  if(!slug)return;
-  setNav('anime');root.innerHTML='<div class="empty">Loading…</div>';
-  try{
-    const d=await api('/anime/detail/'+encodeURIComponent(slug));
-    const eps=d.episodes||[];
-    window.__animeEps=eps;
-    window.__animeMeta={slug,title:d.title,poster:d.poster||'',overview:d.overview||''};
-    const poster=d.poster||(eps[0]&&eps[0].thumb)||'';
-    root.innerHTML=`<div class="an-detail">
-      <div class="an-hero">
-        <div class="an-poster" style="background-image:url('${esc(poster)}')"></div>
-        <div class="an-info">
-          <span class="badge-dub">Hindi Dub</span>
-          <h1>${esc(d.title||slug)}</h1>
-          <p class="an-meta">${esc((d.genres||[]).join(' · '))} ${(d.languages||[]).length?'· '+esc((d.languages||[]).join(', ')):''}</p>
-          <p class="an-ov">${esc((d.overview||'').slice(0,420))}</p>
-          <div class="an-actions">
-            <button class="btn" type="button" onclick="location.hash='#/anime/watch/${esc(slug)}?ep=0'">▶ Play S1E1</button>
-            <button class="btn ghost" type="button" onclick="animeHome()">← Back</button>
-          </div>
-        </div>
-      </div>
-      <h3 class="an-ep-title">Episodes · ${eps.length}</h3>
-      <div class="an-eps">${eps.map((ep,i)=>
-        `<button type="button" class="ep" onclick="location.hash='#/anime/watch/${esc(slug)}?ep=${i}'">S${ep.season||1}E${ep.episode||i+1}</button>`
-      ).join('')}</div>
-    </div>`;
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-async function animeWatch(slug, epIdx){
-  setNav('anime');
-  epIdx=parseInt(epIdx||0,10)||0;
-  root.innerHTML='<div class="empty">Loading player…</div>';
-  try{
-    let eps=window.__animeEps;
-    let meta=window.__animeMeta;
-    if(!eps||!meta||meta.slug!==slug){
-      const d=await api('/anime/detail/'+encodeURIComponent(slug));
-      eps=d.episodes||[];
-      meta={slug,title:d.title,poster:d.poster||'',overview:d.overview||''};
-      window.__animeEps=eps; window.__animeMeta=meta;
-    }
-    if(!eps.length){root.innerHTML='<div class="empty err">No episodes</div>';return}
-    if(epIdx<0)epIdx=0; if(epIdx>=eps.length)epIdx=eps.length-1;
-    const ep=eps[epIdx];
-    root.innerHTML=`<div class="an-watch">
-      <div class="an-watch-top">
-        <button class="btn ghost" type="button" onclick="location.hash='#/anime/title/${esc(slug)}'">← Back</button>
-        <div class="an-watch-title">${esc(meta.title||'')} · S${ep.season||1}E${ep.episode||epIdx+1}</div>
-      </div>
-      <div id="anime-player" class="vlc-shell"><div class="empty">Resolving stream…</div></div>
-      <div class="an-nav-ep">
-        <button class="btn ghost" type="button" ${epIdx<=0?'disabled':''} onclick="location.hash='#/anime/watch/${esc(slug)}?ep=${epIdx-1}'">⏮ Previous</button>
-        <button class="btn" type="button" ${epIdx>=eps.length-1?'disabled':''} onclick="location.hash='#/anime/watch/${esc(slug)}?ep=${epIdx+1}'">Next episode ⏭</button>
-      </div>
-      <h3 class="an-ep-title">Episodes · ${eps.length}</h3>
-      <div class="an-eps">${eps.map((e,i)=>
-        `<button type="button" class="ep ${i===epIdx?'on':''}" onclick="location.hash='#/anime/watch/${esc(slug)}?ep=${i}'">S${e.season||1}E${e.episode||i+1}</button>`
-      ).join('')}</div>
-    </div>`;
-    await animePlayStream(slug, epIdx);
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-
-
-
-async function animePlayStream(slug, idx){
-  const eps=window.__animeEps||[];
-  const ep=eps[idx];
-  if(!ep)return;
-  const box=document.getElementById('anime-player');
-  if(!box)return;
-  try{
-    box.innerHTML='<div class="an-load"><div class="an-spin"></div><p>Loading stream…</p></div>';
-    let url='';
-    if(ep.stream_url) url=ep.stream_url;
-    else if(ep.video_hash){
-      const s=await api('/anime/stream?hash='+encodeURIComponent(ep.video_hash));
-      url=s.stream_url||'';
-    }
-    if(!url){box.innerHTML='<div class="empty err">No stream</div>';return}
-    if(/embed|vidmoly|abyss|filesforever/i.test(url)){
-      box.innerHTML=`<iframe src="${esc(url)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture" class="an-iframe"></iframe>`;
-      return;
-    }
-    const isHls=/\.m3u8(\?|$)/i.test(url);
-    const playUrl=isHls?('/anime/hls?u='+encodeURIComponent(url)):url;
-    const titleTxt=((window.__animeMeta&&window.__animeMeta.title)||'')+' · EP '+(ep.episode||idx+1);
-    box.innerHTML=`
-      <div class="vlc-stage" id="vlc-stage">
-        <video id="av" playsinline webkit-playsinline crossorigin="anonymous" preload="auto"></video>
-        <div class="vlc-overlay show" id="vlc-ov">
-          <div class="vlc-top">
-            <span class="vlc-badge">HLS</span>
-            <span class="vlc-live-title">${esc(titleTxt)}</span>
-            <button type="button" class="vlc-ico" id="v-fs" title="Fullscreen">⛶</button>
-          </div>
-          <div class="vlc-center">
-            <button type="button" class="vlc-big" id="v-bigplay" aria-label="Play">▶</button>
-          </div>
-          <div class="vlc-bottom">
-            <div class="vlc-progress-wrap">
-              <input type="range" id="v-seek" min="0" max="1000" value="0" step="1"/>
-              <div class="vlc-times"><span id="v-cur">0:00</span><span id="v-dur">0:00</span></div>
-            </div>
-            <div class="vlc-controls">
-              <button type="button" class="vlc-ico" id="v-prev" title="Previous">⏮</button>
-              <button type="button" class="vlc-ico vlc-play-main" id="v-play" title="Play">▶</button>
-              <button type="button" class="vlc-ico" id="v-next" title="Next">⏭</button>
-              <div class="vlc-vol">
-                <button type="button" class="vlc-ico" id="v-mute">🔊</button>
-                <input type="range" id="v-vol" min="0" max="1" step="0.05" value="1"/>
-              </div>
-              <div class="vlc-spacer"></div>
-              <label class="vlc-sel">Q
-                <select id="av-quality"><option value="-1">Auto</option></select>
-              </label>
-              <label class="vlc-sel">A
-                <select id="av-audio"><option value="-1">…</option></select>
-              </label>
-              <label class="vlc-sel">S
-                <select id="v-speed">
-                  <option value="0.75">0.75×</option>
-                  <option value="1" selected>1×</option>
-                  <option value="1.25">1.25×</option>
-                  <option value="1.5">1.5×</option>
-                  <option value="2">2×</option>
-                </select>
-              </label>
-              <button type="button" class="vlc-ico" id="v-pip" title="PiP">⧉</button>
-              <button type="button" class="vlc-ico" id="v-fs2" title="Fullscreen">⛶</button>
-            </div>
-          </div>
-        </div>
-      </div>`;
-    const v=document.getElementById('av');
-    const ov=document.getElementById('vlc-ov');
-    const qSel=document.getElementById('av-quality');
-    const aSel=document.getElementById('av-audio');
-    if(window.__hls){try{window.__hls.destroy()}catch(e){} window.__hls=null;}
-
-    function fmt(s){
-      if(!isFinite(s)||s<0) return '0:00';
-      s=Math.floor(s);
-      const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60;
-      if(h>0) return h+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');
-      return m+':'+String(sec).padStart(2,'0');
-    }
-    function setPlaying(on){
-      const a=document.getElementById('v-play'), b=document.getElementById('v-bigplay');
-      if(a) a.textContent=on?'⏸':'▶';
-      if(b){ b.textContent=on?'⏸':'▶'; b.classList.toggle('playing',on); }
-    }
-    function doPlay(){
-      const p=v.play();
-      if(p&&p.then) p.then(()=>setPlaying(true)).catch(()=>{ setPlaying(false); toast('Tap ▶ to play'); });
-      else setPlaying(!v.paused);
-    }
-    function togglePlay(){ if(v.paused) doPlay(); else { v.pause(); setPlaying(false); } }
-    function goFs(){
-      const el=box;
-      try{
-        if(document.fullscreenElement||document.webkitFullscreenElement)
-          (document.exitFullscreen||document.webkitExitFullscreen).call(document);
-        else (el.requestFullscreen||el.webkitRequestFullscreen).call(el);
-      }catch(e){
-        try{ if(v.webkitEnterFullscreen) v.webkitEnterFullscreen(); }catch(e2){ toast('Fullscreen blocked'); }
-      }
-    }
-
-    document.getElementById('v-play').onclick=togglePlay;
-    document.getElementById('v-bigplay').onclick=togglePlay;
-    document.getElementById('v-mute').onclick=()=>{ v.muted=!v.muted; document.getElementById('v-mute').textContent=v.muted?'🔇':'🔊'; };
-    document.getElementById('v-vol').oninput=function(){ v.volume=+this.value; v.muted=false; document.getElementById('v-mute').textContent=v.volume===0?'🔇':'🔊'; };
-    document.getElementById('v-speed').onchange=function(){ v.playbackRate=+this.value; };
-    const seek=document.getElementById('v-seek');
-    let seeking=false;
-    seek.addEventListener('input', function(){ seeking=true; if(v.duration) document.getElementById('v-cur').textContent=fmt((+this.value/1000)*v.duration); });
-    seek.addEventListener('change', function(){ if(v.duration) v.currentTime=(+this.value/1000)*v.duration; seeking=false; });
-    v.addEventListener('timeupdate', function(){
-      if(seeking) return;
-      document.getElementById('v-cur').textContent=fmt(v.currentTime);
-      document.getElementById('v-dur').textContent=fmt(v.duration||0);
-      if(v.duration) seek.value=Math.floor((v.currentTime/v.duration)*1000);
-    });
-    v.addEventListener('loadedmetadata', function(){
-      document.getElementById('v-dur').textContent=fmt(v.duration||0);
-    });
-    v.addEventListener('play', ()=>setPlaying(true));
-    v.addEventListener('pause', ()=>setPlaying(false));
-    v.addEventListener('waiting', ()=>{ /* buffering */ });
-    v.addEventListener('playing', ()=>setPlaying(true));
-    document.getElementById('v-fs').onclick=goFs;
-    document.getElementById('v-fs2').onclick=goFs;
-    document.getElementById('v-pip').onclick=async()=>{
-      try{ if(document.pictureInPictureElement) await document.exitPictureInPicture(); else await v.requestPictureInPicture(); }
-      catch(e){ toast('PiP not supported'); }
-    };
-    document.getElementById('v-prev').onclick=()=>{ if(idx>0) location.hash='#/anime/watch/'+encodeURIComponent(slug)+'?ep='+(idx-1); };
-    document.getElementById('v-next').onclick=()=>{ if(idx<eps.length-1) location.hash='#/anime/watch/'+encodeURIComponent(slug)+'?ep='+(idx+1); };
-
-    let hideT=null;
-    const showOv=()=>{
-      ov.classList.add('show');
-      clearTimeout(hideT);
-      hideT=setTimeout(()=>{ if(!v.paused) ov.classList.remove('show'); }, 3200);
-    };
-    box.addEventListener('mousemove', showOv);
-    box.addEventListener('touchstart', showOv, {passive:true});
-    // tap video toggles play when overlay hidden
-    v.addEventListener('click', function(e){ e.preventDefault(); showOv(); togglePlay(); });
-
-    if(isHls && window.Hls && Hls.isSupported()){
-      const hls=new Hls({
-        enableWorker:true,
-        lowLatencyMode:false,
-        backBufferLength:30,
-        maxBufferLength:60,
-        maxMaxBufferLength:120,
-        capLevelToPlayerSize:true,
-        startLevel:0,
-        fragLoadingMaxRetry:8,
-        manifestLoadingMaxRetry:5,
-        levelLoadingMaxRetry:5,
-        fragLoadingRetryDelay:1000,
-        xhrSetup:function(xhr){ try{ xhr.withCredentials=false; }catch(e){} }
-      });
-      window.__hls=hls;
-      window.__hlsSwitching=false;
-
-      function fillTracks(){
-        if(window.__hlsSwitching) return;
-        if(qSel && hls.levels && hls.levels.length){
-          const cur=qSel.value;
-          qSel.innerHTML='<option value="-1">Auto</option>'+hls.levels.map((lv,i)=>{
-            const h=lv.height||0;
-            return '<option value="'+i+'">'+(h?h+'p':'L'+i)+'</option>';
-          }).join('');
-          if(cur!==''&&cur!=null) qSel.value=cur;
-          qSel.onchange=function(){
-            const i=parseInt(this.value,10);
-            window.__hlsSwitching=true;
-            hls.currentLevel=i; hls.nextLevel=i;
-            toast(i<0?'Quality: Auto':('Quality: '+(hls.levels[i]&&hls.levels[i].height?hls.levels[i].height+'p':i)));
-            setTimeout(()=>{window.__hlsSwitching=false;},800);
-          };
-        }
-        const tracks=hls.audioTracks||[];
-        if(aSel && tracks.length){
-          const prev=aSel.value;
-          aSel.innerHTML=tracks.map((tr,i)=>'<option value="'+i+'">'+esc(tr.name||tr.lang||('A'+(i+1)))+'</option>').join('');
-          if(prev!==''&&prev!=='-1'&&tracks[parseInt(prev,10)]) aSel.value=prev;
-          else{
-            let hi=tracks.findIndex(tr=>/hin|hindi/i.test((tr.name||'')+' '+(tr.lang||'')));
-            if(hi<0) hi=0;
-            aSel.value=String(hi);
-            try{ hls.audioTrack=hi; }catch(e){}
-          }
-          aSel.onchange=function(){
-            const i=parseInt(this.value,10);
-            if(isNaN(i)||i<0) return;
-            try{ hls.audioTrack=i; toast('Audio: '+(tracks[i]&&(tracks[i].name||tracks[i].lang)||i)); }catch(e){ toast('Audio failed'); }
-          };
-        }
-      }
-
-      hls.loadSource(playUrl);
-      hls.attachMedia(v);
-      hls.on(Hls.Events.MANIFEST_PARSED, function(){
-        fillTracks();
-        try{
-          if(hls.levels && hls.levels.length){
-            // start at lowest quality for reliable first frame on weak CDNs
-            const last=hls.levels.length-1;
-            hls.startLevel=last;
-            hls.currentLevel=last;
-            if(qSel) qSel.value=String(last);
-          }
-        }catch(e){}
-        doPlay();
-      });
-      hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, fillTracks);
-      hls.on(Hls.Events.LEVEL_SWITCHED, function(){
-        if(qSel && !window.__hlsSwitching && hls.currentLevel>=0) qSel.value=String(hls.currentLevel);
-      });
-      hls.on(Hls.Events.ERROR, function(ev, data){
-        if(!data||!data.fatal) return;
-        console.warn('HLS fatal', data.type, data.details);
-        if(data.type===Hls.ErrorTypes.NETWORK_ERROR){
-          try{ hls.startLoad(); }catch(e){}
-          setTimeout(function(){
-            if(v.readyState<2){
-              toast('CDN blocked — try another quality or episode');
-              try{ hls.destroy(); }catch(e){}
-              v.controls=true;
-              v.src=playUrl;
-              v.load();
-            }
-          }, 2500);
-        }
-        else if(data.type===Hls.ErrorTypes.MEDIA_ERROR){ try{ hls.recoverMediaError(); }catch(e){} }
-        else {
-          toast('Stream error: '+(data.details||''));
-          v.controls=true;
-        }
-      });
-    } else if(isHls && v.canPlayType('application/vnd.apple.mpegurl')){
-      v.src=playUrl;
-      doPlay();
-    } else {
-      v.src=playUrl;
-      doPlay();
-    }
-  }catch(e){ box.innerHTML='<div class="empty err">'+esc(e.message)+'</div>'; }
-}
-
-
-
-
-
-
-async function animeSearchGo(){
-  const q=(document.getElementById('aq')||{}).value||'';
-  if(!q.trim())return;
-  root.innerHTML='<div class="empty">Searching…</div>';
-  try{
-    const d=await api('/anime/search?q='+encodeURIComponent(q.trim()));
-    root.innerHTML=`<section class="sec"><div class="sec-head"><h2>Results · ${esc(q)}</h2>
-      <button class="btn ghost" onclick="animeHome()">← Back</button></div>
-      <div class="grid">${(d.items||[]).map(it=>`<div class="card" onclick="location.hash='#/anime/title/${esc(it.slug||'')}'">
-        <div class="p" style="background-image:url('${esc(it.poster||'')}')"><span class="badge-dub">Hindi Dub</span></div>
-        <div class="t">${esc(it.title||'')}</div></div>`).join('')||'<p class="empty">No results</p>'}</div></section>`;
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-async function animeCatalog(){
-  root.innerHTML='<div class="empty">Loading catalog…</div>';
-  try{
-    const d=await api('/anime/catalog');
-    root.innerHTML=`<section class="sec"><div class="sec-head"><h2>Catalog · ${(d.items||[]).length}</h2>
-      <button class="btn ghost" onclick="animeHome()">← Back</button></div>
-      <div class="grid">${(d.items||[]).slice(0,120).map(it=>`<div class="card" onclick="location.hash='#/anime/title/${esc(it.slug||'')}'">
-        <div class="p" style="background-image:url('${esc(it.poster||'')}')"><span class="badge-dub">Hindi Dub</span></div>
-        <div class="t">${esc(it.title||'')}</div></div>`).join('')}</div></section>`;
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-
-
-
-
-
-
-
-
-async function musicHome(){
-  setNav('music');root.innerHTML='<div class="empty">Loading music…</div>';
-  try{
-    let sections=[];
-    try{const home=await api('/music/home');sections=home.sections||[]}catch(e){}
-    const chips=['Arijit','Taylor Swift','Lo-fi','EDM','Punjabi','Bollywood','Hip Hop','Lofi Beats'];
-    function songList(title,items){
-      if(!items||!items.length)return '';
-      const rows=items.slice(0,16).map(it=>{
-        const id=String(it.id||it.video_id||(it.saavn_id?('saavn:'+it.saavn_id):'')||'');
-        if(!id)return '';
-        const thumb=it.thumb||it.image||'';
-        const name=htmlDecode(it.title||it.name||'Unknown');
-        const art=htmlDecode(it.artist||it.subtitle||'');
-        return `<div class="m-row" role="button" onclick="playMusic('${esc(id)}')">
-          <img class="thumb" src="${esc(thumb)}" alt="" width="52" height="52" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2252%22 height=%2252%22/>'"/>
-          <div class="meta"><div class="t">${esc(name)}</div><div class="a">${esc(art)}</div></div>
-          <button type="button" class="play-mini" aria-label="Play" onclick="event.stopPropagation();playMusic('${esc(id)}')">▶</button>
-        </div>`;
-      }).join('');
-      return `<section class="sec"><div class="sec-head"><h2>${esc(title)}</h2></div><div class="m-list">${rows}</div></section>`;
-    }
-    let body=sections.map(s=>songList(s.title||'Mix', s.items||[])).join('')||'<div class="empty">Search for a song above</div>';
-    root.innerHTML=`<div class="dl-hero" style="margin-bottom:14px;padding:20px">
-      <h1 style="margin:0 0 4px;font-size:1.4rem">🎵 Music</h1>
-      <p style="color:var(--mute);margin:0 0 12px;font-size:.88rem">Saavn streams · tap ▶ to play</p>
-      <div class="m-chips">${chips.map(c=>`<button type="button" onclick="document.getElementById('q').value='${c}';musicSearch('${c}')">${c}</button>`).join('')}</div>
-    </div>${body}`;
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-function musicCard(s){
-  const id=s.id||s.video_id||s.saavn_id||'';
-  return `<div class="m-card" role="button" tabindex="0" onclick="location.hash='#/music/play/${encodeURIComponent(id)}'">
-    <div class="art"><img src="${esc(s.thumb||'')}" alt="" loading="lazy"/></div>
-    <div class="mi"><div class="mt">${esc(s.title)}</div><div class="ma">${esc(s.artist||s.provider||'')}</div></div>
-  </div>`;
-}
-async function musicSearch(q){
-  q=q||((document.getElementById('q')||{}).value||'');
-  q=String(q).trim();if(!q)return;
-  setNav('music');root.innerHTML='<div class="empty">Searching…</div>';
-  try{
-    let items=[];
-    try{const a=await api('/music/search?q='+encodeURIComponent(q));items=items.concat(a.items||a.results||[])}catch(e){}
-    try{const y=await api('/music/yt/search?q='+encodeURIComponent(q));items=items.concat(y.items||[])}catch(e){}
-    const seen=new Set();const uniq=[];
-    for(const it of items){
-      const id=String(it.id||it.video_id||'');
-      const k=id||((it.title||'')+'|'+(it.artist||''));
-      if(seen.has(k))continue;seen.add(k);uniq.push(it);
-    }
-    MSTATE.queue=uniq.slice(0,40).map(it=>({id:it.id||it.video_id,title:it.title||it.name,artist:it.artist,thumb:it.thumb||it.image}));
-    const rows=uniq.map(it=>{
-      const id=String(it.id||it.video_id||'');
-      if(!id)return '';
-      return `<div class="m-row" onclick="playMusic('${esc(id)}')">
-        <img class="thumb" src="${esc(it.thumb||it.image||'')}" alt="" width="52" height="52" loading="lazy"/>
-        <div class="meta"><div class="t">${esc(htmlDecode(it.title||it.name||''))}</div><div class="a">${esc(htmlDecode(it.artist||it.subtitle||it.provider||''))}</div></div>
-        <button type="button" class="play-mini" onclick="event.stopPropagation();playMusic('${esc(id)}')">▶</button>
-      </div>`;
-    }).join('')||'<p class="empty">No results</p>';
-    root.innerHTML=`<section class="sec"><div class="sec-head"><h2>Results · ${esc(q)}</h2>
-      <button class="btn ghost" type="button" onclick="musicHome()">← Back</button></div>
-      <div class="m-list">${rows}</div></section>`;
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-function fmtTime(s){s=Math.floor(s||0);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
-function nudgeLyrics(delta){
-  MSTATE.lyricsOffset=Math.round(((MSTATE.lyricsOffset||0)+delta)*10)/10;
-  const el=document.getElementById('lrc-offset');
-  if(el) el.textContent=(MSTATE.lyricsOffset>0?'+':'')+MSTATE.lyricsOffset.toFixed(1)+'s';
-  const audio=getAudio();
-  if(audio) renderSyncLyrics(audio.currentTime||0);
-}
-function renderSyncLyrics(t){
-  const box=document.getElementById('mp-lyrics');
-  if(!box||!MSTATE.lines||!MSTATE.lines.length) return;
-  const et=t+(MSTATE.lyricsOffset||0);
-  let idx=-1;
-  for(let i=0;i<MSTATE.lines.length;i++){
-    if(MSTATE.lines[i].t<=et) idx=i; else break;
-  }
-  if(idx<0) idx=0;
-  let track=box.querySelector('.lrc-track');
-  if(!track || MSTATE._lrcBuilt!==MSTATE.lines.length){
-    MSTATE._lrcBuilt=MSTATE.lines.length;
-    MSTATE._lrcIdx=-1;
-    box.innerHTML='<div class="lrc-track">'+MSTATE.lines.map((ln,i)=>
-      `<div class="lrc-line" data-i="${i}">${esc(ln.text||' ')}</div>`
-    ).join('')+'</div>';
-    track=box.querySelector('.lrc-track');
-  }
-  if(MSTATE._lrcIdx===idx) return;
-  MSTATE._lrcIdx=idx;
-  const lines=track.children;
-  for(let i=0;i<lines.length;i++){
-    const d=Math.abs(i-idx);
-    lines[i].className='lrc-line'+(i===idx?' on':(d===1?' near':(d>3?' far':'')));
-  }
-  const active=lines[idx];
-  if(active){
-    const mid=box.clientHeight/2;
-    const y=active.offsetTop+active.offsetHeight/2;
-    track.style.transform='translateY('+(mid-y)+'px)';
-  }
-}
-function cycleLoop(){
-  MSTATE.loop=MSTATE.loop==='off'?'one':(MSTATE.loop==='one'?'all':'off');
-  const b=document.getElementById('sm-loop');
-  if(b){b.textContent=MSTATE.loop==='off'?'🔁':(MSTATE.loop==='one'?'🔂':'🔁');b.classList.toggle('on',MSTATE.loop!=='off');b.title='Loop: '+MSTATE.loop}
-  toast('Loop: '+MSTATE.loop);
-}
-function toggleShuffle(){
-  MSTATE.shuffle=!MSTATE.shuffle;
-  const b=document.getElementById('sm-shuffle');
-  if(b) b.classList.toggle('on',MSTATE.shuffle);
-  toast(MSTATE.shuffle?'Shuffle on':'Shuffle off');
-}
-function musicNext(){
-  if(!MSTATE.queue||!MSTATE.queue.length){toast('No queue');return}
-  if(MSTATE.shuffle){
-    MSTATE.qIdx=Math.floor(Math.random()*MSTATE.queue.length);
-  }else{
-    MSTATE.qIdx=(MSTATE.qIdx+1)%MSTATE.queue.length;
-  }
-  const it=MSTATE.queue[MSTATE.qIdx];
-  if(it) location.hash='#/music/play/'+encodeURIComponent(it.id||it.video_id||'');
-}
-function musicPrev(){
-  if(!MSTATE.queue||!MSTATE.queue.length){toast('No queue');return}
-  MSTATE.qIdx=(MSTATE.qIdx-1+MSTATE.queue.length)%MSTATE.queue.length;
-  const it=MSTATE.queue[MSTATE.qIdx];
-  if(it) location.hash='#/music/play/'+encodeURIComponent(it.id||it.video_id||'');
-}
-async function musicPlayPage(rawId){
-  const id=decodeURIComponent(rawId||'');
-  bindGlobalAudio();
-  // Every await below is guarded by this token: if the user navigates to
-  // another track (or away) before a request resolves, the stale response
-  // is dropped instead of overwriting the now-current track's state/UI —
-  // this is what was causing lyrics/queue data from one song to bleed
-  // into another when switching quickly.
-  const myToken=(MSTATE._playToken=(MSTATE._playToken||0)+1);
-  setNav('music');
-  root.innerHTML='<div class="empty">Loading player…</div>';
-  let title=id, artist='', thumb='', audioUrl=null, duration=null, videoId=null, downloadUrl=null;
-  try{
-    const d=await api('/music/play/'+encodeURIComponent(id));
-    if(myToken!==MSTATE._playToken) return;
-    title=htmlDecode(d.title||title); artist=htmlDecode(d.artist||''); thumb=d.thumb||'';
-    audioUrl=d.play_url||d.audio_url||null; duration=d.duration||null; videoId=d.video_id||null;
-    downloadUrl=d.audio_url||d.download_url||null;
-    if(!audioUrl&&d.sources){const a=(d.sources||[]).find(s=>s.type==='audio');if(a)audioUrl=a.play_url||a.url}
-  }catch(e){
-    if(myToken!==MSTATE._playToken) return;
-    toast('Stream failed: '+(e.message||e));
-  }
-  if(myToken!==MSTATE._playToken) return;
-  // queue index
-  if(MSTATE.queue&&MSTATE.queue.length){
-    const ix=MSTATE.queue.findIndex(x=>(x.id||x.video_id)===id);
-    if(ix>=0) MSTATE.qIdx=ix;
-  }else{
-    MSTATE.queue=[{id,title,artist,thumb}];
-    MSTATE.qIdx=0;
-  }
-  MSTATE={...MSTATE,id,vid:videoId,title,artist,thumb,audioUrl,lines:[],_lrcIdx:-1,_playToken:myToken};
-
-  root.innerHTML=`<div class="sm-player">
-    <div class="sm-hero" style="--art:url('${esc(thumb)}')">
-      <div class="sm-hero-bg"></div>
-      <div class="sm-art-wrap">${thumb?`<img class="sm-art" src="${esc(thumb)}" alt=""/>`:'<div class="sm-art"></div>'}</div>
-      <div class="sm-meta">
-        <div class="sm-now"><span class="eq" id="sm-eq"><span></span><span></span><span></span><span></span></span>NOW PLAYING</div>
-        <h1 class="sm-title" id="mp-title">${esc(title)}</h1>
-        <div class="sm-artist" id="mp-artist">${esc(artist||'Unknown artist')}</div>
-      </div>
-    </div>
-    <div class="sm-progress">
-      <input type="range" id="sm-seek" min="0" max="1000" value="0"/>
-      <div class="sm-time"><span id="sm-cur">0:00</span><span id="sm-dur">${duration?fmtTime(duration):'—:—'}</span></div>
-    </div>
-    <div class="sm-vol">
-      <span>🔊</span>
-      <input type="range" id="sm-vol" min="0" max="100" value="100"/>
-    </div>
-    <div class="sm-controls">
-      <button type="button" class="sm-btn" id="sm-prev" onclick="musicPrev()" title="Previous">⏮</button>
-      <button type="button" class="sm-btn sm-play" id="sm-toggle" title="Play">▶</button>
-      <button type="button" class="sm-btn" id="sm-next" onclick="musicNext()" title="Next">⏭</button>
-    </div>
-    <div class="sm-icons">
-      <button type="button" id="sm-info" onclick="showTrackInfo()" title="Track info">ℹ</button>
-      <button type="button" id="sm-lyrics-toggle" class="on" onclick="toggleLyricsPanel()" title="Show/hide lyrics">📜</button>
-      <button type="button" id="sm-shuffle" onclick="toggleShuffle()" title="Shuffle">🔀</button>
-      <button type="button" id="sm-loop" onclick="cycleLoop()" title="Repeat">🔁</button>
-      <button type="button" id="sm-like" onclick="toggleLike()" title="Like">♡</button>
-      <button type="button" id="sm-queue-btn" onclick="openQueue()" title="Queue">☰</button>
-    </div>
-    <div class="sm-extra">
-      <a class="btn" id="sm-dl" href="${esc(downloadUrl||audioUrl||'#')}" target="_blank" rel="noopener" download>⬇ Download</a>
-      <button class="btn ghost" type="button" onclick="copyStreamLink()">Copy stream</button>
-      <button class="btn ghost" type="button" onclick="location.hash='#/music'">Library</button>
-    </div>
-    <div class="m-lyrics" id="m-lyrics-panel">
-      <div class="m-lyrics-head">
-        <h3>Lyrics</h3>
-        <div class="lrc-tools">
-          <span class="tag" id="lrc-tag"></span>
-          <div class="lrc-sync" id="lrc-sync" style="display:none">
-            <button type="button" onclick="nudgeLyrics(-0.5)" title="Lyrics running late? Shift earlier">−</button>
-            <span id="lrc-offset">0.0s</span>
-            <button type="button" onclick="nudgeLyrics(0.5)" title="Lyrics running early? Shift later">+</button>
-          </div>
-        </div>
-      </div>
-      <div id="mp-lyrics" class="lrc-box">Loading lyrics…</div>
-    </div>
-    <section class="sec" id="sm-rec"><h2>More like this</h2><div class="empty">Loading…</div></section>
-  </div>`;
-
-  const bar=document.getElementById('nowbar');
-  if(bar){
-    document.getElementById('nowtitle').textContent=title;
-    document.getElementById('nowartist').textContent=artist||'';
-    document.getElementById('nowthumb').src=thumb||'';
-    document.getElementById('nowplayer').innerHTML='';
-    bar.classList.add('on');
-  }
-
-  // These buttons are recreated on every navigation, so re-apply the
-  // persisted MSTATE flags (and liked status) to their fresh DOM nodes.
-  const likeBtn=document.getElementById('sm-like');
-  if(likeBtn){const on=isLiked(id);likeBtn.classList.toggle('on',on);likeBtn.textContent=on?'♥':'♡'}
-  const shufBtn=document.getElementById('sm-shuffle');
-  if(shufBtn) shufBtn.classList.toggle('on',!!MSTATE.shuffle);
-  const loopBtn=document.getElementById('sm-loop');
-  if(loopBtn){loopBtn.textContent=MSTATE.loop==='one'?'🔂':'🔁';loopBtn.classList.toggle('on',MSTATE.loop!=='off')}
-
-  // One shared audio element lives outside #root (in the mini player bar)
-  // so playback survives navigating to other pages — it is not recreated
-  // here, only re-pointed when the track actually changed.
-  const audio=getAudio();
-  const toggle=document.getElementById('sm-toggle');
-  const seek=document.getElementById('sm-seek');
-  const vol=document.getElementById('sm-vol');
-
-  if(audioUrl){
-    try{audio.pause()}catch(e){}
-    audio.src=audioUrl;
-    audio.dataset.trackId=id;
-    const p=audio.play();
-    if(p&&p.then) p.then(()=>setPlayIcon(true)).catch(()=>{setPlayIcon(false);toast('Tap ▶ to play')});
-    else setPlayIcon(!audio.paused);
-    // now bar
-    const bar=document.getElementById('nowbar');
-    if(bar) bar.classList.add('on');
-    const nt=document.getElementById('nowthumb'); if(nt&&thumb) nt.src=thumb;
-    const ntitle=document.getElementById('nowtitle'); if(ntitle) ntitle.textContent=title;
-    const nart=document.getElementById('nowartist'); if(nart) nart.textContent=artist;
-  }else if(videoId){
-    document.querySelector('.sm-art-wrap').innerHTML=`<div class="yt" style="aspect-ratio:16/9;width:100%;border-radius:12px;overflow:hidden"><iframe src="https://www.youtube.com/embed/${esc(videoId)}?autoplay=1&rel=0" allow="autoplay;encrypted-media" allowfullscreen style="width:100%;height:100%;border:0"></iframe></div>`;
-    toast('Using YouTube player');
-  }else toast('No playable stream');
-
-  toggle.onclick=()=>{
-    if(!audio.src) return;
-    if(audio.paused){audio.play().catch(()=>{})}else{audio.pause()}
-  };
-  if(vol){
-    vol.value=Math.round((audio.volume==null?1:audio.volume)*100);
-    vol.style.setProperty('--val',vol.value+'%');
-    vol.oninput=()=>{audio.volume=(+vol.value)/100;vol.style.setProperty('--val',vol.value+'%')};
-  }
-  seek.addEventListener('input',()=>{seek._seeking=true;seek.style.setProperty('--val',(seek.value/10)+'%')});
-  seek.addEventListener('change',()=>{
-    if(audio.duration) audio.currentTime=(seek.value/1000)*audio.duration;
-    seek._seeking=false;
-  });
-  if(audio.duration) seek.style.setProperty('--val',((audio.currentTime/audio.duration)*100)+'%');
-
-  // lyrics
-  MSTATE.lyricsOffset=0;
-  const syncBox=document.getElementById('lrc-sync');
-  const offEl=document.getElementById('lrc-offset');
-  if(offEl) offEl.textContent='0.0s';
-  try{
-    let lq='/music/lyrics?title='+encodeURIComponent(title)+'&artist='+encodeURIComponent(artist||'');
-    if(duration) lq+='&duration='+Math.round(duration);
-    const L=await api(lq);
-    if(myToken!==MSTATE._playToken) return;
-    const el=document.getElementById('mp-lyrics');
-    const tg=document.getElementById('lrc-tag');
-    if(L.lines&&L.lines.length){
-      MSTATE.lines=L.lines; MSTATE._lrcIdx=-1;
-      renderSyncLyrics(audio.currentTime||0);
-      if(tg) tg.textContent='Synced';
-      if(syncBox) syncBox.style.display='inline-flex';
-    }else if(L.found&&(L.lyrics||L.synced)){
-      el.innerHTML='<pre style="white-space:pre-wrap;font:inherit;color:inherit;margin:0">'+esc(L.lyrics||L.synced)+'</pre>';
-      if(tg) tg.textContent='Plain text';
-    }else{
-      el.innerHTML='<div class="empty" style="padding:26px 8px">No lyrics found</div>';
-      if(tg) tg.textContent='';
-    }
-    if(L.title) document.getElementById('mp-title').textContent=L.title;
-    if(L.artist) document.getElementById('mp-artist').textContent=L.artist;
-  }catch(e){
-    if(myToken!==MSTATE._playToken) return;
-    const el=document.getElementById('mp-lyrics');
-    if(el) el.textContent='Lyrics unavailable';
-  }
-
-  // recommended
-  try{
-    const rec=await api('/music/related?q='+encodeURIComponent((title+' '+(artist||'')).trim())+'&limit=8');
-    if(myToken!==MSTATE._playToken) return;
-    const recEl=document.getElementById('sm-rec');
-    if(recEl){
-      const items=(rec.items||[]).filter(x=>(x.id||'')!==id);
-      if(items.length){
-        const have=new Set((MSTATE.queue||[]).map(x=>x.id));
-        items.forEach(it=>{if(it.id&&!have.has(it.id)){MSTATE.queue.push(it);have.add(it.id)}});
-        recEl.innerHTML=`<h2>More like this</h2><div class="sm-rec-list">${items.map(it=>{
-          const rid=it.id||it.video_id||'';
-          return `<div class="sm-rec-row" onclick="location.hash='#/music/play/'+encodeURIComponent('${esc(rid)}')">
-            <img src="${esc(it.thumb||'')}" alt="" loading="lazy"/>
-            <div class="meta"><div class="t">${esc(it.title||'')}</div><div class="a">${esc(it.artist||'')}</div></div>
-          </div>`;
-        }).join('')}</div>`;
-      }else recEl.innerHTML='<h2>More like this</h2><p class="empty">No suggestions</p>';
-    }
-  }catch(e){
-    if(myToken!==MSTATE._playToken) return;
-    const recEl=document.getElementById('sm-rec');
-    if(recEl) recEl.innerHTML='';
-  }
-}
-function playMusic(vid){
-  if(!vid){toast('No track');return}
-  vid=String(vid);
-  location.hash='#/music/play/'+encodeURIComponent(vid);
-}
-function closeMusic(){
-  const a=getAudio();
-  if(a){try{a.pause();a.removeAttribute('src');delete a.dataset.trackId;a.load()}catch(e){}}
-  const np=document.getElementById('nowplayer');
-  if(np) np.innerHTML='';
-  const bar=document.getElementById('nowbar');
-  if(bar) bar.classList.remove('on');
-  const fill=document.getElementById('nowfill');
-  if(fill) fill.style.width='0';
-  closeQueue();
-  MSTATE.id='';MSTATE.audioUrl=null;
-  if(location.hash.indexOf('#/music/play')===0) location.hash='#/music';
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-async function downloaderHome(){
-  setNav('dl');
-  root.innerHTML=`<div class="dl-wrap">
-    <div class="dl-hero">
-      <h1>⬇ Downloader</h1>
-      <p>Paste any link — YouTube, TikTok, Instagram, X, Reddit, Vimeo &amp; 1000+ sites (yt-dlp · OmniGet-style)</p>
-      <div class="dl-box">
-        <input id="dl-url" type="url" placeholder="https://youtube.com/watch?v=…" onkeydown="if(event.key==='Enter')dlProbe()"/>
-        <button class="btn" type="button" onclick="dlProbe()">Fetch formats</button>
-      </div>
-      <div class="dl-chips">
-        <button type="button" onclick="document.getElementById('dl-url').value='https://www.youtube.com/watch?v=dQw4w9WgXcQ'">YouTube sample</button>
-        <button type="button" onclick="dlMode='audio';dlProbe()">Audio only</button>
-      </div>
-    </div>
-    <div id="dl-out"></div>
-  </div>`;
-}
-let dlMode='all';
-function fmtBytes(n){if(!n)return '';n=+n;if(n>1e9)return (n/1e9).toFixed(1)+' GB';if(n>1e6)return (n/1e6).toFixed(1)+' MB';if(n>1e3)return (n/1e3).toFixed(0)+' KB';return n+' B'}
-async function dlProbe(){
-  const url=(document.getElementById('dl-url')||{}).value||'';
-  const u=url.trim(); if(!u){toast('Paste a URL');return}
-  const out=document.getElementById('dl-out');
-  if(out) out.innerHTML='<div class="empty">Probing with yt-dlp…</div>';
-  try{
-    const d=await api('/dl/info?url='+encodeURIComponent(u));
-    if(!d.ok){out.innerHTML=`<div class="empty err">${esc(d.error||'Failed')}</div>`;return}
-    let fmts=d.formats||[];
-    if(dlMode==='audio') fmts=fmts.filter(f=>f.kind==='audio'||(f.acodec&&f.acodec!=='none'));
-    dlMode='all';
-    window.__dlFmts=fmts;
-    window.__dlMux=d.best_muxed||fmts.find(f=>f.muxed)||null;
-    window.__dlVid=fmts.find(f=>f.kind==='video'&&f.vcodec&&f.vcodec!=='none')||fmts.find(f=>f.height&&(!f.muxed));
-    window.__dlAud=d.best_audio||fmts.find(f=>f.kind==='audio'||(f.acodec&&f.acodec!=='none'&&(!f.vcodec||f.vcodec==='none')));
-    // prefer highest height video-only for combine
-    const vids=fmts.filter(f=>f.vcodec&&f.vcodec!=='none'&&(!f.acodec||f.acodec==='none'||!f.muxed));
-    if(vids.length){vids.sort((a,b)=>(b.height||0)-(a.height||0));window.__dlVid=vids[0]}
-    const mux=window.__dlMux;
-    let h='';
-    if(mux&&mux.url){
-      h+=`<div class="dl-note">✅ <b>Single file with sound:</b> ${esc(mux.label)}</div>`;
-    }else if(window.__dlVid&&window.__dlAud){
-      h+=`<div class="dl-note">🔊 Video &amp; audio are separate (normal for YT). Tap <b>⬇ Download with sound</b> — we merge them with ffmpeg into one MP4.</div>`;
-    }else{
-      h+=`<div class="dl-note">⚠️ No clear video+audio pair. Try another link or quality.</div>`;
-    }
-    h+=`<div class="dl-preview">
-      ${d.thumbnail?`<img src="${esc(d.thumbnail)}" alt=""/>`:''}
-      <div class="meta">
-        <h2>${esc(d.title||'Untitled')}</h2>
-        <div class="sub">${esc(d.uploader||'')} ${d.duration?('· '+fmtTime(d.duration)):''} · ${esc(d.extractor||'')}</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
-          <a class="btn ghost" href="${esc(d.webpage_url||u)}" target="_blank" rel="noopener">Open page</a>
-          ${mux&&mux.url?'<button class="btn" type="button" onclick="dlCopyMux()">Copy VIDEO+AUDIO</button>':''}
-          ${(window.__dlVid&&window.__dlAud)?'<button class="btn" type="button" onclick="dlCombine()">⬇ Download with sound</button>':''}
-          <button class="btn ghost" type="button" onclick="dlMerge()">Merge via yt-dlp</button>
-        </div>
-      </div>
-    </div>
-    <h3 style="margin:0 0 10px;font-size:.95rem">Formats · ${fmts.length}</h3>
-    <div class="dl-formats">`;
-    if(!fmts.length) h+='<div class="empty">No direct formats</div>';
-    fmts.forEach((f,i)=>{
-      const isM=!!f.muxed;
-      h+=`<div class="dl-fmt ${isM?'muxed':''}">
-        <div class="lab">${esc(f.label)}</div>
-        <div class="sz">${fmtBytes(f.filesize)}</div>
-        <a class="btn" href="${esc(f.url||'#')}" target="_blank" rel="noopener" download>⬇ Save</a>
-        <button class="btn ghost" type="button" onclick="dlCopyFmt(${i})">Copy</button>
-      </div>`;
-    });
-    h+='</div>';
-    out.innerHTML=h;
-  }catch(e){
-    if(out) out.innerHTML=`<div class="empty err">${esc(e.message||e)}</div>`;
-  }
-}
-function dlCopyMux(){const m=window.__dlMux;if(m&&m.url)navigator.clipboard.writeText(m.url).then(()=>toast('Copied — VIDEO+AUDIO (has sound)'))}
-function dlCopyFmt(i){const f=(window.__dlFmts||[])[i];if(f&&f.url)navigator.clipboard.writeText(f.url).then(()=>toast(f.muxed?'Copied (has audio)':'Copied'))}
-async function dlCombine(){
-  const v=window.__dlVid,a=window.__dlAud;
-  if(!v||!a||!v.url||!a.url){toast('Need video + audio formats');return}
-  const title=(document.querySelector('.dl-preview h2')||{}).textContent||'video';
-  toast('Merging video+audio… keep this tab open (30–120s)');
-  try{
-    const r=await fetch('/dl/combine',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({video:v.url,audio:a.url,title:title})
-    });
-    if(!r.ok){
-      let msg='Merge failed '+r.status;
-      try{const j=await r.json();msg=j.detail||msg}catch(e){}
-      toast(msg);return;
-    }
-    const blob=await r.blob();
-    if(blob.size<1000){toast('Empty file');return}
-    const url=URL.createObjectURL(blob);
-    const link=document.createElement('a');
-    link.href=url;link.download=(title||'video').replace(/[^\w\-. ]+/g,'').slice(0,80)+'.mp4';
-    document.body.appendChild(link);link.click();link.remove();
-    setTimeout(()=>URL.revokeObjectURL(url),5000);
-    toast('Download started · '+(Math.round(blob.size/1e6*10)/10)+' MB');
-  }catch(e){toast(e.message||'Merge error')}
-}
-function dlMerge(){
-  const u=(document.getElementById('dl-url')||{}).value||'';
-  if(!u.trim()){toast('Paste URL first');return}
-  toast('Merging video+audio (may take 30–90s)…');
-  const a=document.createElement('a');
-  a.href='/dl/merged?url='+encodeURIComponent(u.trim())+'&quality=720';
-  a.target='_blank';
-  a.rel='noopener';
-  document.body.appendChild(a);a.click();a.remove();
-}
-
-
-
-async function home(){
-  setNav('home');root.innerHTML='<div class="empty">Loading…</div>';
-  try{
-    const d=await api('/api/home');
-    const hero=(d.trending_movies&&d.trending_movies[0])||(d.trending_series&&d.trending_series[0]);
-    let h='';
-    if(hero){
-      const media=hero.type==='tv'?'tv':'movie';
-      const bg=hero.backdrop||hero.poster||'';
-      h=`<div class="hero">${bg?`<img src="${esc(bg)}" alt=""/>`:''}<div class="hbody"><div class="badge">Featured</div><h1>${esc(hero.name)}</h1><p>${esc(hero.overview||'')}</p><div style="margin-top:12px"><button class="btn" onclick="location.hash='#/watch/${media}/${hero.tmdb_id||hero.id}'">▶ Play</button>
-      <button class="btn ghost" style="margin-left:8px" onclick="location.hash='#/title/${media}/${hero.tmdb_id||hero.id}'">Details</button></div></div></div>`;
-    }
-    root.innerHTML=h
-      +row('Trending Movies',d.trending_movies)
-      +row('Trending Series',d.trending_series)
-      +row('Popular Movies',d.popular_movies)
-      +row('Popular Series',d.popular_series)
-      +row('Now Playing',d.now_playing)
-      +row('On The Air',d.on_the_air)
-      +row('Top Movies',d.top_movies)
-      +row('Top Series',d.top_series)
-      +row('Upcoming',d.upcoming);
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-async function grid(k,page){
-  page=page||1;
-  setNav(k);root.innerHTML='<div class="empty">Loading…</div>';
-  try{
-    const d=await api((k==='movies'?'/api/movies':'/api/series')+'?page='+page);
-    const total=d.total_pages||1;
-    const pager=`<div class="pager">
-      <button class="src" type="button" ${page<=1?'disabled':''} onclick="grid('${k}',${page-1})">← Prev</button>
-      <span class="page-n">Page ${page} / ${total}</span>
-      <button class="src" type="button" ${page>=total?'disabled':''} onclick="grid('${k}',${page+1})">Next →</button>
-    </div>`;
-    root.innerHTML=`<section class="sec" style="padding-top:6px"><div class="sec-head"><h2>${k==='movies'?'Movies':'Series'}</h2>${pager}</div>
-      <div class="grid">${(d.items||[]).map(card).join('')||'<p class="empty">Empty</p>'}</div>
-      ${pager}</section>`;
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-async function search(q){
-  setNav('');root.innerHTML='<div class="empty">Searching…</div>';
-  try{
-    const d=await api('/api/search?q='+encodeURIComponent(q));
-    const items=d.items||d.tmdb||[];
-    root.innerHTML=`<section class="sec"><h2>Results for “${esc(q)}”</h2><div class="grid">${items.map(card).join('')||'<p class="empty">No results</p>'}</div></section>`;
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-function goSearch(){const q=document.getElementById('q').value.trim();if(!q)return;if(location.hash.indexOf('#/music')===0){musicSearch(q);return}location.hash='#/search/'+encodeURIComponent(q)}
-async function title(media,id){
-  setNav('');root.innerHTML='<div class="empty">Loading…</div>';
-  try{
-    const d=await api(`/api/detail/${media}/${id}`);
-    const poster=d.poster?`background-image:url('${esc(d.poster)}')`:'';
-    root.innerHTML=`<div class="detail"><div class="poster" style="${poster}"></div><div>
-      <h1>${esc(d.name)}</h1>
-      <div class="meta">${esc(d.year||'')} · ${esc(d.type)} ${d.rating?('· ★ '+Number(d.rating).toFixed(1)):''} ${(d.genres||[]).slice(0,4).map(g=>'· '+esc(g)).join('')}</div>
-      <p class="overview">${esc(d.overview||'')}</p>
-      <button class="btn" onclick="location.hash='#/watch/${media}/${id}'">▶ Play</button>
-      ${d.seasons&&d.seasons.length?`<section class="sec"><h2>Seasons</h2><div class="row">${d.seasons.map(s=>`<div class="card" onclick="location.hash='#/watch/tv/${id}?se=${s.season}&ep=1'"><div class="p" style="display:flex;align-items:center;justify-content:center;font-size:1.5rem;color:var(--a);aspect-ratio:1">S${s.season}</div><div class="t">${esc(s.name)} · ${s.episode_count||'?'} ep</div></div>`).join('')}</div></section>`:''}
-    </div></div>`;
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-let PS={sources:[],idx:0,se:1,ep:1};
-let dashPlayer=null;
-let plyrInst=null;
-function destroyPlayer(){
-  try{ if(dashPlayer){ dashPlayer.reset(); dashPlayer=null; } }catch(e){}
-  try{ if(plyrInst){ plyrInst.destroy(); plyrInst=null; } }catch(e){}
-}
-function isBrowserPlayable(url, format){
-  const u=(url||'').toLowerCase();
-  const f=(format||'').toLowerCase();
-  if(/\.mp4(\?|$)/i.test(u) || f==='mp4') return true;
-  if(/\.webm(\?|$)/i.test(u) || f==='webm') return true;
-  if(/\.m3u8(\?|$)/i.test(u) || f==='hls') return true;
-  if(/\.mpd(\?|$)/i.test(u) || f==='dash') return true;
-  // MKV/AVI often fail in HTML5 — still try, fallback panel if error
-  return false;
-}
-function renderP(){
-  const s=PS.sources[PS.idx]; const f=document.getElementById('frame');
-  if(!s){f.innerHTML='<div class="empty">No sources</div>';return}
-  destroyPlayer();
-  const play=s.play_url||s.url;
-  const st=document.getElementById('st');
-  if(st) st.innerHTML=(PS.idx+1)+'/'+PS.sources.length+' · '+esc(s.label)+(s.format?('<span class="fmt-tag">'+esc(s.format)+'</span>'):'');
-  document.querySelectorAll('.src[data-i]').forEach((b,i)=>b.classList.toggle('on',i===PS.idx));
-  const qsel=document.getElementById('qsel');
-  if(qsel){qsel.innerHTML='';qsel.style.display='none'}
-  const ext=document.getElementById('extpanel');
-  if(ext) ext.innerHTML='';
-
-  if(s.type==='embed'){
-    f.innerHTML=`<iframe src="${esc(play)}" allowfullscreen allow="autoplay;encrypted-media;picture-in-picture;fullscreen;clipboard-write" referrerpolicy="origin" style="width:100%;height:100%;border:0;background:#000" loading="eager"></iframe>`;
-    return;
-  }
-
-  const isDash=/\\.mpd(\\?|$)/i.test(play)||/\\.mpd(\\?|$)/i.test(s.url||'')||(s.format||'').toUpperCase()==='DASH';
-  const tryNative=isBrowserPlayable(play,s.format)||isDash||/\\.mkv/i.test(play)||(s.format||'').toUpperCase()==='MKV'||(s.format||'').toUpperCase()==='FILE';
-
-  f.innerHTML='';
-  const v=document.createElement('video');
-  v.id='vmain'; v.playsInline=true; v.setAttribute('playsinline',''); v.setAttribute('crossorigin','anonymous');
-  v.controls=true; v.style.cssText='width:100%;height:100%;background:#000';
-  f.appendChild(v);
-
-  const showExt=()=>{
-    if(!ext) return;
-    ext.innerHTML=`<div class="ext-panel">
-      <h4>Advanced playback</h4>
-      <p>This file may use codecs (MKV / HEVC / DTS) that browsers block. Use an external player like <b>VLC</b>, <b>mpv</b>, or <b>PotPlayer</b> for full quality — same approach as MovieBox-TUI.</p>
-      <div class="ext-actions">
-        <a class="primary" href="${esc(play)}" target="_blank" rel="noopener">Open / Download file</a>
-        <button type="button" class="primary" onclick="navigator.clipboard.writeText('${esc(play).replace(/'/g,"\\'")}').then(()=>toast('Link copied — paste into VLC → Open Network Stream'))">Copy stream URL</button>
-        <button type="button" onclick="window.__nx()">Try next source</button>
-      </div>
-    </div>`;
-  };
-
-  if(isDash && window.dashjs){
-    try{
-      dashPlayer=dashjs.MediaPlayer().create();
-      dashPlayer.updateSettings({streaming:{abr:{autoSwitchBitrate:{video:true}},buffer:{fastSwitchEnabled:true}}});
-      dashPlayer.initialize(v, play, true);
-      if(window.Plyr){ try{ plyrInst=new Plyr(v,{controls:['play-large','play','progress','current-time','duration','mute','volume','settings','fullscreen'],settings:['quality','speed']}); }catch(e){} }
-      dashPlayer.on(dashjs.MediaPlayer.events.ERROR,()=>{toast('DASH error');showExt();});
-      dashPlayer.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED,()=>{
-        try{
-          const bitrates=dashPlayer.getBitrateInfoListFor('video')||[];
-          if(qsel&&bitrates.length){
-            qsel.style.display='inline-block';
-            qsel.innerHTML='<option value="auto">Auto</option>'+bitrates.map((b,i)=>`<option value="${i}">${b.height||'?'}p</option>`).join('');
-            qsel.onchange=()=>{const val=qsel.value;if(val==='auto')dashPlayer.updateSettings({streaming:{abr:{autoSwitchBitrate:{video:true}}}});else{dashPlayer.updateSettings({streaming:{abr:{autoSwitchBitrate:{video:false}}}});dashPlayer.setQualityFor('video',parseInt(val,10))}};
-          }
-        }catch(e){}
-      });
-    }catch(e){showExt();}
-  }else{
-    v.src=play;
-    if(window.Plyr){
-      try{
-        plyrInst=new Plyr(v,{
-          controls:['play-large','play','progress','current-time','duration','mute','volume','settings','pip','fullscreen'],
-          settings:['speed'],
-          keyboard:{focused:true,global:true},
-          tooltips:{controls:true,seek:true},
-          autoplay:true
-        });
-      }catch(e){}
-    }else{
-      v.autoplay=true;
-    }
-    let erred=false;
-    v.addEventListener('error',()=>{if(erred)return;erred=true;toast('Browser cannot decode this file');showExt();});
-    // If MKV and no progress after 4s with readyState low
-    if(/\\.mkv/i.test(play)||(s.format||'').toUpperCase()==='MKV'){
-      setTimeout(()=>{
-        try{
-          if(v.readyState<2 && v.videoWidth===0){ showExt(); }
-        }catch(e){}
-      },4000);
-    }
-  }
-}
-window.__nx=
-()=>{if(PS.idx<PS.sources.length-1){PS.idx++;toast('Next source…');renderP()}else toast('All sources failed')};
-
-async function watch(media,id,se,ep){
-  setNav('');
-  document.body.classList.add('watching');
-  const nbar=document.getElementById('nowbar'); if(nbar) nbar.classList.remove('on');
-  PS={sources:[],idx:0,se:se||1,ep:ep||1};
-  root.innerHTML=`<div class="player-shell"><div class="player-wrap"><div id="frame" class="empty">Loading stream…</div></div><div id="extpanel"></div></div>
-    <div class="bar"><span id="st">Fetching sources…</span>
-    <select id="qsel" class="se-select" style="display:none"></select>
-    <button class="src" type="button" onclick="window.__nx()">Next source ↻</button>
-    <a class="src" href="#/title/${media}/${id}">Details</a></div>
-    <div id="srcs"></div><div id="hublist"></div><div id="eps"></div>`;
-  try{
-    let url=`/api/play?tmdb_id=${encodeURIComponent(id)}&media=${media}&fast=1`;
-    if(media==='tv')url+=`&se=${PS.se}&ep=${PS.ep}`;
-    const ctrl=new AbortController();
-    const to=setTimeout(()=>ctrl.abort(),25000);
-    let d;
-    try{
-      const r=await fetch(url,{signal:ctrl.signal});
-      clearTimeout(to);
-      if(!r.ok) throw new Error('Play API '+r.status);
-      d=await r.json();
-    }catch(e){
-      clearTimeout(to);
-      throw e;
-    }
-    PS.sources=d.sources||[];
-    if(!PS.sources.length){
-      document.getElementById('frame').innerHTML=`<div class="empty err">No sources found${d.errors?(' · '+esc(JSON.stringify(d.errors))):''}</div>`;
-      return;
-    }
-    document.getElementById('srcs').innerHTML=
-      '<div style="font-size:.75rem;color:var(--mute);margin:4px 0 6px">Sources</div>'+
-      PS.sources.map((s,i)=>`<button type="button" class="src ${i===0?'on':''}" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('');
-    const hubEl=document.getElementById('hublist');
-    if(hubEl){
-      hubEl.innerHTML=`<div class="hubbox"><button type="button" class="src" onclick="loadHubs('${esc(media)}','${esc(id)}',${PS.se},${PS.ep})">Load 4K / Download mirrors…</button></div>`;
-    }
-    renderP();
-  }catch(e){
-    const msg=e.name==='AbortError'?'Timed out — try again':(e.message||String(e));
-    const fr=document.getElementById('frame');
-    if(fr) fr.innerHTML=`<div class="empty err">${esc(msg)}</div>`;
-    toast(msg);
-  }
-  if(media==='tv'){
-    try{
-      const sd=await api(`/api/tv/${id}/season/${PS.se}`);
-      const epsList=(sd.episodes||[]).slice().sort((a,b)=>(a.episode||0)-(b.episode||0));
-      const epEl=document.getElementById('eps');
-      if(epEl) epEl.innerHTML=`<div style="margin-top:12px"><div style="font-size:.8rem;color:var(--mute);margin-bottom:6px">Episodes · S${PS.se}</div><div style="display:flex;flex-wrap:wrap;gap:6px">${epsList.map(e=>`<button type="button" class="ep ${e.episode==PS.ep?'on':''}" onclick="location.hash='#/watch/tv/${id}?se=${PS.se}&ep=${e.episode}'">E${e.episode}</button>`).join('')}</div></div>`;
-    }catch(e){}
-  }
-}
-async function loadHubs(media,id,se,ep){
-  const hubEl=document.getElementById('hublist');
-  if(hubEl) hubEl.innerHTML='<div class="empty">Loading 4K mirrors…</div>';
-  try{
-    let url=`/api/play?tmdb_id=${encodeURIComponent(id)}&media=${media}&fast=0`;
-    if(media==='tv')url+=`&se=${se}&ep=${ep}`;
-    const d=await api(url);
-    const hubs=(d.sources||[]).map((s,i)=>({s,i})).filter(x=>x.s.provider==='4khdhub');
-    // merge new hub sources
-    const base=PS.sources.filter(s=>s.provider!=='4khdhub');
-    const hubOnly=(d.sources||[]).filter(s=>s.provider==='4khdhub');
-    PS.sources=base.concat(hubOnly);
-    // refresh source buttons
-    const srcs=document.getElementById('srcs');
-    if(srcs) srcs.innerHTML='<div style="font-size:.75rem;color:var(--mute);margin:4px 0 6px">Sources</div>'+PS.sources.map((s,i)=>`<button type="button" class="src" data-i="${i}" onclick="PS.idx=${i};renderP()">${esc(s.label)}</button>`).join('');
-    let html='';
-    if(hubOnly.length){
-      html+=`<div class="hubbox"><h3>4K / Hub</h3>${hubOnly.map((s)=>{
-        const i=PS.sources.indexOf(s);
-        return `<button type="button" class="src" onclick="PS.idx=${i};renderP()">▶ ${esc(s.label)}</button>`;
-      }).join('')}</div>`;
-    }
-    const dls=d.downloads||[];
-    if(dls.length){
-      html+=`<div class="dlbox"><h3>Download</h3><div class="dl-grid">${dls.map(s=>{
-        const u=s.url||'';
-        return `<a class="dl-card" href="${esc(u)}" target="_blank" rel="noopener" download><div class="dl-ico">⬇</div><div class="dl-meta"><div class="dl-title">${esc(s.label||'File')}</div><div class="dl-sub">${esc(s.format||'')}</div></div></a>`;
-      }).join('')}</div></div>`;
-    }
-    if(!html) html='<div class="empty">No 4K mirrors</div>';
-    if(hubEl) hubEl.innerHTML=html;
-  }catch(e){if(hubEl) hubEl.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-
-async function apiDocs(){
-  setNav('api');
-  const cards=[
-    {g:'🌐 Web',e:'GET /',d:'This website (SPA). Hash routes: #/movies #/series #/music #/anime #/dl #/watch/...',h:'Open the site root. Use the sidebar to navigate.'},
-    {g:'🏠 Catalog',e:'GET /api/home',d:'Trending & popular movies/series from TMDB.',h:'Browser calls this on Home. You can open /api/home in a new tab to see JSON.'},
-    {g:'🔍 Search',e:'GET /api/search?q=avatar',d:'Search movies & TV on TMDB.',h:'Type in the top search box (not on Music) or call the URL with your query.'},
-    {g:'▶️ Play',e:'GET /api/play?tmdb_id=19995&media=movie&fast=1',d:'Embed players (VidSrc, VidLink, …). fast=1 = quick embeds only.',h:'Click Play on any title. Use Next source if one embed fails. fast=0 also loads 4K mirrors.'},
-    {g:'🎵 Music',e:'GET /music/search · /music/yt/search · /music/yt/trending · /music/yt/play/{id}',d:'Saavn + YouTube (Invidious) streams, trending, lyrics.',h:'Music tab: chips + search. YT ids play via Invidious audio.'},
-    {g:'🎌 Anime',e:'GET /anime/home · /anime/search · /anime/detail/{slug} · /anime/stream?hash=',d:'HindiAnime Hindi-dub catalog + HLS resolve.',h:'Anime tab → pick series → episode → play.'},
-    {g:'⬇ Downloader',e:'GET /dl/info?url=https://...',d:'yt-dlp probe (OmniGet-style). Lists formats with direct links.',h:'Paste a YouTube/TikTok/… link. Prefer rows marked 🔊 VIDEO+AUDIO so sound is included when you Copy/Save.'},
-    {g:'🎧 Audio only',e:'GET /dl/audio?url=...',d:'Picks the best audio stream for a page URL.',h:'Use when you only need music/speech from a video page.'},
-    {g:'📦 4K / Hub',e:'GET /fk/search?q= · /tools/resolve?url=',d:'4KHDHub search + HubCloud direct resolve.',h:'On a movie page, tap Load 4K mirrors, or call these APIs from /docs.'},
-    {g:'🎬 MovieBox API',e:'GET /mb/search?q= · /mb/stream/{id}',d:'Mobile MovieBox BFF (HMAC). Streams may need cookies (use proxy).',h:'For API clients only — not used by the main web player. See /docs.'},
-    {g:'❤️ Health',e:'GET /health',d:'Version + enabled providers.',h:'Check deploy is alive after update.'},
-    {g:'📖 Swagger',e:'GET /docs',d:'Interactive OpenAPI — try every endpoint in the browser.',h:'Best for beginners to experiment with parameters.'},
-  ];
-  root.innerHTML=`<div class="api-guide">
-    <div class="dl-hero"><h1>API guide</h1><p>Beginner-friendly map of ElitePlex · click a path in Swagger to try live</p>
-      <a class="btn" href="/docs" target="_blank">Open Swagger →</a>
-    </div>
-    ${cards.map(c=>`<div class="api-card"><h3><span>${c.g}</span></h3>
-      <div class="ep">${esc(c.e)}</div>
-      <p>${esc(c.d)}</p>
-      <div class="how"><b>How to use:</b> ${esc(c.h)}</div>
-    </div>`).join('')}
-  </div>`;
-}
-async function router(){
-  closeQueue();
-  if((location.hash||'').indexOf('#/watch')!==0) document.body.classList.remove('watching');
-  const h=location.hash.slice(1)||'/';const [path,qs]=h.split('?');
-  const params=Object.fromEntries(new URLSearchParams(qs||''));
-  const p=path.split('/').filter(Boolean);
-  try{
-    if(!p.length) return home();
-    if(p[0]==='movies') return grid('movies');
-    if(p[0]==='music'&&p[1]==='play'&&p[2]) return musicPlayPage(p.slice(2).join('/'));
-    if(p[0]==='anime'&&p[1]==='watch'&&p[2]) return animeWatch(p[2], parseInt(params.ep||'0',10));
-    if(p[0]==='anime'&&p[1]==='title'&&p[2]) return animeOpen(p[2]);
-    if(p[0]==='anime') return animeHome();
-    if(p[0]==='music') return musicHome();
-    if(p[0]==='dl') return downloaderHome();
-    if(p[0]==='series') return grid('series');
-    if(p[0]==='search'&&p[1]) return search(decodeURIComponent(p[1]));
-    if(p[0]==='title'&&p[1]&&p[2]) return title(p[1],p[2]);
-    if(p[0]==='watch'&&p[1]&&p[2]) return watch(p[1],p[2],parseInt(params.se||'1',10),parseInt(params.ep||'1',10));
-    if(p[0]==='api') return apiDocs();
-    root.innerHTML='<div class="empty">Not found</div>';
-  }catch(e){root.innerHTML=`<div class="empty err">${esc(e.message)}</div>`}
-}
-window.addEventListener('hashchange',router);
-router();
-</script>
-<div id="nowbar" class="now-bar">
-  <div class="now-fill" id="nowfill"></div>
-  <audio id="g-audio" preload="metadata"></audio>
-  <img id="nowthumb" alt="" onclick="if(MSTATE.id)location.hash='#/music/play/'+encodeURIComponent(MSTATE.id)"/>
-  <div class="now-meta" onclick="if(MSTATE.id)location.hash='#/music/play/'+encodeURIComponent(MSTATE.id)"><div class="t" id="nowtitle">—</div><div class="a" id="nowartist"></div></div>
-  <div class="now-player" id="nowplayer"></div>
-  <div class="now-actions">
-    <button class="src" type="button" id="nb-toggle" onclick="nbToggle()" title="Play/Pause">▶</button>
-    <button class="src" type="button" onclick="if(MSTATE.id)location.hash='#/music/play/'+encodeURIComponent(MSTATE.id)">Player</button>
-    <button class="src" type="button" onclick="closeMusic()">✕</button>
-  </div>
-</div>
-<div id="toast"></div>
-</body></html>
+body{margin:0;font-family:system-ui,sans-serif;background:#0b0f14;color:#e8eef7;padding:2rem;line-height:1.5}
+a{color:#6ea8fe} .box{max-width:36rem;margin:auto;background:#121820;border:1px solid #243044;border-radius:12px;padding:1.5rem}
+code{background:#1a2332;padding:.1rem .35rem;border-radius:4px}
+</style></head><body>
+<div class="box">
+<h1>ElitePlex API</h1>
+<p><code>web/index.html</code> missing — <b>API-only mode</b> (still fully working).</p>
+<ul>
+<li><a href="/docs">/docs</a> — OpenAPI</li>
+<li><a href="/health">/health</a></li>
+<li><a href="/moviebox/search?q=Avatar">/moviebox/search</a></li>
+<li><a href="/mb/search?q=Avatar">/mb/search</a></li>
+<li><a href="/play?subject_id=1654274595068805784">/play?subject_id=…</a></li>
+</ul>
+<p>Place <code>web/index.html</code> next to <code>api.py</code> to enable the UI.</p>
+</div></body></html>
 """
-
 
 
 @app.get("/site", response_class=HTMLResponse, tags=["Meta"])
 async def site_spa():
-    return HTMLResponse(SPA_HTML)
+    return HTMLResponse(_load_spa())
 
 
 # Serve full app at root too
 @app.get("/", response_class=HTMLResponse, tags=["Meta"], include_in_schema=False)
 async def root_spa():
-    return HTMLResponse(SPA_HTML)
+    return HTMLResponse(_load_spa())
 
 if __name__ == "__main__":
     import uvicorn
