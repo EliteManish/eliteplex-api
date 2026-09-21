@@ -36,7 +36,7 @@ app = FastAPI(
         "**Catalog** `/api/*` · **Play** embeds · **Music** · **Downloader** (yt-dlp + ffmpeg merge)\n"
         "**MovieBox** `/mb/*` · **4KHDHub** `/fk/*` · **Tools** `/tools/*`"
     ),
-    version="5.4.0",
+    version="5.14.2",
     docs_url=None,
     redoc_url=None,
 )
@@ -279,17 +279,32 @@ async def mb_request(method: str, path: str, body: Optional[dict] = None) -> Any
 
 
 def _is_dummy_url(url: str) -> bool:
-    u = (url or "").lower()
-    markers = [
+    """True for MovieBox App-Upgrade notice / promo dummy MP4s (never play these)."""
+    u = (url or "").lower().strip()
+    if not u:
+        return True
+    # Known notice hashes / paths
+    markers = (
         "1c7de0bd3393702d9191801f15f88f8d",
         "9a0461bc39da389663bf3dbb17091d3f",
-        "/notice.mp4",
         "b164fbfb43477929",
         "aa348f2541d13ffe",
-    ]
+        "b164fbfb4347792950bdfbfb563d39d9",
+        "/notice.mp4",
+        "app-upgrade",
+        "upgrade-notice",
+        "discontinued",
+    )
     if any(m in u for m in markers):
         return True
-    return "macdn.aoneroom.com" in u and "/other/" in u
+    # Entire macdn "other" bucket is promotional / notice clips
+    if "macdn.aoneroom.com" in u and "/other/" in u:
+        return True
+    if "macdn.aoneroom.com" in u and u.rstrip("/").endswith(".mp4"):
+        # short promo clips on macdn root-ish paths
+        if "/dash/" not in u and "/hls/" not in u:
+            return True
+    return False
 
 
 def _dash_from_sign_cookie(cookie: str) -> Optional[str]:
@@ -333,6 +348,89 @@ def _dash_from_sign_cookie(cookie: str) -> Optional[str]:
             pass
     return None
 
+
+async def _mb_h5_domain() -> str:
+    """Discover current H5 player domain (moviebox rotates: mzfi.me, netfilm.world, …)."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": "https://moviebox.ph/",
+        "Origin": "https://moviebox.ph",
+        "Accept": "application/json",
+        "X-Client-Info": '{"timezone":"Asia/Dhaka"}',
+        "X-Request-Lang": "en",
+    }
+    for base in (
+        "https://h5-api.aoneroom.com",
+        "https://h5.aoneroom.com",
+    ):
+        try:
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+                r = await client.get(f"{base}/wefeed-h5api-bff/media-player/get-domain", headers=headers)
+                if r.status_code == 200:
+                    d = r.json().get("data")
+                    if isinstance(d, str) and d.startswith("http"):
+                        return d.rstrip("/")
+        except Exception:
+            continue
+    return "https://mzfi.me"
+
+
+async def _mb_h5_play(subject_id: str, se: int = 0, ep: int = 0, detail_path: str = "") -> dict:
+    """H5 subject/play + download — often returns H.264 when mobile is HEVC-only."""
+    domain = await _mb_h5_domain()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Origin": domain,
+        "Referer": f"{domain}/",
+        "X-Client-Info": '{"timezone":"Asia/Dhaka"}',
+        "X-Request-Lang": "en",
+    }
+    out: dict = {}
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        params = {"subjectId": subject_id, "se": se, "ep": ep}
+        if detail_path:
+            params["detailPath"] = detail_path
+        for path in (
+            f"{domain}/wefeed-h5api-bff/subject/play",
+            "https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/play",
+            "https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/download",
+        ):
+            try:
+                r = await client.get(path, params=params, headers=headers)
+                if r.status_code != 200:
+                    continue
+                data = (r.json() or {}).get("data") or {}
+                if not isinstance(data, dict):
+                    continue
+                # merge streams
+                for key in ("streams", "dash", "hls", "downloads"):
+                    if data.get(key):
+                        out.setdefault(key, [])
+                        if isinstance(data[key], list):
+                            out[key].extend(data[key])
+                        else:
+                            out[key].append(data[key])
+                if data.get("hasResource") is not None:
+                    out["hasResource"] = data.get("hasResource")
+            except Exception:
+                continue
+    return out
+
+
+def _is_mb_notice_url(url: str) -> bool:
+    """Filter MovieBox 'App Upgrade Notice' / dummy promo clips."""
+    if not url or _is_dummy_url(url):
+        return True
+    u = url.lower()
+    bad = (
+        "upgrade", "notice", "app-upgrade", "discontinu", "legacy",
+        "update-now", "movieboxdownload", "promo", "/notice/",
+        "macdn.aoneroom.com/other",
+    )
+    return any(b in u for b in bad)
+
+
 def _parse_mb_play_info(data: dict, user_agent: str) -> List[dict]:
     out: List[dict] = []
     seen = set()
@@ -347,7 +445,7 @@ def _parse_mb_play_info(data: dict, user_agent: str) -> List[dict]:
         playable = _dash_from_sign_cookie(cookie)
         if not playable and raw_url and not _is_dummy_url(raw_url):
             playable = raw_url
-        if not playable or playable in seen:
+        if not playable or playable in seen or _is_mb_notice_url(playable):
             continue
         seen.add(playable)
         res = stream.get("resolutions") or stream.get("resolution") or stream.get("quality") or "?"
@@ -1108,7 +1206,7 @@ def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return {"ok": True, "version": "5.7.0", "providers": ["tmdb", "vidsrc", "vidlink", "vidfast", "autoembed", "4khdhub", "hubcloud", "ytmusic", "moviebox-api"]}
+    return {"ok": True, "version": "5.14.2", "providers": ["tmdb", "vidsrc", "4khdhub", "hubcloud", "ytmusic", "jiosaavn", "deezer", "piped", "lrclib", "moviebox-api", "netmirror", "vixsrc"]}
 
 
 # ----- Mov
@@ -1912,7 +2010,6 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
     - `mp4` — progressive files if any (all phones)
     - `sources` — DASH/MPD + headers (HEVC; use VLC)
     - `qualities` — MPD broken into 1080/720/480
-    - `browser` — embed players (all phones)
     - `play` — best single URL to open first
     """
     if se == 0 and ep == 0:
@@ -1931,15 +2028,27 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
         data = {}
 
     sources = _parse_mb_play_info(data, _mb_ua)
+    # H5 play/download fallback (sometimes H.264 when mobile is HEVC-only)
+    try:
+        h5 = await _mb_h5_play(subject_id, se, ep)
+        if h5:
+            h5_sources = _parse_mb_play_info(h5, _mb_ua)
+            for s in h5_sources:
+                s["source"] = s.get("source") or "h5"
+            sources = sources + h5_sources
+    except Exception:
+        pass
     try:
         extra = await _mb_resource_links(subject_id, se, ep)
     except Exception:
         extra = []
     seen = {s.get("url") for s in sources}
     for item in extra:
-        if item.get("url") and item["url"] not in seen:
+        if item.get("url") and item["url"] not in seen and not _is_mb_notice_url(item.get("url") or ""):
             sources.append(item)
             seen.add(item["url"])
+    # drop notice / dummy streams
+    sources = [s for s in sources if s.get("url") and not _is_mb_notice_url(s.get("url") or "")]
 
     referer = globals().get("STREAM_REFERER", "https://sportslive.wine")
     for s in sources:
@@ -1948,6 +2057,12 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
         h.setdefault("Referer", referer)
         s["headers"] = h
         s["play_url"] = s.get("url")
+
+    # Flag when only HEVC DASH (no progressive MP4)
+    only_hevc = bool(sources) and all(
+        ("hevc" in str(s.get("codec") or "").lower() or "h265" in str(s.get("codec") or "").lower() or ".mpd" in (s.get("url") or ""))
+        for s in sources
+    ) and not any(".mp4" in (s.get("url") or "").lower() for s in sources)
 
     # Progressive MP4 only (real files)
     mp4_list = []
@@ -1994,7 +2109,7 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
             qualities = [{"error": str(e)[:160]}]
         break
 
-    # Title + browser embeds
+    # Title + optional TMDB id
     title = data.get("title")
     try:
         det = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}")
@@ -2002,7 +2117,7 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
         title = title or subj.get("title")
     except Exception:
         pass
-    browser, tmdb_id = [], None
+    tmdb_id = None
     if title:
         try:
             q = re.sub(r"\[.*?\]", "", title).strip()
@@ -2011,19 +2126,6 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
                 if res.get("media_type") not in ("movie", "tv"):
                     continue
                 tmdb_id = res["id"]
-                media = res["media_type"]
-                browser = [
-                    {"provider": p, "url": u, "phone_friendly": True}
-                    for p, u in [
-                        ("vidsrc", f"https://vidsrc.to/embed/{media}/{tmdb_id}"),
-                        ("vidlink", f"https://vidlink.pro/{media}/{tmdb_id}"),
-                        ("videasy", f"https://player.videasy.net/{media}/{tmdb_id}"),
-                        ("vidking", f"https://www.vidking.net/embed/{media}/{tmdb_id}"),
-                    ]
-                ]
-                if media == "tv":
-                    for b in browser:
-                        b["url"] = b["url"].rstrip("/") + f"/{se or 1}/{ep or 1}"
                 break
         except Exception:
             pass
@@ -2037,14 +2139,21 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
             pass
 
     play = None
+    # MovieBox native only — no third-party embeds in this response
     if mp4_list:
         play = mp4_list[0]["url"]
-    elif browser:
-        play = browser[0]["url"]  # phone-friendly embed first
     elif proxy_mpd:
         play = proxy_mpd
     elif sources:
-        play = sources[0].get("url")
+        play = sources[0].get("proxy_url") or sources[0].get("url")
+
+    note = "MovieBox native only. DASH/HEVC: use proxy_mpd or VLC with Cookie headers."
+    if only_hevc and not mp4_list:
+        note = (
+            "MovieBox returned HEVC DASH only (app upgrade/paywall). "
+            "Use proxy_mpd with a DASH player or open the MPD in VLC with Cookie. "
+            "Third-party embeds are not included in MovieBox responses."
+        )
 
     return {
         "provider": "moviebox",
@@ -2057,11 +2166,11 @@ async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
         "sources": sources,
         "qualities": qualities,
         "audio": audio,
-        "browser": browser,
         "proxy_mpd": proxy_mpd,
         "play": play,
         "count": len(sources),
-        "note": "Use sources[].proxy_url or proxy_mpd in browser (dash.js). Raw CDN needs Cookie.",
+        "only_hevc": only_hevc,
+        "note": note,
         "proxy_url": proxy_mpd,
     }
 
@@ -2744,8 +2853,17 @@ async def _vixsrc_embed_path(tmdb_id: int, media: str = "movie", se: int = 1, ep
         api = f"{_VIXSRC_BASE}/api/tv/{tmdb_id}/{se}/{ep}"
     else:
         api = f"{_VIXSRC_BASE}/api/movie/{tmdb_id}"
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        r = await client.get(api, headers=_VIX_HDR)
+    headers = {
+        **_VIX_HDR,
+        "Referer": f"{_VIXSRC_BASE}/",
+        "Origin": _VIXSRC_BASE,
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    async with httpx.AsyncClient(timeout=18.0, follow_redirects=True) as client:
+        try:
+            r = await client.get(api, headers=headers)
+        except Exception:
+            return None
         if r.status_code != 200:
             return None
         try:
@@ -2843,7 +2961,17 @@ async def vix_stream(
     media = "tv" if media in ("tv", "series") else "movie"
     embed = await _vixsrc_embed_path(tmdb_id, media, se, ep)
     if not embed:
-        raise HTTPException(404, "VixSrc: no embed for this id")
+        return {
+            "ok": False,
+            "provider": "vixsrc",
+            "tmdb_id": tmdb_id,
+            "media": media,
+            "streams": [],
+            "count": 0,
+            "error": "VixSrc returned no embed (geo/cloud block possible)",
+            "embed": f"https://vixsrc.to/embed/movie/{tmdb_id}" if media == "movie" else f"https://vixsrc.to/embed/tv/{tmdb_id}/{se}/{ep}",
+            "note": "Use /api/play embeds or /direct/stream as fallback",
+        }
     resolved = await _vixsrc_resolve_playlist(embed)
     if not resolved:
         return {
@@ -3172,13 +3300,17 @@ _nm_api_base: Optional[str] = None
 _nm_api_bases: List[str] = []
 
 
-async def _nm_resolve_bases() -> List[str]:
+async def _nm_resolve_bases(force: bool = False) -> List[str]:
     """Discover all working NewTV API bases (token_hash from probe domains)."""
     global _nm_api_bases, _nm_api_base
-    if _nm_api_bases:
+    if _nm_api_bases and not force:
         return _nm_api_bases
     found: List[str] = []
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+    # Prefer known API hosts first (probe domains are slow / flaky on serverless)
+    for fb in ("https://tv.imgcdn.kim", "https://tv.imgcdn.cloud", "https://imgcdn.kim"):
+        if fb not in found:
+            found.append(fb)
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, limits=httpx.Limits(max_connections=5)) as client:
         for probe in _NM_PROBE:
             try:
                 r = await client.get(f"{probe}/checknewtv.php", headers=_NM_HEADERS)
@@ -3193,10 +3325,6 @@ async def _nm_resolve_bases() -> List[str]:
                     found.append(base)
             except Exception:
                 continue
-    # known fallbacks
-    for fb in ("https://tv.imgcdn.kim", "https://tv.imgcdn.cloud"):
-        if fb not in found:
-            found.append(fb)
     if not found:
         raise HTTPException(502, "NetMirror API base could not be resolved")
     _nm_api_bases = found
@@ -3246,8 +3374,8 @@ async def _nm_get(path: str, ott: str, params: Optional[dict] = None, extra: Opt
             except Exception as e:
                 last_err = str(e)[:120]
                 continue
-    # soft signal — callers can convert
-    raise HTTPException(503, f"NetMirror unavailable ({last_err})")
+    # soft fail — return sentinel for callers
+    raise RuntimeError(f"NetMirror unavailable ({last_err})")
 
 
 @app.get("/nm/search", tags=["NetMirror"])
@@ -3255,9 +3383,22 @@ async def nm_search(
     q: str = Query(..., min_length=1),
     platform: str = Query("netflix", description="netflix|prime|hotstar|disney"),
 ):
-    """NetMirror title search (OTT library)."""
+    """NetMirror title search (OTT library). Soft-fails with empty items if host blocked."""
     ott = _NM_PLATFORMS.get(platform.lower(), "nf")
-    data = await _nm_get("/newtv/search.php", ott, {"s": q})
+    try:
+        data = await _nm_get("/newtv/search.php", ott, {"s": q})
+    except Exception as e:
+        return {
+            "ok": False,
+            "provider": "netmirror",
+            "display_name": "NetMirror",
+            "platform": platform,
+            "query": q,
+            "count": 0,
+            "items": [],
+            "error": str(e)[:160],
+            "note": "NetMirror often blocks cloud IPs (Vercel). Works on VPS/home IP.",
+        }
     items = []
     for it in data.get("searchResult") or []:
         if not isinstance(it, dict):
@@ -3269,6 +3410,7 @@ async def nm_search(
             "ott": ott,
         })
     return {
+        "ok": True,
         "provider": "netmirror",
         "display_name": "NetMirror",
         "platform": platform,
@@ -3286,13 +3428,17 @@ async def nm_detail(
 ):
     """NetMirror post/detail (seasons / episodes metadata)."""
     ott = _NM_PLATFORMS.get(platform.lower(), "nf")
-    data = await _nm_get(
-        "/newtv/post.php",
-        ott,
-        {"id": id},
-        {"Lastep": "", "Usertoken": ""},
-    )
+    try:
+        data = await _nm_get(
+            "/newtv/post.php",
+            ott,
+            {"id": id},
+            {"Lastep": "", "Usertoken": ""},
+        )
+    except Exception as e:
+        return {"ok": False, "provider": "netmirror", "id": id, "error": str(e)[:160], "data": {}}
     return {
+        "ok": True,
         "provider": "netmirror",
         "display_name": "NetMirror",
         "id": id,
@@ -3313,13 +3459,28 @@ async def nm_stream(
     NetMirror direct stream (usually HLS .m3u8).
     Pass `id` from search, or `title` to search+play in one call.
     """
+    try:
+        return await _nm_stream_inner(id, platform, title, se, ep)
+    except Exception as e:
+        return {
+            "ok": False,
+            "provider": "netmirror",
+            "display_name": "NetMirror",
+            "error": str(e)[:160],
+            "streams": [],
+            "stream": None,
+            "note": "NetMirror blocks many cloud IPs. Use embeds / VixSrc / 4K instead.",
+        }
+
+
+async def _nm_stream_inner(id, platform, title, se, ep):
     ott = _NM_PLATFORMS.get(platform.lower(), "nf")
     content_id = id
     if title and not id:
         sr = await _nm_get("/newtv/search.php", ott, {"s": title})
         results = sr.get("searchResult") or []
         if not results:
-            raise HTTPException(404, "NetMirror: no search results")
+            return {"ok": False, "provider": "netmirror", "error": "no search results", "streams": [], "stream": None}
         content_id = str(results[0].get("id"))
     # detail for series episode mapping
     if se or ep:
@@ -3366,7 +3527,7 @@ async def nm_stream(
     )
     link = player.get("video_link") or player.get("url") or ""
     if not link:
-        raise HTTPException(404, f"NetMirror: no video_link ({player.get('status')})")
+        return {"ok": False, "provider": "netmirror", "error": f"no video_link ({player.get('status')})", "streams": [], "stream": None}
     base = await _nm_resolve_base()
     return {
         "provider": "netmirror",
@@ -4299,15 +4460,37 @@ async def music_search(q: str = Query(..., min_length=1)):
                 ytm.append(e)
     except Exception as e:
         errors["ytmusic"] = str(e)
-    # Saavn first (playable), then YT
-    items = saavn + ytm[:20]
+    deezer = []
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            r = await client.get("https://api.deezer.com/search", params={"q": q, "limit": 8})
+            if r.status_code == 200:
+                for it in (r.json().get("data") or []):
+                    if not isinstance(it, dict):
+                        continue
+                    artist = (it.get("artist") or {}).get("name") or ""
+                    cover = (it.get("album") or {}).get("cover_big") or ""
+                    deezer.append({
+                        "id": f"deezer:{it.get('id')}",
+                        "title": it.get("title"),
+                        "artist": artist,
+                        "thumb": cover,
+                        "duration": it.get("duration"),
+                        "preview_url": it.get("preview"),
+                        "provider": "deezer",
+                    })
+    except Exception as e:
+        errors["deezer"] = str(e)[:80]
+    # Saavn first (playable), then YT, then Deezer previews
+    items = saavn + ytm[:16] + deezer
     return {
         "query": q,
         "count": len(items),
         "items": items,
         "jiosaavn": saavn,
-        "ytmusic": ytm[:20],
-        "provider": "jiosaavn+ytmusic",
+        "ytmusic": ytm[:16],
+        "deezer": deezer,
+        "provider": "jiosaavn+ytmusic+deezer",
         "errors": errors or None,
     }
 
@@ -4607,6 +4790,835 @@ async def music_lyrics(
 
 
 
+
+
+# ── Extra music sources (SimpMusic / Spotube / PyMusic style) ──────────────
+
+_PIPED_APIS = [
+    "https://api.piped.private.coffee",
+    "https://pipedapi.ducks.party",
+    "https://pipedapi.adminforge.de",
+]
+
+
+async def _piped_get(path: str, params: Optional[dict] = None) -> Any:
+    last = None
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        for base in _PIPED_APIS:
+            try:
+                r = await client.get(
+                    f"{base}{path}",
+                    params=params or {},
+                    headers={"User-Agent": "ElitePlex/5.8", "Accept": "application/json"},
+                )
+                if r.status_code == 200:
+                    return r.json()
+                last = f"HTTP {r.status_code} @ {base}"
+            except Exception as e:
+                last = str(e)[:80]
+                continue
+    raise RuntimeError(last or "Piped unavailable")
+
+
+def _piped_vid(url: str) -> Optional[str]:
+    if not url:
+        return None
+    if "v=" in url:
+        return url.split("v=")[-1].split("&")[0][:11]
+    if "/watch?v=" in url:
+        return url.split("/watch?v=")[-1][:11]
+    parts = url.rstrip("/").split("/")
+    return parts[-1][:11] if parts else None
+
+
+@app.get("/music/deezer/search", tags=["Music"])
+async def music_deezer_search(q: str = Query(..., min_length=1), limit: int = Query(15, ge=1, le=40)):
+    """Deezer public search — metadata + 30s preview (PyMusic / Spotube style)."""
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        r = await client.get(
+            "https://api.deezer.com/search",
+            params={"q": q, "limit": limit},
+            headers={"User-Agent": "ElitePlex/5.8"},
+        )
+        if r.status_code != 200:
+            return {"ok": False, "query": q, "items": [], "error": f"HTTP {r.status_code}"}
+        data = r.json()
+    items = []
+    for it in data.get("data") or []:
+        if not isinstance(it, dict):
+            continue
+        artist = (it.get("artist") or {}).get("name") or ""
+        album = (it.get("album") or {}).get("title") or ""
+        cover = (it.get("album") or {}).get("cover_xl") or (it.get("album") or {}).get("cover_big") or ""
+        preview = it.get("preview") or ""
+        items.append({
+            "id": f"deezer:{it.get('id')}",
+            "deezer_id": it.get("id"),
+            "title": it.get("title"),
+            "artist": artist,
+            "album": album,
+            "thumb": cover,
+            "duration": it.get("duration"),
+            "preview_url": preview,
+            "audio_url": preview or None,
+            "link": it.get("link"),
+            "provider": "deezer",
+            "source": "deezer",
+            "playable_preview": bool(preview),
+        })
+    return {"ok": True, "query": q, "count": len(items), "items": items, "provider": "deezer"}
+
+
+@app.get("/music/suggest", tags=["Music"])
+async def music_suggest(q: str = Query(..., min_length=1)):
+    """Search suggestions (Piped + light YT-style)."""
+    suggestions = []
+    errors = {}
+    try:
+        data = await _piped_get("/suggestions", {"query": q})
+        if isinstance(data, list):
+            suggestions.extend([str(x) for x in data if x][:12])
+    except Exception as e:
+        errors["piped"] = str(e)[:80]
+    if not suggestions:
+        # lightweight fallback seeds from saavn search titles
+        try:
+            hits = await _saavn_search(q, 6)
+            for h in hits:
+                if h.get("title"):
+                    suggestions.append(h["title"])
+        except Exception as e:
+            errors["saavn"] = str(e)[:80]
+    # unique preserve order
+    seen = set()
+    out = []
+    for s in suggestions:
+        k = s.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(s)
+    return {"query": q, "suggestions": out[:12], "errors": errors or None}
+
+
+@app.get("/music/piped/search", tags=["Music"])
+async def music_piped_search(
+    q: str = Query(..., min_length=1),
+    filter: str = Query("music_songs", description="music_songs|all|videos"),
+):
+    """Piped search (SimpMusic / simplyMusic style). Stream via /music/play/{yt_id}."""
+    try:
+        data = await _piped_get("/search", {"q": q, "filter": filter})
+    except Exception as e:
+        return {"ok": False, "query": q, "items": [], "error": str(e)[:120], "provider": "piped"}
+    items = []
+    for it in (data.get("items") if isinstance(data, dict) else data) or []:
+        if not isinstance(it, dict):
+            continue
+        if it.get("type") and it.get("type") not in ("stream", "video", None):
+            continue
+        vid = _piped_vid(it.get("url") or "")
+        if not vid:
+            continue
+        items.append({
+            "id": f"yt:{vid}",
+            "video_id": vid,
+            "title": it.get("title"),
+            "artist": it.get("uploaderName") or it.get("uploader"),
+            "thumb": it.get("thumbnail"),
+            "duration": it.get("duration"),
+            "views": it.get("views"),
+            "provider": "piped",
+            "source": "piped",
+        })
+    return {"ok": True, "query": q, "count": len(items), "items": items, "provider": "piped"}
+
+
+
+
+@app.get("/music/piped/stream/{video_id}", tags=["Music"])
+async def music_piped_stream(video_id: str):
+    """
+    Piped stream lookup (SimpMusic / simplyMusic style).
+    Returns audio if available; otherwise video/mp4 + related metadata.
+    Falls back to yt-dlp / existing play pipeline when Piped has no audio.
+    """
+    video_id = video_id.replace("yt:", "").strip()
+    if not re.match(r"^[\w-]{6,20}$", video_id):
+        raise HTTPException(400, "invalid video id")
+    errors = {}
+    streams = []
+    meta = {"title": None, "artist": None, "thumb": None, "duration": None}
+    try:
+        data = await _piped_get(f"/streams/{video_id}")
+        if isinstance(data, dict):
+            meta["title"] = data.get("title")
+            meta["artist"] = data.get("uploader") or data.get("uploaderName")
+            meta["thumb"] = data.get("thumbnailUrl") or data.get("thumbnail")
+            meta["duration"] = data.get("duration")
+            for a in data.get("audioStreams") or []:
+                if not isinstance(a, dict) or not a.get("url"):
+                    continue
+                streams.append({
+                    "type": "audio",
+                    "provider": "piped",
+                    "label": f"Piped audio {a.get('bitrate') or a.get('quality') or ''}".strip(),
+                    "url": a["url"],
+                    "bitrate": a.get("bitrate"),
+                    "mime": a.get("mimeType"),
+                    "format": "AUDIO",
+                    "playable": True,
+                })
+            for v in data.get("videoStreams") or []:
+                if not isinstance(v, dict) or not v.get("url"):
+                    continue
+                # prefer non-videoOnly (has audio)
+                if v.get("videoOnly"):
+                    continue
+                streams.append({
+                    "type": "video",
+                    "provider": "piped",
+                    "label": f"Piped {v.get('quality') or v.get('format') or 'mp4'}",
+                    "url": v["url"],
+                    "mime": v.get("mimeType"),
+                    "format": "VIDEO",
+                    "playable": True,
+                })
+            if data.get("hls"):
+                streams.append({
+                    "type": "hls",
+                    "provider": "piped",
+                    "label": "Piped HLS",
+                    "url": data["hls"],
+                    "format": "HLS",
+                    "playable": True,
+                })
+    except Exception as e:
+        errors["piped"] = str(e)[:120]
+
+    # yt-dlp audio fallback
+    if not any(s.get("type") == "audio" for s in streams):
+        try:
+            u, fmt, dur, err = await _ytdlp_audio(video_id)
+            if u:
+                streams.insert(0, {
+                    "type": "audio",
+                    "provider": "yt-dlp",
+                    "label": f"Audio ({fmt or 'm4a'})",
+                    "url": u,
+                    "format": (fmt or "m4a").upper(),
+                    "playable": True,
+                })
+                if dur and not meta["duration"]:
+                    meta["duration"] = dur
+            elif err:
+                errors["yt-dlp"] = err[:120]
+        except Exception as e:
+            errors["yt-dlp"] = str(e)[:120]
+
+    # always offer embed fallback
+    streams.append({
+        "type": "embed",
+        "provider": "youtube",
+        "label": "YouTube embed",
+        "url": f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0",
+        "format": "EMBED",
+        "playable": True,
+    })
+
+    best = next((s for s in streams if s.get("type") == "audio" and s.get("url")), None)
+    if not best:
+        best = next((s for s in streams if s.get("playable") and s.get("type") != "embed"), None)
+
+    return {
+        "ok": bool(best),
+        "video_id": video_id,
+        "title": meta["title"],
+        "artist": meta["artist"],
+        "thumb": meta["thumb"] or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        "duration": meta["duration"],
+        "audio_url": best["url"] if best and best.get("type") == "audio" else None,
+        "stream": best,
+        "streams": streams,
+        "count": len(streams),
+        "errors": errors or None,
+        "provider": "piped+yt-dlp",
+    }
+
+
+@app.get("/music/stream", tags=["Music"])
+async def music_stream_resolve(
+    id: str = Query(None, description="saavn:ID | yt:VIDEO | VIDEO_ID | deezer:ID"),
+    q: str = Query(None, description="Search title if no id"),
+    video_id: str = Query(None),
+):
+    """
+    Universal music stream resolver.
+    - saavn:xxx → full JioSaavn CDN
+    - yt:xxx / 11-char id → Piped + yt-dlp audio
+    - deezer:xxx → 30s preview
+    - q=title → search Saavn then stream first hit
+    """
+    if video_id and not id:
+        id = video_id
+    if not id and q:
+        try:
+            hits = await _saavn_search(q.strip()[:80], 5)
+            if hits:
+                sid = hits[0].get("saavn_id") or (hits[0].get("id") or "").replace("saavn:", "")
+                if sid:
+                    id = f"saavn:{sid}"
+        except Exception:
+            pass
+    if not id:
+        raise HTTPException(400, "Provide id= or q=")
+
+    rid = id.strip()
+    # Deezer preview
+    if rid.startswith("deezer:"):
+        did = rid.split(":", 1)[1]
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(f"https://api.deezer.com/track/{did}")
+            if r.status_code != 200:
+                return {"ok": False, "error": "deezer track not found", "streams": []}
+            tr = r.json()
+            preview = tr.get("preview")
+            artist = (tr.get("artist") or {}).get("name") or ""
+            cover = (tr.get("album") or {}).get("cover_xl") or (tr.get("album") or {}).get("cover_big")
+            streams = []
+            if preview:
+                streams.append({
+                    "type": "audio",
+                    "provider": "deezer",
+                    "label": "Deezer 30s preview",
+                    "url": preview,
+                    "format": "MP3",
+                    "playable": True,
+                })
+            return {
+                "ok": bool(preview),
+                "id": rid,
+                "title": tr.get("title"),
+                "artist": artist,
+                "thumb": cover,
+                "duration": tr.get("duration"),
+                "audio_url": preview,
+                "stream": streams[0] if streams else None,
+                "streams": streams,
+                "note": "Deezer public API only provides 30s previews",
+            }
+
+    # YouTube / Piped
+    if rid.startswith("yt:") or re.match(r"^[\w-]{11}$", rid):
+        vid = rid[3:] if rid.startswith("yt:") else rid
+        return await music_piped_stream(vid)
+
+    # Saavn / generic play
+    try:
+        return await music_play(rid)
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"ok": False, "id": rid, "error": str(e)[:160], "streams": []}
+
+
+@app.get("/music/deezer/play/{track_id}", tags=["Music"])
+async def music_deezer_play(track_id: str):
+    """Deezer track preview stream (30s)."""
+    track_id = track_id.replace("deezer:", "").strip()
+    return await music_stream_resolve(id=f"deezer:{track_id}")
+
+@app.get("/music/charts", tags=["Music"])
+async def music_charts(region: str = Query("in", description="in|us|global")):
+    """Quick charts via curated Saavn searches + Deezer chart."""
+    region = (region or "in").lower()
+    seeds = {
+        "in": [
+            ("Trending India", "trending hindi songs 2024"),
+            ("Bollywood", "bollywood hits"),
+            ("Punjabi", "punjabi hits"),
+            ("Tamil", "tamil hits"),
+        ],
+        "us": [
+            ("US Pop", "top pop usa"),
+            ("Hip Hop", "hip hop hits"),
+            ("R&B", "rnb hits"),
+        ],
+        "global": [
+            ("Global Hits", "top hits global"),
+            ("K-Pop", "kpop hits"),
+            ("Latin", "latin hits"),
+        ],
+    }.get(region, None) or [
+        ("Trending", "trending songs"),
+        ("Pop", "pop hits"),
+    ]
+    sections = []
+    for title, q in seeds:
+        try:
+            items = await _saavn_search(q, 10)
+            if items:
+                sections.append({"title": title, "items": items[:10], "source": "jiosaavn"})
+        except Exception:
+            continue
+    # Deezer chart
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get("https://api.deezer.com/chart/0/tracks", params={"limit": 12})
+            if r.status_code == 200:
+                tracks = (r.json() or {}).get("data") or []
+                items = []
+                for it in tracks:
+                    artist = (it.get("artist") or {}).get("name") or ""
+                    cover = (it.get("album") or {}).get("cover_big") or ""
+                    items.append({
+                        "id": f"deezer:{it.get('id')}",
+                        "title": it.get("title"),
+                        "artist": artist,
+                        "thumb": cover,
+                        "duration": it.get("duration"),
+                        "preview_url": it.get("preview"),
+                        "provider": "deezer",
+                    })
+                if items:
+                    sections.append({"title": "Deezer Chart", "items": items, "source": "deezer"})
+    except Exception:
+        pass
+    return {"region": region, "sections": sections, "provider": "charts"}
+
+
+@app.get("/music/unified", tags=["Music"])
+async def music_unified(q: str = Query(..., min_length=1)):
+    """
+    One-shot search across JioSaavn + YT Music + Deezer + Piped (SimpMusic-style aggregator).
+    """
+    q = q.strip()[:100]
+    out = {"query": q, "jiosaavn": [], "ytmusic": [], "deezer": [], "piped": [], "errors": {}}
+    try:
+        out["jiosaavn"] = await _saavn_search(q, 12)
+    except Exception as e:
+        out["errors"]["jiosaavn"] = str(e)[:80]
+    try:
+        data = await _ytm_post("search", {"query": q})
+        items = []
+        _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+        seen = set()
+        for it in items:
+            e = _ytm_parse_item(it)
+            if e and e["video_id"] not in seen:
+                seen.add(e["video_id"])
+                out["ytmusic"].append(e)
+        out["ytmusic"] = out["ytmusic"][:12]
+    except Exception as e:
+        out["errors"]["ytmusic"] = str(e)[:80]
+    try:
+        dz = await music_deezer_search(q=q, limit=10)
+        out["deezer"] = dz.get("items") or []
+    except Exception as e:
+        out["errors"]["deezer"] = str(e)[:80]
+    try:
+        pd = await music_piped_search(q=q, filter="music_songs")
+        out["piped"] = pd.get("items") or []
+    except Exception as e:
+        out["errors"]["piped"] = str(e)[:80]
+    # flat mix: saavn first (full streams)
+    flat = list(out["jiosaavn"]) + list(out["ytmusic"]) + list(out["deezer"]) + list(out["piped"])
+    out["items"] = flat
+    out["count"] = len(flat)
+    if not out["errors"]:
+        out["errors"] = None
+    return out
+
+
+
+# =============================================================================
+# Expanded Music + Lyrics APIs (PaxSenix-style, native, unlimited)
+# Deezer public · JioSaavn · LRCLIB · lyrics.ovh
+# =============================================================================
+
+@app.get("/lyrics/plain", tags=["Lyrics"])
+async def lyrics_plain(
+    title: str = Query(..., min_length=1),
+    artist: str = Query("", description="Artist name"),
+):
+    """Plain text lyrics (lyrics.ovh + LRCLIB fallback)."""
+    errors = {}
+    plain = None
+    source = None
+    if artist:
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                r = await client.get(f"https://api.lyrics.ovh/v1/{artist}/{title}")
+                if r.status_code == 200:
+                    plain = (r.json() or {}).get("lyrics")
+                    if plain:
+                        source = "lyrics.ovh"
+        except Exception as e:
+            errors["ovh"] = str(e)[:80]
+    if not plain:
+        try:
+            lr = await music_lyrics(title=title, artist=artist, album="", duration=0)
+            if lr.get("found") and lr.get("lyrics"):
+                plain = lr["lyrics"]
+                source = "lrclib"
+        except Exception as e:
+            errors["lrclib"] = str(e)[:80]
+    return {
+        "ok": bool(plain),
+        "title": title,
+        "artist": artist,
+        "lyrics": plain,
+        "source": source,
+        "errors": errors or None,
+    }
+
+
+@app.get("/lyrics/lrcget", tags=["Lyrics"])
+@app.get("/lyrics/lrc", tags=["Lyrics"], include_in_schema=False)
+async def lyrics_lrcget(
+    title: str = Query(..., min_length=1),
+    artist: str = Query(""),
+    album: str = Query(""),
+    duration: float = Query(0),
+):
+    """Synced LRC lyrics (LRCLIB) — same engine as /music/lyrics."""
+    # Call via TestClient-free internal: reuse HTTP path logic by duplicating thin wrapper
+    from fastapi.responses import JSONResponse
+    try:
+        # Direct call — pass plain values (not Query objects)
+        result = await music_lyrics.__wrapped__(title, artist, album, duration) if hasattr(music_lyrics, '__wrapped__') else None
+    except Exception:
+        result = None
+    if result is None:
+        # fallback: internal LRCLIB fetch
+        try:
+            async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "ElitePlex/1.0"}) as client:
+                r = await client.get("https://lrclib.net/api/search", params={"q": f"{artist} {title}".strip()})
+                items = r.json() if r.status_code == 200 else []
+                best = items[0] if isinstance(items, list) and items else None
+                if not best:
+                    return {"found": False, "lyrics": None, "synced": None, "lines": [], "source": "lrclib"}
+                synced = best.get("syncedLyrics") or ""
+                return {
+                    "found": True,
+                    "title": best.get("trackName"),
+                    "artist": best.get("artistName"),
+                    "album": best.get("albumName"),
+                    "lyrics": best.get("plainLyrics"),
+                    "synced": synced,
+                    "lines": _parse_lrc(synced),
+                    "duration": best.get("duration"),
+                    "source": "lrclib",
+                }
+        except Exception as e:
+            return {"found": False, "lyrics": None, "synced": None, "lines": [], "error": str(e)[:120], "source": "lrclib"}
+    return result
+
+
+@app.get("/lyrics/genius", tags=["Lyrics"])
+async def lyrics_genius(
+    title: str = Query(..., min_length=1),
+    artist: str = Query(""),
+):
+    """Genius-style lyrics lookup via public aggregators (no Genius API key)."""
+    return await lyrics_plain(title=title, artist=artist)
+
+
+@app.get("/lyrics/multi", tags=["Lyrics"])
+async def lyrics_multi(
+    title: str = Query(..., min_length=1),
+    artist: str = Query(""),
+    duration: float = Query(0),
+):
+    """All lyric sources in one call: LRCLIB (synced) + plain."""
+    # LRCLIB via lrcget helper
+    synced = await lyrics_lrcget(title=title, artist=artist, album="", duration=duration)
+    if not isinstance(synced, dict):
+        synced = {"found": False}
+    plain = await lyrics_plain(title=title, artist=artist)
+    if not isinstance(plain, dict):
+        plain = {"ok": False}
+    return {
+        "title": title,
+        "artist": artist,
+        "synced": {
+            "found": synced.get("found"),
+            "lyrics": synced.get("lyrics"),
+            "synced": synced.get("synced"),
+            "lines": synced.get("lines"),
+            "source": synced.get("source"),
+        },
+        "plain": {
+            "found": plain.get("ok"),
+            "lyrics": plain.get("lyrics"),
+            "source": plain.get("source"),
+        },
+    }
+
+
+@app.get("/deezer/search", tags=["Deezer"])
+async def deezer_search(
+    q: str = Query(..., min_length=1),
+    type: str = Query("track", description="track|album|artist|playlist"),
+    limit: int = Query(15, ge=1, le=50),
+):
+    """Deezer search (public API)."""
+    path = {
+        "track": "https://api.deezer.com/search",
+        "album": "https://api.deezer.com/search/album",
+        "artist": "https://api.deezer.com/search/artist",
+        "playlist": "https://api.deezer.com/search/playlist",
+    }.get(type.lower(), "https://api.deezer.com/search")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(path, params={"q": q, "limit": limit})
+        if r.status_code != 200:
+            return {"ok": False, "error": f"HTTP {r.status_code}", "items": []}
+        data = r.json()
+    items = data.get("data") or []
+    return {"ok": True, "query": q, "type": type, "count": len(items), "items": items, "provider": "deezer"}
+
+
+@app.get("/deezer/track", tags=["Deezer"])
+async def deezer_track(id: str = Query(..., description="Deezer track id")):
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.get(f"https://api.deezer.com/track/{id}")
+        if r.status_code != 200:
+            return {"ok": False, "error": "not found"}
+        return {"ok": True, "provider": "deezer", "track": r.json()}
+
+
+@app.get("/deezer/album", tags=["Deezer"])
+async def deezer_album(id: str = Query(...)):
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.get(f"https://api.deezer.com/album/{id}")
+        if r.status_code != 200:
+            return {"ok": False, "error": "not found"}
+        return {"ok": True, "provider": "deezer", "album": r.json()}
+
+
+@app.get("/deezer/artist", tags=["Deezer"])
+async def deezer_artist(id: str = Query(...)):
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.get(f"https://api.deezer.com/artist/{id}")
+        if r.status_code != 200:
+            return {"ok": False, "error": "not found"}
+        art = r.json()
+        # top tracks
+        top = []
+        try:
+            t = await client.get(f"https://api.deezer.com/artist/{id}/top", params={"limit": 15})
+            if t.status_code == 200:
+                top = (t.json() or {}).get("data") or []
+        except Exception:
+            pass
+        return {"ok": True, "provider": "deezer", "artist": art, "top": top}
+
+
+@app.get("/deezer/playlist", tags=["Deezer"])
+async def deezer_playlist(id: str = Query(...)):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(f"https://api.deezer.com/playlist/{id}")
+        if r.status_code != 200:
+            return {"ok": False, "error": "not found"}
+        return {"ok": True, "provider": "deezer", "playlist": r.json()}
+
+
+@app.get("/deezer/home", tags=["Deezer"])
+async def deezer_home():
+    """Deezer charts / homepage."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get("https://api.deezer.com/chart")
+        if r.status_code != 200:
+            return {"ok": False, "error": f"HTTP {r.status_code}"}
+        data = r.json()
+    return {
+        "ok": True,
+        "provider": "deezer",
+        "tracks": (data.get("tracks") or {}).get("data") or [],
+        "albums": (data.get("albums") or {}).get("data") or [],
+        "artists": (data.get("artists") or {}).get("data") or [],
+        "playlists": (data.get("playlists") or {}).get("data") or [],
+    }
+
+
+@app.get("/jiosaavn/search", tags=["JioSaavn"])
+async def jiosaavn_search(q: str = Query(..., min_length=1), limit: int = Query(20, ge=1, le=40)):
+    items = await _saavn_search(q, limit)
+    return {"ok": True, "query": q, "count": len(items), "items": items, "provider": "jiosaavn"}
+
+
+@app.get("/jiosaavn/track", tags=["JioSaavn"])
+async def jiosaavn_track(id: str = Query(..., description="Saavn song id")):
+    id = id.replace("saavn:", "").strip()
+    card = await _saavn_stream_by_id(id)
+    if not card:
+        return {"ok": False, "error": "not found", "id": id}
+    return {"ok": True, "provider": "jiosaavn", "track": card}
+
+
+@app.get("/jiosaavn/charts", tags=["JioSaavn"])
+async def jiosaavn_charts():
+    """Official Saavn charts list."""
+    try:
+        data = await _saavn_get({"__call": "content.getCharts", "ctx": "web6dot0"})
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120], "items": []}
+    items = data if isinstance(data, list) else []
+    out = []
+    for it in items[:30]:
+        if not isinstance(it, dict):
+            continue
+        out.append({
+            "id": it.get("id") or it.get("listid"),
+            "title": it.get("title") or it.get("listname"),
+            "image": it.get("image"),
+            "subtitle": it.get("subtitle") or it.get("language"),
+            "type": it.get("type") or "playlist",
+        })
+    return {"ok": True, "count": len(out), "items": out, "provider": "jiosaavn"}
+
+
+@app.get("/jiosaavn/album", tags=["JioSaavn"])
+async def jiosaavn_album(id: str = Query(..., description="Album id")):
+    try:
+        data = await _saavn_get({"__call": "content.getAlbumDetails", "albumid": id, "ctx": "web6dot0"})
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "invalid response"}
+    songs = []
+    for s in data.get("list") or data.get("songs") or []:
+        c = _saavn_card(s) if isinstance(s, dict) else None
+        if c:
+            songs.append(c)
+    return {
+        "ok": True,
+        "provider": "jiosaavn",
+        "id": id,
+        "title": data.get("title") or data.get("name"),
+        "image": data.get("image"),
+        "year": data.get("year"),
+        "songs": songs,
+        "count": len(songs),
+    }
+
+
+@app.get("/jiosaavn/playlist", tags=["JioSaavn"])
+async def jiosaavn_playlist(id: str = Query(...)):
+    try:
+        data = await _saavn_get({"__call": "playlist.getDetails", "listid": id, "ctx": "web6dot0"})
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "invalid response"}
+    songs = []
+    for s in data.get("list") or data.get("songs") or []:
+        c = _saavn_card(s) if isinstance(s, dict) else None
+        if c:
+            songs.append(c)
+    return {
+        "ok": True,
+        "provider": "jiosaavn",
+        "id": id,
+        "title": data.get("listname") or data.get("title"),
+        "image": data.get("image"),
+        "songs": songs,
+        "count": len(songs),
+    }
+
+
+@app.get("/jiosaavn/artist", tags=["JioSaavn"])
+async def jiosaavn_artist(id: str = Query(...), q: str = Query(None, description="Or search by name")):
+    if q and not id:
+        try:
+            data = await _saavn_get({"__call": "autocomplete.get", "query": q, "ctx": "web6dot0"})
+            arts = (data.get("artists") or {}).get("data") or []
+            if arts:
+                id = str(arts[0].get("id"))
+        except Exception:
+            pass
+    if not id:
+        return {"ok": False, "error": "need id or q"}
+    try:
+        data = await _saavn_get({
+            "__call": "artist.getArtistPageDetails",
+            "artistId": id,
+            "ctx": "web6dot0",
+        })
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+    return {"ok": True, "provider": "jiosaavn", "id": id, "data": data if isinstance(data, dict) else {"raw": data}}
+
+
+@app.get("/tools/songlink", tags=["Tools"])
+async def tools_songlink(
+    title: str = Query(..., min_length=1),
+    artist: str = Query(""),
+):
+    """
+    Find the same song across platforms (I don't have Spotify style).
+    Returns JioSaavn + Deezer + YT Music matches.
+    """
+    q = f"{title} {artist}".strip()
+    result = {"title": title, "artist": artist, "matches": {}}
+    try:
+        hits = await _saavn_search(q, 5)
+        result["matches"]["jiosaavn"] = hits[:5]
+    except Exception as e:
+        result["matches"]["jiosaavn"] = {"error": str(e)[:80]}
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get("https://api.deezer.com/search", params={"q": q, "limit": 5})
+            if r.status_code == 200:
+                result["matches"]["deezer"] = (r.json() or {}).get("data") or []
+    except Exception as e:
+        result["matches"]["deezer"] = {"error": str(e)[:80]}
+    try:
+        data = await _ytm_post("search", {"query": q})
+        items = []
+        _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+        songs = []
+        seen = set()
+        for it in items:
+            e = _ytm_parse_item(it)
+            if e and e["video_id"] not in seen:
+                seen.add(e["video_id"])
+                songs.append(e)
+        result["matches"]["ytmusic"] = songs[:5]
+    except Exception as e:
+        result["matches"]["ytmusic"] = {"error": str(e)[:80]}
+    return {"ok": True, **result}
+
+
+@app.get("/tools/idonthavespotify", tags=["Tools"])
+async def tools_idonthavespotify(
+    url: str = Query(None, description="Spotify track URL"),
+    title: str = Query(None),
+    artist: str = Query(""),
+):
+    """Resolve Spotify URL or title to free playable alternatives."""
+    if url and "spotify" in url.lower():
+        meta = await _spotify_meta(url)
+        title = meta.get("title") or title or ""
+        artist = meta.get("artist") or artist or ""
+    if not title:
+        raise HTTPException(400, "Provide Spotify url= or title=")
+    link = await tools_songlink(title=title, artist=artist)
+    # best playable
+    play = None
+    try:
+        matched = await _match_download(title, artist)
+        if matched.get("links"):
+            play = matched["links"][0]
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "title": title,
+        "artist": artist,
+        "play": play,
+        "alternatives": link.get("matches"),
+    }
+
 @app.get("/music/related", tags=["Music"])
 async def music_related(q: str = Query(..., min_length=1), limit: int = 8):
     """Recommended / similar songs (JioSaavn search around query)."""
@@ -4717,8 +5729,148 @@ def _extract_youtube_id(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+
+async def _tikwm_extract(url: str) -> dict:
+    """TikTok via tikwm.com — direct CDN (no watermark HD when available)."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": "https://www.tikwm.com/",
+        "Accept": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, headers=headers) as client:
+        r = await client.get("https://www.tikwm.com/api/", params={"url": url, "hd": 1})
+        if r.status_code != 200:
+            return {"ok": False, "error": f"tikwm HTTP {r.status_code}"}
+        j = r.json()
+        if j.get("code") != 0:
+            return {"ok": False, "error": j.get("msg") or "tikwm failed"}
+        d = j.get("data") or {}
+        formats = []
+        if d.get("hdplay"):
+            formats.append({"id": "hd", "label": "HD · no watermark", "ext": "mp4", "kind": "video+audio", "muxed": True, "url": d["hdplay"]})
+        if d.get("play"):
+            formats.append({"id": "play", "label": "Standard · no watermark", "ext": "mp4", "kind": "video+audio", "muxed": True, "url": d["play"]})
+        if d.get("wmplay"):
+            formats.append({"id": "wm", "label": "With watermark", "ext": "mp4", "kind": "video+audio", "muxed": True, "url": d["wmplay"]})
+        if d.get("music"):
+            formats.append({"id": "music", "label": "Audio", "ext": "mp3", "kind": "audio", "url": d["music"]})
+        if not formats:
+            return {"ok": False, "error": "tikwm: no media urls"}
+        best = formats[0]
+        return {
+            "ok": True,
+            "title": d.get("title") or "TikTok",
+            "id": str(d.get("id") or ""),
+            "extractor": "tikwm",
+            "duration": d.get("duration"),
+            "thumbnail": d.get("cover") or d.get("origin_cover"),
+            "webpage_url": url,
+            "formats": formats,
+            "format_count": len(formats),
+            "best": best,
+            "best_muxed": best,
+            "best_audio": next((f for f in formats if f["kind"] == "audio"), None),
+            "download_url": best["url"],
+            "note": "Direct TikTok CDN via tikwm",
+        }
+
+
+async def _piped_yt_streams(video_id: str) -> dict:
+    """Fetch YouTube streams from multiple Piped instances (CDN URLs)."""
+    bases = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.leptons.xyz",
+        "https://pipedapi.adminforge.de",
+        "https://pipedapi.ducks.party",
+        "https://api.piped.private.coffee",
+        "https://pipedapi.nosebs.ru",
+        "https://pipedapi.drgns.space",
+        "https://pipedapi.owo.si",
+        "https://piped-api.codespace.cz",
+        "https://pipedapi.reallyaweso.me",
+        "https://api.piped.yt",
+    ]
+    errors = []
+    async with httpx.AsyncClient(timeout=14.0, follow_redirects=True, headers={"User-Agent": "ElitePlex/5.14"}) as client:
+        for base in bases:
+            try:
+                r = await client.get(f"{base}/streams/{video_id}")
+                if r.status_code != 200:
+                    errors.append(f"{base}:{r.status_code}")
+                    continue
+                j = r.json()
+                formats = []
+                for vs in (j.get("videoStreams") or []):
+                    u = vs.get("url")
+                    if not u:
+                        continue
+                    q = str(vs.get("quality") or "")
+                    h = int(re.sub(r"\D", "", q) or 0) or None
+                    formats.append({
+                        "id": str(vs.get("itag") or q),
+                        "label": f"{q} · {(vs.get('format') or 'mp4').upper()}" + (" · video-only" if vs.get("videoOnly") else " · 🔊"),
+                        "ext": (vs.get("format") or "mp4").lower(),
+                        "height": h,
+                        "kind": "video" if vs.get("videoOnly") else "video+audio",
+                        "muxed": not vs.get("videoOnly"),
+                        "url": u,
+                    })
+                for a in (j.get("audioStreams") or [])[:6]:
+                    if a.get("url"):
+                        formats.append({
+                            "id": str(a.get("itag") or "a"),
+                            "label": f"audio · {a.get('quality') or a.get('bitrate') or ''}",
+                            "ext": (a.get("format") or "m4a").lower(),
+                            "kind": "audio",
+                            "url": a["url"],
+                        })
+                if not formats:
+                    errors.append(f"{base}:empty")
+                    continue
+                # prefer muxed then height
+                formats.sort(key=lambda f: (0 if f.get("muxed") else 1, -(f.get("height") or 0)))
+                return {
+                    "ok": True,
+                    "title": j.get("title") or f"YouTube {video_id}",
+                    "id": video_id,
+                    "extractor": f"piped/{base.split('//')[1]}",
+                    "duration": j.get("duration"),
+                    "thumbnail": j.get("thumbnailUrl"),
+                    "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
+                    "formats": formats,
+                    "format_count": len(formats),
+                    "best": formats[0],
+                    "best_muxed": next((f for f in formats if f.get("muxed")), None),
+                    "best_audio": next((f for f in formats if f.get("kind") == "audio"), None),
+                    "download_url": formats[0]["url"],
+                    "hls": j.get("hls"),
+                    "dash": j.get("dash"),
+                    "note": "Direct stream via Piped",
+                }
+            except Exception as e:
+                errors.append(f"{base}:{type(e).__name__}")
+                continue
+    return {"ok": False, "error": "piped all failed", "detail": errors[:6]}
+
+
+def _ytdlp_has_cdn(formats: list) -> bool:
+    """True if any format has a real googlevideo / CDN URL (not youtube.com page)."""
+    for f in formats or []:
+        u = (f.get("url") or "")
+        if not u:
+            continue
+        if "googlevideo.com" in u or "googleusercontent.com" in u:
+            return True
+        if "googlevideo" in u:
+            return True
+        # non-YT sites: any http media URL counts
+        if u.startswith("http") and "youtube.com/" not in u and "youtu.be/" not in u:
+            return True
+    return False
+
+
 def _ytdlp_info(url: str) -> dict:
-    """Extract media + direct URLs. YouTube: android client first, then embed fallback."""
+    """Extract media + direct CDN URLs. YouTube: android_creator / mediaconnect first."""
     try:
         import yt_dlp  # type: ignore
     except ImportError:
@@ -4738,38 +5890,67 @@ def _ytdlp_info(url: str) -> dict:
         "skip_download": True,
         "noplaylist": True,
         "extract_flat": False,
-        "socket_timeout": 25,
-        "retries": 1,
+        "socket_timeout": 22,
+        "retries": 2,
+        "fragment_retries": 3,
     }
+    # Optional cookies for Vercel / datacenter IPs (export from browser)
+    cookie_file = os.environ.get("YTDLP_COOKIES") or os.environ.get("YTDLP_COOKIES_FILE")
+    if cookie_file and os.path.isfile(cookie_file):
+        base_opts["cookiefile"] = cookie_file
+    cookie_b64 = os.environ.get("YTDLP_COOKIES_B64")
+    if cookie_b64 and "cookiefile" not in base_opts:
+        try:
+            import tempfile
+            raw = base64.b64decode(cookie_b64)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+            tmp.write(raw)
+            tmp.close()
+            base_opts["cookiefile"] = tmp.name
+        except Exception:
+            pass
 
     info = None
     last_err = None
-    attempts = []
+    used_client = None
     if is_yt:
-        # As of 2026 YouTube requires a PO Token for most GVS (streaming) URLs on
-        # the android/ios/android_creator clients — yt-dlp still "succeeds" but
-        # silently drops those format URLs, so we can't just take the first
-        # client that doesn't raise; we need one that actually returns formats.
-        # web_embedded / tv currently don't require a PO Token (per yt-dlp's own
-        # PO Token Guide), so try those first; keep the others as fallbacks since
-        # YouTube's enforcement shifts client-by-client over time.
-        attempts = [
-            {**base_opts, "extractor_args": {"youtube": {"player_client": ["web_embedded"]}}},
-            {**base_opts, "extractor_args": {"youtube": {"player_client": ["tv"]}}},
-            {**base_opts, "extractor_args": {"youtube": {"player_client": ["android"]}}},
-            {**base_opts, "extractor_args": {"youtube": {"player_client": ["android_creator"]}}},
-            {**base_opts, "extractor_args": {"youtube": {"player_client": ["ios"]}}},
-            {**base_opts, "extractor_args": {"youtube": {"player_client": ["web_safari"]}}},
-            {**base_opts},  # let yt-dlp pick its own (self-updating) default client mix
+        # Multi-client in one call often recovers more formats; then try singles
+        # Keep list short — Vercel/serverless time limits; these clients return CDN most often
+        clients_batches = [
+            ["android_creator"],
+            ["mediaconnect"],
+            ["android_creator", "mediaconnect"],
+            ["android"],
         ]
+        attempts = []
+        for batch in clients_batches:
+            attempts.append((
+                {
+                    **base_opts,
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": batch,
+                            "player_skip": ["webpage"],
+                        }
+                    },
+                },
+                "+".join(batch),
+            ))
+        attempts.append((base_opts, "default"))
     else:
-        attempts = [base_opts]
+        attempts = [(base_opts, "default")]
 
-    for opts in attempts:
+    for opts, client_name in attempts:
         try:
             candidate = _run(opts)
-            if candidate and candidate.get("formats"):
+            fmts = (candidate or {}).get("formats") or []
+            if candidate and fmts and _ytdlp_has_cdn(fmts):
                 info = candidate
+                used_client = client_name
+                break
+            if candidate and fmts and not is_yt:
+                info = candidate
+                used_client = client_name
                 break
         except Exception as e:
             last_err = str(e)
@@ -4815,8 +5996,9 @@ def _ytdlp_info(url: str) -> dict:
             "format_count": 1,
             "best": {"url": embed, "kind": "embed", "label": "YouTube Embed"},
             "note": (
-                "Direct CDN blocked on this server IP (YouTube bot-check). "
-                "Use embed_url to play in an iframe, or host cookies.txt / different IP for direct links."
+                "YouTube blocked direct CDN on this server IP for this video. "
+                "Set env YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64 (Netscape cookies.txt) on the host, "
+                "or use embed_url. Some videos still work without cookies."
             ),
             "error_detail": (last_err or "")[:200],
         }
@@ -4886,6 +6068,16 @@ def _ytdlp_info(url: str) -> dict:
         pri = 0 if k == "video+audio" else (1 if k == "video" else 2)
         return (pri, -(x.get("height") or 0), -(x.get("abr") or 0))
 
+    # Drop non-CDN YouTube page URLs (keep only googlevideo etc.)
+    if is_yt:
+        formats = [
+            f for f in formats
+            if f.get("url") and (
+                "googlevideo.com" in f["url"]
+                or "googleusercontent.com" in f["url"]
+                or "googlevideo" in f["url"]
+            )
+        ]
     formats.sort(key=_sk)
     thumb = info.get("thumbnail")
     if not thumb and info.get("thumbnails"):
@@ -4901,7 +6093,7 @@ def _ytdlp_info(url: str) -> dict:
         "ok": True,
         "title": info.get("title") or "media",
         "id": info.get("id"),
-        "extractor": info.get("extractor") or info.get("ie_key"),
+        "extractor": (info.get("extractor") or info.get("ie_key") or "yt-dlp") + (f"/{used_client}" if used_client else ""),
         "duration": info.get("duration"),
         "uploader": info.get("uploader") or info.get("channel"),
         "thumbnail": thumb,
@@ -5096,18 +6288,739 @@ async def dl_any(url: str = Query(..., min_length=8)):
     return result
 
 
+
+
+# =============================================================================
+# Music downloaders (PaxSenix-style paths, native unlimited — no rate limit)
+# Spotify/Tidal/etc. → metadata + JioSaavn / yt-dlp match for full audio
+# =============================================================================
+
+def _spotify_id(url: str) -> Optional[str]:
+    m = re.search(r"spotify\.com/(?:intl-[a-z]+/)?track/([a-zA-Z0-9]+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"spotify:track:([a-zA-Z0-9]+)", url)
+    return m.group(1) if m else None
+
+
+async def _spotify_meta(url: str) -> dict:
+    """Public oEmbed + open graph style meta (no API key)."""
+    track_id = _spotify_id(url) or ""
+    meta = {"id": track_id, "title": None, "artist": None, "thumb": None, "url": url}
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        try:
+            r = await client.get(
+                "https://open.spotify.com/oembed",
+                params={"url": url if url.startswith("http") else f"https://open.spotify.com/track/{track_id}"},
+            )
+            if r.status_code == 200:
+                j = r.json()
+                meta["title"] = j.get("title")
+                meta["thumb"] = j.get("thumbnail_url")
+                # title often "Song · Artist"
+                t = meta["title"] or ""
+                if " · " in t:
+                    parts = t.split(" · ", 1)
+                    meta["title"], meta["artist"] = parts[0].strip(), parts[1].strip()
+                elif " - " in t:
+                    parts = t.split(" - ", 1)
+                    meta["title"], meta["artist"] = parts[0].strip(), parts[1].strip()
+        except Exception:
+            pass
+    return meta
+
+
+async def _match_download(title: str, artist: str = "") -> dict:
+    """Find full playable audio via Saavn then yt-dlp search."""
+    links = []
+    errors = {}
+    q = f"{title} {artist}".strip()
+    if not q:
+        return {"links": [], "errors": {"query": "empty"}}
+    try:
+        match = await _saavn_match(title, artist)
+        if match and match.get("audio_url"):
+            links.append({
+                "label": f"JioSaavn {match.get('audio_format') or '320'}",
+                "url": match["audio_url"],
+                "format": (match.get("audio_format") or "mp4").upper(),
+                "quality": "320kbps",
+                "provider": "jiosaavn",
+                "direct": True,
+                "title": match.get("title") or title,
+                "artist": match.get("artist") or artist,
+                "thumb": match.get("thumb"),
+            })
+    except Exception as e:
+        errors["jiosaavn"] = str(e)[:100]
+    # yt-dlp ytsearch
+    try:
+        yq = f"ytsearch1:{q}"
+        data = await asyncio.to_thread(_ytdlp_info, yq)
+        if data.get("ok"):
+            formats = data.get("formats") or []
+            audios = [f for f in formats if f.get("kind") == "audio"]
+            muxed = [f for f in formats if f.get("kind") == "video+audio"]
+            best = (audios or muxed or formats or [None])[0]
+            if best and best.get("url"):
+                links.append({
+                    "label": f"YouTube {best.get('format') or best.get('kind') or 'audio'}",
+                    "url": best["url"],
+                    "format": (best.get("format") or "m4a").upper(),
+                    "provider": "youtube",
+                    "direct": True,
+                    "title": data.get("title") or title,
+                    "thumb": data.get("thumbnail"),
+                })
+            elif data.get("embed_url"):
+                links.append({
+                    "label": "YouTube embed",
+                    "url": data["embed_url"],
+                    "format": "EMBED",
+                    "provider": "youtube",
+                    "direct": False,
+                })
+        elif data.get("error"):
+            errors["yt-dlp"] = str(data["error"])[:120]
+    except Exception as e:
+        errors["yt-dlp"] = str(e)[:100]
+    return {"links": links, "errors": errors}
+
+
+@app.get("/dl/jiosaavn", tags=["Downloader"])
+async def dl_jiosaavn(
+    url: str = Query(None, description="JioSaavn song URL or bare query"),
+    q: str = Query(None, description="Search query"),
+):
+    """JioSaavn downloader — direct CDN links (unlimited)."""
+    query = (q or url or "").strip()
+    if not query:
+        raise HTTPException(400, "Provide url= or q=")
+    # If URL, extract slug/name
+    if query.startswith("http"):
+        # try path last segment as search
+        slug = query.rstrip("/").split("/")[-1]
+        slug = re.sub(r"[-_]+", " ", slug)
+        query = slug or query
+    hits = await _saavn_search(query, 8)
+    if not hits:
+        return {"ok": False, "provider": "jiosaavn", "error": "no results", "query": query}
+    downloads = []
+    for h in hits[:5]:
+        sid = h.get("saavn_id") or (h.get("id") or "").replace("saavn:", "")
+        try:
+            card = await _saavn_stream_by_id(sid) if sid else None
+        except Exception:
+            card = None
+        audio = (card or h).get("audio_url") or h.get("audio_url")
+        if not audio and sid:
+            try:
+                card = await _saavn_stream_by_id(sid)
+                audio = (card or {}).get("audio_url")
+            except Exception:
+                pass
+        if audio:
+            downloads.append({
+                "title": (card or h).get("title") or h.get("title"),
+                "artist": (card or h).get("artist") or h.get("artist"),
+                "thumb": (card or h).get("thumb") or h.get("thumb"),
+                "url": audio,
+                "directUrl": audio,
+                "format": ((card or h).get("audio_format") or "mp4").upper(),
+                "quality": "320kbps",
+                "provider": "jiosaavn",
+                "id": f"saavn:{sid}" if sid else h.get("id"),
+            })
+    return {
+        "ok": bool(downloads),
+        "provider": "jiosaavn",
+        "query": query,
+        "count": len(downloads),
+        "downloads": downloads,
+        "url": downloads[0]["url"] if downloads else None,
+        "directUrl": downloads[0]["url"] if downloads else None,
+    }
+
+
+@app.get("/dl/spotify", tags=["Downloader"])
+async def dl_spotify(
+    url: str = Query(..., description="Spotify track URL or spotify:track:ID"),
+    server: str = Query("auto", description="auto|jiosaavn|youtube"),
+):
+    """
+    Spotify downloader (unlimited). Resolves track meta via oEmbed,
+    then fetches full audio from JioSaavn / YouTube (no Spotify DRM).
+    """
+    if not url.startswith("http") and not url.startswith("spotify:"):
+        url = f"https://open.spotify.com/track/{url}"
+    meta = await _spotify_meta(url)
+    title = meta.get("title") or ""
+    artist = meta.get("artist") or ""
+    if not title:
+        return {"ok": False, "provider": "spotify", "error": "could not resolve track metadata", "input": url}
+    matched = await _match_download(title, artist)
+    links = matched["links"]
+    if server == "jiosaavn":
+        links = [L for L in links if L.get("provider") == "jiosaavn"] or links
+    elif server == "youtube":
+        links = [L for L in links if L.get("provider") == "youtube"] or links
+    best = links[0] if links else None
+    return {
+        "ok": bool(best),
+        "provider": "spotify",
+        "input": url,
+        "spotify_id": meta.get("id"),
+        "title": title,
+        "artist": artist,
+        "thumb": meta.get("thumb"),
+        "url": best["url"] if best else None,
+        "directUrl": best["url"] if best else None,
+        "downloads": links,
+        "errors": matched.get("errors") or None,
+        "note": "Full audio via JioSaavn/YouTube match — not Spotify CDN",
+    }
+
+
+@app.get("/dl/deezer", tags=["Downloader"])
+async def dl_deezer(
+    url: str = Query(..., description="Deezer track URL or numeric id"),
+    quality: str = Query("320kbps", description="Preferred quality label"),
+):
+    """Deezer downloader — preview + full match via JioSaavn/YouTube."""
+    tid = None
+    m = re.search(r"deezer\.com/(?:[a-z]{2}/)?track/(\d+)", url)
+    if m:
+        tid = m.group(1)
+    elif url.isdigit():
+        tid = url
+    if not tid:
+        raise HTTPException(400, "Need Deezer track URL or id")
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        r = await client.get(f"https://api.deezer.com/track/{tid}")
+        if r.status_code != 200:
+            return {"ok": False, "provider": "deezer", "error": "track not found"}
+        tr = r.json()
+    title = tr.get("title") or ""
+    artist = (tr.get("artist") or {}).get("name") or ""
+    thumb = (tr.get("album") or {}).get("cover_xl") or (tr.get("album") or {}).get("cover_big")
+    preview = tr.get("preview")
+    matched = await _match_download(title, artist)
+    links = matched["links"]
+    if preview:
+        links.append({
+            "label": "Deezer 30s preview",
+            "url": preview,
+            "format": "MP3",
+            "quality": "preview",
+            "provider": "deezer",
+            "direct": True,
+        })
+    best = next((L for L in links if L.get("provider") == "jiosaavn"), None) or (links[0] if links else None)
+    return {
+        "ok": bool(best),
+        "provider": "deezer",
+        "deezer_id": tid,
+        "title": title,
+        "artist": artist,
+        "thumb": thumb,
+        "quality": quality,
+        "url": best["url"] if best else None,
+        "directUrl": best["url"] if best else None,
+        "downloads": links,
+        "errors": matched.get("errors") or None,
+    }
+
+
+@app.get("/dl/tidal", tags=["Downloader"])
+async def dl_tidal(url: str = Query(..., description="Tidal track URL or title search")):
+    """Tidal → title match → JioSaavn/YouTube full audio."""
+    title = url
+    if "tidal.com" in url:
+        # best-effort: last path segment
+        title = re.sub(r'[-_]', " ", url.rstrip("/").split("/")[-1])
+    matched = await _match_download(title, "")
+    best = (matched["links"] or [None])[0]
+    return {
+        "ok": bool(best),
+        "provider": "tidal",
+        "input": url,
+        "url": best["url"] if best else None,
+        "directUrl": best["url"] if best else None,
+        "downloads": matched["links"],
+        "errors": matched.get("errors") or None,
+        "note": "Matched via public search — not Tidal CDN",
+    }
+
+
+@app.get("/dl/qobuz", tags=["Downloader"])
+async def dl_qobuz(url: str = Query(...), quality: str = Query("320kbps")):
+    """Qobuz → match full audio (JioSaavn/YouTube)."""
+    title = url
+    if "qobuz.com" in url:
+        title = re.sub(r'[-_]', " ", url.rstrip("/").split("/")[-1])
+    matched = await _match_download(title, "")
+    best = (matched["links"] or [None])[0]
+    return {
+        "ok": bool(best),
+        "provider": "qobuz",
+        "quality": quality,
+        "url": best["url"] if best else None,
+        "directUrl": best["url"] if best else None,
+        "downloads": matched["links"],
+        "errors": matched.get("errors") or None,
+    }
+
+
+@app.get("/dl/applemusic", tags=["Downloader"])
+async def dl_applemusic(url: str = Query(...)):
+    """Apple Music URL → oEmbed/title match → full audio."""
+    title = artist = ""
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        try:
+            r = await client.get("https://itunes.apple.com/oembed", params={"url": url})
+            if r.status_code == 200:
+                j = r.json()
+                title = j.get("title") or ""
+                artist = j.get("author_name") or ""
+        except Exception:
+            pass
+    if not title:
+        title = re.sub(r'[-_]', " ", url.rstrip("/").split("/")[-1])
+    matched = await _match_download(title, artist)
+    best = (matched["links"] or [None])[0]
+    return {
+        "ok": bool(best),
+        "provider": "applemusic",
+        "title": title,
+        "artist": artist,
+        "url": best["url"] if best else None,
+        "directUrl": best["url"] if best else None,
+        "downloads": matched["links"],
+        "errors": matched.get("errors") or None,
+    }
+
+
+@app.get("/dl/amazonmusic", tags=["Downloader"])
+async def dl_amazonmusic(url: str = Query(...)):
+    """Amazon Music → title guess → full audio match."""
+    title = re.sub(r'[-_]', " ", url.rstrip("/").split("/")[-1])
+    matched = await _match_download(title, "")
+    best = (matched["links"] or [None])[0]
+    return {
+        "ok": bool(best),
+        "provider": "amazonmusic",
+        "url": best["url"] if best else None,
+        "directUrl": best["url"] if best else None,
+        "downloads": matched["links"],
+        "errors": matched.get("errors") or None,
+    }
+
+
+@app.get("/dl/audiomack", tags=["Downloader"])
+async def dl_audiomack(url: str = Query(...)):
+    """Audiomack / generic page — yt-dlp extract."""
+    data = await asyncio.to_thread(_ytdlp_info, url)
+    if not data.get("ok"):
+        # fallback title match from path
+        title = re.sub(r'[-_]', " ", url.rstrip("/").split("/")[-1])
+        matched = await _match_download(title, "")
+        best = (matched["links"] or [None])[0]
+        return {
+            "ok": bool(best),
+            "provider": "audiomack",
+            "url": best["url"] if best else None,
+            "directUrl": best["url"] if best else None,
+            "downloads": matched["links"],
+            "errors": {"yt-dlp": data.get("error"), **(matched.get("errors") or {})},
+        }
+    formats = data.get("formats") or []
+    audios = [f for f in formats if f.get("kind") == "audio"]
+    best = (audios or formats or [None])[0]
+    return {
+        "ok": bool(best and best.get("url")),
+        "provider": "audiomack",
+        "title": data.get("title"),
+        "url": best.get("url") if best else None,
+        "directUrl": best.get("url") if best else None,
+        "downloads": [{"label": f.get("label") or f.get("kind"), "url": f.get("url"), "format": f.get("format")} for f in (audios or formats)[:8] if f.get("url")],
+    }
+
+
+@app.get("/dl/snapany", tags=["Downloader"])
+async def dl_snapany(url: str = Query(..., min_length=8)):
+    """SnapAny-style universal downloader (yt-dlp + HubCloud) — unlimited."""
+    return await dl_any(url=url)
+
+
+
+# =============================================================================
+# Platform downloaders (PaxSenix-complete set) — all unlimited via yt-dlp / native
+# =============================================================================
+
+async def _dl_platform(url: str, provider: str, prefer: str = "auto") -> dict:
+    """Shared extractor — prefer audio/video, return PaxSenix-like shape."""
+    url = (url or "").strip()
+    if not re.match(r"^https?://", url, re.I):
+        return {"ok": False, "provider": provider, "error": "url must start with http(s)://", "input": url}
+    # hub / pixel first
+    low = url.lower()
+    try:
+        if "hubcloud." in low and "/drive/" in low:
+            links = await resolve_hubcloud(url)
+            return {"ok": True, "provider": "hubcloud", "count": len(links), "downloads": links, "url": links[0]["url"] if links else None, "directUrl": links[0]["url"] if links else None, "input": url}
+        if "hubdrive." in low:
+            links = await resolve_hubdrive(url)
+            return {"ok": True, "provider": "hubdrive", "count": len(links), "downloads": links, "url": links[0]["url"] if links else None, "directUrl": links[0]["url"] if links else None, "input": url}
+    except Exception:
+        pass
+
+    # TikTok → TikWM first (reliable CDN)
+    if any(x in low for x in ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "tiktok.com/t/")):
+        try:
+            tw = await _tikwm_extract(url)
+            if tw.get("ok") and tw.get("formats"):
+                data = tw
+                # jump to format assembly below via fall-through after setting data
+            else:
+                data = await asyncio.to_thread(_ytdlp_info, url)
+        except Exception:
+            data = await asyncio.to_thread(_ytdlp_info, url)
+    else:
+        data = await asyncio.to_thread(_ytdlp_info, url)
+    # YouTube: if yt-dlp gave embed-only / failed → Piped multi-instance CDN
+    if data.get("ok") and data.get("mode") == "embed":
+        data["ok"] = False
+    yt_id = _extract_youtube_id(url)
+    if yt_id and (not data.get("ok") or not any(
+        "googlevideo" in (f.get("url") or "") for f in (data.get("formats") or [])
+    )):
+        try:
+            piped = await _piped_yt_streams(yt_id)
+            if piped.get("ok") and piped.get("formats"):
+                data = piped
+        except Exception:
+            pass
+
+    if not data.get("ok"):
+        return {
+            "ok": False,
+            "provider": provider,
+
+            "error": data.get("error") or data.get("note") or "extract failed — YouTube may block this server IP",
+            "input": url,
+            "embed_url": data.get("embed_url") or (f"https://www.youtube.com/embed/{_extract_youtube_id(url)}" if _extract_youtube_id(url) else None),
+            "title": data.get("title"),
+            "thumbnail": data.get("thumbnail"),
+            "formats": data.get("formats") or [],
+        }
+    formats = data.get("formats") or []
+    audios = [f for f in formats if f.get("kind") == "audio"]
+    videos = [f for f in formats if f.get("kind") in ("video", "video+audio")]
+    muxed = [f for f in formats if f.get("kind") == "video+audio"]
+    downloads = []
+    for f in (audios + muxed + videos)[:12]:
+        if not f.get("url"):
+            continue
+        downloads.append({
+            "label": f.get("label") or f.get("format") or f.get("kind"),
+            "url": f["url"],
+            "format": f.get("format"),
+            "kind": f.get("kind"),
+            "height": f.get("height"),
+            "abr": f.get("abr"),
+        })
+    best = None
+    if prefer == "audio":
+        best = (audios or muxed or downloads or [None])[0]
+    elif prefer == "video":
+        best = (muxed or videos or downloads or [None])[0]
+    else:
+        best = (muxed or audios or videos or downloads or [None])[0]
+    if isinstance(best, dict) and "url" not in best and downloads:
+        best = downloads[0]
+    return {
+        "ok": bool(best and (isinstance(best, dict) and best.get("url"))),
+        "provider": provider,
+        "extractor": data.get("extractor"),
+        "title": data.get("title"),
+        "thumbnail": data.get("thumbnail"),
+        "duration": data.get("duration"),
+        "url": best.get("url") if isinstance(best, dict) else None,
+        "directUrl": best.get("url") if isinstance(best, dict) else None,
+        "download_url": best.get("url") if isinstance(best, dict) else None,
+        "downloads": downloads,
+        "formats": formats,
+        "input": url,
+        "webpage_url": data.get("webpage_url"),
+    }
+
+
+@app.get("/dl/tiktok", tags=["Downloader"])
+async def dl_tiktok(url: str = Query(..., min_length=8)):
+    """TikTok video/audio downloader."""
+    return await _dl_platform(url, "tiktok")
+
+
+@app.get("/dl/ig", tags=["Downloader"])
+@app.get("/dl/instagram", tags=["Downloader"], include_in_schema=False)
+async def dl_ig(url: str = Query(..., min_length=8)):
+    """Instagram reels / posts downloader."""
+    return await _dl_platform(url, "instagram")
+
+
+@app.get("/dl/fb", tags=["Downloader"])
+@app.get("/dl/facebook", tags=["Downloader"], include_in_schema=False)
+async def dl_fb(url: str = Query(..., min_length=8)):
+    """Facebook video downloader."""
+    return await _dl_platform(url, "facebook")
+
+
+@app.get("/dl/threads", tags=["Downloader"])
+async def dl_threads(url: str = Query(..., min_length=8)):
+    """Threads (Meta) media downloader."""
+    return await _dl_platform(url, "threads")
+
+
+@app.get("/dl/twitter", tags=["Downloader"])
+@app.get("/dl/x", tags=["Downloader"], include_in_schema=False)
+async def dl_twitter(url: str = Query(..., min_length=8)):
+    """Twitter / X video & GIF downloader."""
+    return await _dl_platform(url, "twitter")
+
+
+@app.get("/dl/ytmp3", tags=["Downloader"])
+async def dl_ytmp3(
+    url: str = Query(..., min_length=8),
+    format: str = Query("m4a", description="mp3|m4a|webm|opus"),
+):
+    """YouTube → best audio (mp3/m4a)."""
+    res = await _dl_platform(url, "ytmp3", prefer="audio")
+    res["requested_format"] = format
+    return res
+
+
+@app.get("/dl/ytmp4", tags=["Downloader"])
+async def dl_ytmp4(
+    url: str = Query(..., min_length=8),
+    quality: str = Query("720", description="360|480|720|1080"),
+):
+    """YouTube → best video under quality."""
+    res = await _dl_platform(url, "ytmp4", prefer="video")
+    res["requested_quality"] = quality
+    # pick closest height if available
+    try:
+        want = int(re.sub(r"\D", "", quality) or "720")
+    except Exception:
+        want = 720
+    formats = res.get("formats") or []
+    # Prefer muxed (video+audio) near requested height; else video-only
+    candidates = [f for f in formats if f.get("kind") in ("video+audio", "video") and f.get("url")]
+    if candidates:
+        def score(f):
+            h = f.get("height") or 0
+            mux = 0 if f.get("kind") == "video+audio" else 1
+            return (mux, abs(h - want), -h)
+        candidates.sort(key=score)
+        best = candidates[0]
+        res["url"] = best.get("url")
+        res["directUrl"] = best.get("url")
+        res["download_url"] = best.get("url")
+        res["quality_label"] = best.get("label")
+        res["ok"] = True
+        # also expose audio pair if best is video-only
+        if best.get("kind") == "video":
+            aud = next((f for f in formats if f.get("kind") == "audio" and f.get("url")), None)
+            if aud:
+                res["audio_url"] = aud.get("url")
+                res["note"] = "Video-only stream — merge with audio_url via /dl/combine if needed"
+    return res
+
+
+@app.get("/dl/soundcloud", tags=["Downloader"])
+async def dl_soundcloud(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "soundcloud", prefer="audio")
+
+
+@app.get("/dl/reddit", tags=["Downloader"])
+async def dl_reddit(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "reddit")
+
+
+@app.get("/dl/pinterest", tags=["Downloader"])
+async def dl_pinterest(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "pinterest")
+
+
+@app.get("/dl/tumblr", tags=["Downloader"])
+async def dl_tumblr(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "tumblr")
+
+
+@app.get("/dl/twitch", tags=["Downloader"])
+async def dl_twitch(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "twitch")
+
+
+@app.get("/dl/dailymotion", tags=["Downloader"])
+async def dl_dailymotion(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "dailymotion")
+
+
+@app.get("/dl/vimeo", tags=["Downloader"])
+async def dl_vimeo(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "vimeo")
+
+
+@app.get("/dl/capcut", tags=["Downloader"])
+async def dl_capcut(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "capcut")
+
+
+@app.get("/dl/likee", tags=["Downloader"])
+async def dl_likee(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "likee")
+
+
+@app.get("/dl/snackvideo", tags=["Downloader"])
+async def dl_snackvideo(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "snackvideo")
+
+
+@app.get("/dl/douyin", tags=["Downloader"])
+async def dl_douyin(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "douyin")
+
+
+@app.get("/dl/snapchat", tags=["Downloader"])
+async def dl_snapchat(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "snapchat")
+
+
+@app.get("/dl/bluesky", tags=["Downloader"])
+async def dl_bluesky(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "bluesky")
+
+
+@app.get("/dl/rednote", tags=["Downloader"])
+async def dl_rednote(url: str = Query(..., min_length=8)):
+    """Xiaohongshu / RedNote."""
+    return await _dl_platform(url, "rednote")
+
+
+@app.get("/dl/9gag", tags=["Downloader"])
+async def dl_9gag(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "9gag")
+
+
+@app.get("/dl/hitube", tags=["Downloader"])
+async def dl_hitube(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "hitube")
+
+
+@app.get("/dl/savevideo", tags=["Downloader"])
+@app.get("/dl/9xbuddy", tags=["Downloader"], include_in_schema=False)
+async def dl_savevideo(url: str = Query(..., min_length=8)):
+    """Generic save-video / 9xbuddy-style (yt-dlp)."""
+    return await _dl_platform(url, "savevideo")
+
+
+@app.get("/dl/aio", tags=["Downloader"])
+async def dl_aio(url: str = Query(..., min_length=8)):
+    """All-in-one downloader (alias of /dl/any)."""
+    return await dl_any(url=url)
+
+
+@app.get("/dl/mediafire", tags=["Downloader"])
+async def dl_mediafire(url: str = Query(..., min_length=8)):
+    """MediaFire direct link resolver."""
+    return await _dl_platform(url, "mediafire")
+
+
+@app.get("/dl/gdrive", tags=["Downloader"])
+async def dl_gdrive(url: str = Query(..., min_length=8)):
+    """Google Drive — best-effort direct / yt-dlp."""
+    # normalize file id
+    m = re.search(r"/file/d/([^/]+)", url) or re.search(r"[?&]id=([^&]+)", url)
+    if m:
+        fid = m.group(1)
+        direct = f"https://drive.google.com/uc?export=download&id={fid}"
+        return {
+            "ok": True,
+            "provider": "gdrive",
+            "file_id": fid,
+            "url": direct,
+            "directUrl": direct,
+            "downloads": [{"label": "Google Drive uc export", "url": direct, "direct": True}],
+            "input": url,
+            "note": "Large files may need confirm token in browser",
+        }
+    return await _dl_platform(url, "gdrive")
+
+
+@app.get("/dl/mega", tags=["Downloader"])
+async def dl_mega(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "mega")
+
+
+@app.get("/dl/terabox", tags=["Downloader"])
+async def dl_terabox(url: str = Query(..., min_length=8)):
+    """TeraBox / Terabox share link."""
+    return await _dl_platform(url, "terabox")
+
+
+@app.get("/dl/sfile", tags=["Downloader"])
+async def dl_sfile(url: str = Query(..., min_length=8)):
+    return await _dl_platform(url, "sfile")
+
 @app.get("/dl/sites", tags=["Downloader"])
 async def dl_sites():
     return {
         "ok": True,
-        "engine": "yt-dlp (android client for YouTube) + HubCloud/HubDrive",
+        "engine": "native JioSaavn + yt-dlp + Deezer + HubCloud (unlimited, no PaxSenix rate limit)",
         "endpoints": {
             "universal": "GET /dl/any?url=",
+            "aio": "GET /dl/aio?url=",
+            "snapany": "GET /dl/snapany?url=",
+            "tiktok": "GET /dl/tiktok?url=",
+            "instagram": "GET /dl/ig?url=",
+            "facebook": "GET /dl/fb?url=",
+            "twitter": "GET /dl/twitter?url=",
+            "threads": "GET /dl/threads?url=",
+            "ytmp3": "GET /dl/ytmp3?url=",
+            "ytmp4": "GET /dl/ytmp4?url=",
+            "soundcloud": "GET /dl/soundcloud?url=",
+            "reddit": "GET /dl/reddit?url=",
+            "pinterest": "GET /dl/pinterest?url=",
+            "tumblr": "GET /dl/tumblr?url=",
+            "twitch": "GET /dl/twitch?url=",
+            "dailymotion": "GET /dl/dailymotion?url=",
+            "vimeo": "GET /dl/vimeo?url=",
+            "capcut": "GET /dl/capcut?url=",
+            "likee": "GET /dl/likee?url=",
+            "snackvideo": "GET /dl/snackvideo?url=",
+            "douyin": "GET /dl/douyin?url=",
+            "snapchat": "GET /dl/snapchat?url=",
+            "bluesky": "GET /dl/bluesky?url=",
+            "rednote": "GET /dl/rednote?url=",
+            "9gag": "GET /dl/9gag?url=",
+            "mediafire": "GET /dl/mediafire?url=",
+            "gdrive": "GET /dl/gdrive?url=",
+            "mega": "GET /dl/mega?url=",
+            "terabox": "GET /dl/terabox?url=",
+            "sfile": "GET /dl/sfile?url=",
+            "spotify": "GET /dl/spotify?url=",
+            "deezer": "GET /dl/deezer?url=",
+            "jiosaavn": "GET /dl/jiosaavn?q=",
+            "tidal": "GET /dl/tidal?url=",
+            "qobuz": "GET /dl/qobuz?url=",
+            "applemusic": "GET /dl/applemusic?url=",
+            "amazonmusic": "GET /dl/amazonmusic?url=",
+            "audiomack": "GET /dl/audiomack?url=",
             "formats": "GET /dl/extract?url=",
             "smart": "GET /dl/smart?url=",
             "combine": "POST /dl/combine",
         },
-        "note": "YouTube uses android player client (no cookies). Direct URLs expire.",
+        "note": "Spotify/Tidal/Apple/Amazon resolve via metadata + JioSaavn/YouTube full audio (no DRM CDN).",
     }
 
 
@@ -5345,6 +7258,280 @@ def _yt_thumb(video_id: str, thumbs: Any = None) -> str:
             return best[0]["url"]
     return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
+
+
+
+# =============================================================================
+# YouTube Music + YouTube (PaxSenix-style paths, native)
+# =============================================================================
+
+@app.get("/yt-music/search", tags=["YouTube Music"])
+async def ytmusic_search(q: str = Query(..., min_length=1), filter: str = Query("songs", description="songs|videos|albums|artists|playlists")):
+    """YouTube Music search (inner API)."""
+    data = await _ytm_post("search", {"query": q})
+    items = []
+    _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+    _ytm_walk(data, "musicTwoRowItemRenderer", items)
+    songs, seen = [], set()
+    for it in items:
+        e = _ytm_parse_item(it)
+        if e and e["video_id"] not in seen:
+            seen.add(e["video_id"])
+            songs.append(e)
+    return {"ok": True, "query": q, "count": len(songs), "items": songs, "provider": "ytmusic"}
+
+
+@app.get("/yt-music/home", tags=["YouTube Music"])
+async def ytmusic_home():
+    """YT Music home / explore rows (via search seeds)."""
+    seeds = ["Top songs", "Trending music", "New releases", "Pop hits", "Hip hop"]
+    sections = []
+    for q in seeds:
+        try:
+            data = await _ytm_post("search", {"query": q})
+            items = []
+            _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+            songs, seen = [], set()
+            for it in items:
+                e = _ytm_parse_item(it)
+                if e and e["video_id"] not in seen:
+                    seen.add(e["video_id"])
+                    songs.append(e)
+            if songs:
+                sections.append({"title": q, "items": songs[:12]})
+        except Exception:
+            continue
+    return {"ok": True, "sections": sections, "provider": "ytmusic"}
+
+
+@app.get("/yt-music/info", tags=["YouTube Music"])
+async def ytmusic_info(video_id: str = Query(..., min_length=6)):
+    """Track info from YT Music next endpoint."""
+    video_id = video_id.replace("yt:", "").strip()
+    data = await _ytm_post("next", {"videoId": video_id})
+    s = json.dumps(data)
+    texts = re.findall(r'"text"\s*:\s*"([^"\\]{2,100})"', s)
+    title = texts[0] if texts else video_id
+    artist = texts[1] if len(texts) > 1 else ""
+    thumbs = re.findall(r'https://i\.ytimg\.com/[^"\\]+', s)
+    thumb = thumbs[0].replace("\\u0026", "&") if thumbs else f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    # related
+    related = []
+    items = []
+    _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+    seen = {video_id}
+    for it in items:
+        e = _ytm_parse_item(it)
+        if e and e["video_id"] not in seen:
+            seen.add(e["video_id"])
+            related.append(e)
+    return {
+        "ok": True,
+        "video_id": video_id,
+        "title": title,
+        "artist": artist,
+        "thumb": thumb,
+        "related": related[:15],
+        "watch_url": f"https://music.youtube.com/watch?v={video_id}",
+        "provider": "ytmusic",
+    }
+
+
+@app.get("/yt-music/next", tags=["YouTube Music"])
+async def ytmusic_next(video_id: str = Query(..., min_length=6)):
+    """Next / radio queue for a track."""
+    info = await ytmusic_info(video_id=video_id)
+    return {
+        "ok": True,
+        "video_id": video_id,
+        "items": info.get("related") or [],
+        "count": len(info.get("related") or []),
+        "provider": "ytmusic",
+    }
+
+
+@app.get("/yt-music/playlist", tags=["YouTube Music"])
+async def ytmusic_playlist(id: str = Query(..., description="Playlist id e.g. RDAMVM... or VLPL...")):
+    """Browse playlist (best-effort via browse endpoint)."""
+    browse_id = id
+    if not id.startswith("VL") and id.startswith("PL"):
+        browse_id = "VL" + id
+    data = await _ytm_post("browse", {"browseId": browse_id})
+    items = []
+    _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+    songs, seen = [], set()
+    for it in items:
+        e = _ytm_parse_item(it)
+        if e and e["video_id"] not in seen:
+            seen.add(e["video_id"])
+            songs.append(e)
+    return {"ok": True, "id": id, "count": len(songs), "items": songs, "provider": "ytmusic"}
+
+
+@app.get("/yt-music/album", tags=["YouTube Music"])
+async def ytmusic_album(id: str = Query(..., description="Browse id MP... or album browseId")):
+    data = await _ytm_post("browse", {"browseId": id})
+    items = []
+    _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+    songs, seen = [], set()
+    for it in items:
+        e = _ytm_parse_item(it)
+        if e and e["video_id"] not in seen:
+            seen.add(e["video_id"])
+            songs.append(e)
+    return {"ok": True, "id": id, "count": len(songs), "items": songs, "provider": "ytmusic"}
+
+
+@app.get("/yt/search", tags=["YouTube"])
+async def yt_search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
+    """YouTube video search — Invidious first, YT Music fallback."""
+    try:
+        res = await music_yt_search(q=q, page=page)
+        if isinstance(res, dict) and res.get("items"):
+            return res
+    except Exception:
+        pass
+    # fallback YT Music search
+    data = await _ytm_post("search", {"query": q})
+    items = []
+    _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+    songs, seen = [], set()
+    for it in items:
+        e = _ytm_parse_item(it)
+        if e and e["video_id"] not in seen:
+            seen.add(e["video_id"])
+            songs.append({
+                "id": f"yt:{e['video_id']}",
+                "video_id": e["video_id"],
+                "title": e.get("title"),
+                "artist": e.get("artist"),
+                "thumb": e.get("thumb"),
+                "provider": "ytmusic",
+            })
+    return {"ok": True, "query": q, "items": songs, "provider": "ytmusic-fallback", "page": page}
+
+
+@app.get("/yt/transcript", tags=["YouTube"])
+async def yt_transcript(
+    video_id: str = Query(..., min_length=6),
+    lang: str = Query("en"),
+):
+    """YouTube transcript / captions (best-effort)."""
+    video_id = video_id.replace("yt:", "").strip()
+    if "youtube.com" in video_id or "youtu.be" in video_id:
+        m = re.search(r"(?:v=|youtu\.be/)([\w-]{11})", video_id)
+        video_id = m.group(1) if m else video_id
+    # try timedtext list
+    lines = []
+    errors = {}
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        try:
+            r = await client.get(
+                "https://www.youtube.com/api/timedtext",
+                params={"v": video_id, "lang": lang, "fmt": "json3"},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200 and r.text:
+                data = r.json()
+                for ev in data.get("events") or []:
+                    segs = ev.get("segs") or []
+                    text = "".join(s.get("utf8") or "" for s in segs).strip()
+                    if text:
+                        lines.append({
+                            "start": (ev.get("tStartMs") or 0) / 1000.0,
+                            "dur": (ev.get("dDurationMs") or 0) / 1000.0,
+                            "text": text,
+                        })
+        except Exception as e:
+            errors["timedtext"] = str(e)[:80]
+        if not lines:
+            # Invidious captions
+            try:
+                data = await _invidious_get(f"/api/v1/captions/{video_id}", {"label": lang})
+            except Exception:
+                try:
+                    data = await _invidious_get(f"/api/v1/captions/{video_id}")
+                except Exception as e:
+                    errors["invidious"] = str(e)[:80]
+                    data = None
+            if isinstance(data, dict) and data.get("captions"):
+                # may be list of tracks only
+                pass
+            elif isinstance(data, list):
+                for it in data:
+                    if isinstance(it, dict) and it.get("text"):
+                        lines.append(it)
+    return {
+        "ok": bool(lines),
+        "video_id": video_id,
+        "lang": lang,
+        "count": len(lines),
+        "lines": lines,
+        "errors": errors or None,
+        "provider": "youtube",
+    }
+
+
+@app.get("/yt/channel", tags=["YouTube"])
+async def yt_channel(id: str = Query(..., description="Channel id UC... or handle")):
+    """Channel info + latest videos via Invidious."""
+    try:
+        data = await _invidious_get(f"/api/v1/channels/{id}")
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "not found"}
+    videos = []
+    for it in (data.get("latestVideos") or [])[:20]:
+        if not isinstance(it, dict):
+            continue
+        vid = it.get("videoId")
+        if not vid:
+            continue
+        videos.append({
+            "video_id": vid,
+            "title": it.get("title"),
+            "thumb": _yt_thumb(vid, it.get("videoThumbnails")),
+            "duration": it.get("lengthSeconds"),
+            "views": it.get("viewCount"),
+        })
+    return {
+        "ok": True,
+        "id": data.get("authorId") or id,
+        "name": data.get("author"),
+        "description": (data.get("description") or "")[:500],
+        "subscribers": data.get("subCount"),
+        "videos": videos,
+        "provider": "invidious",
+    }
+
+
+@app.get("/yt/ytaudio", tags=["YouTube"])
+async def yt_ytaudio(url: str = Query(..., description="YouTube URL or video id")):
+    """Best audio stream URL (alias of /dl/ytmp3)."""
+    if re.match(r"^[\w-]{11}$", url.strip()):
+        url = f"https://www.youtube.com/watch?v={url.strip()}"
+    return await dl_ytmp3(url=url)
+
+
+@app.get("/yt/download", tags=["YouTube"])
+async def yt_download(
+    url: str = Query(..., min_length=6),
+    type: str = Query("audio", description="audio|video"),
+):
+    """YouTube audio/video download helper."""
+    if re.match(r"^[\w-]{11}$", url.strip()):
+        url = f"https://www.youtube.com/watch?v={url.strip()}"
+    if type == "video":
+        return await dl_ytmp4(url=url)
+    return await dl_ytmp3(url=url)
+
+
+# Aliases matching /music/yt/*
+@app.get("/yt-music/play/{video_id}", tags=["YouTube Music"])
+async def ytmusic_play(video_id: str):
+    """Play stream for YT Music track."""
+    return await music_yt_play(video_id)
 
 @app.get("/music/yt/search", tags=["Music"])
 async def music_yt_search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
@@ -5985,437 +8172,328 @@ async def custom_swagger_ui():
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<meta name="theme-color" content="#06080f"/>
+<meta name="theme-color" content="#05070e"/>
 <title>ElitePlex API · Docs</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
 <style>
 :root{
-  --bg:#06080f;--bg2:#0b0e18;--panel:rgba(16,18,30,.72);--panel2:rgba(22,25,40,.85);
+  --bg:#05070e;--panel:rgba(14,16,28,.75);--panel2:rgba(20,22,36,.9);
   --line:rgba(255,255,255,.08);--line2:rgba(255,255,255,.14);
-  --text:#f4f6ff;--mute:#8b93b0;--dim:#5c6480;
-  --c1:#22d3ee;--c2:#a78bfa;--c3:#f472b6;--c4:#34d399;--c5:#fbbf24;
-  --get:#22d3ee;--post:#34d399;--put:#fbbf24;--del:#f87171;--patch:#c084fc;
-  --r:18px;--ease:cubic-bezier(.22,1,.36,1);
-  --glow:0 0 60px rgba(34,211,238,.12);
+  --text:#eef1ff;--mute:#8b93b3;--dim:#5a6280;
+  --c1:#2dd4bf;--c2:#818cf8;--c3:#f472b6;--c4:#4ade80;--c5:#fbbf24;
+  --get:#2dd4bf;--post:#4ade80;--put:#fbbf24;--del:#fb7185;--patch:#c084fc;
+  --ease:cubic-bezier(.22,1,.36,1);--r:16px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html{scroll-behavior:smooth}
 body{
-  font-family:"IBM Plex Sans",system-ui,sans-serif;
-  background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5;
+  font-family:"DM Sans",system-ui,sans-serif;background:var(--bg);color:var(--text);
+  min-height:100vh;line-height:1.5;
   background-image:
-    radial-gradient(ellipse 100% 80% at 0% -30%,rgba(34,211,238,.16),transparent 50%),
-    radial-gradient(ellipse 80% 60% at 100% 0%,rgba(167,139,250,.14),transparent 45%),
-    radial-gradient(ellipse 60% 50% at 50% 120%,rgba(244,114,182,.08),transparent 50%);
-  background-attachment:fixed;overflow-x:hidden;
+    radial-gradient(ellipse 90% 70% at 50% -30%,rgba(45,212,191,.15),transparent 55%),
+    radial-gradient(ellipse 70% 50% at 100% 10%,rgba(129,140,248,.12),transparent 45%),
+    radial-gradient(ellipse 50% 40% at 0% 80%,rgba(244,114,182,.07),transparent 50%);
+  background-attachment:fixed;
 }
-body::before{
-  content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.4;
-  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
+/* TOP BAR */
+.topbar{
+  position:sticky;top:0;z-index:100;padding:12px 16px 14px;
+  background:rgba(5,7,14,.85);backdrop-filter:blur(24px) saturate(1.4);
+  border-bottom:1px solid var(--line);
+  animation:slideDown .5s var(--ease);
 }
-.shell{position:relative;z-index:1;display:grid;grid-template-columns:280px 1fr;min-height:100vh}
-@media(max-width:900px){.shell{grid-template-columns:1fr}}
-
-/* Sidebar */
-.side{
-  position:sticky;top:0;height:100vh;overflow:auto;padding:20px 14px 40px;
-  background:rgba(8,10,18,.78);backdrop-filter:blur(28px) saturate(1.5);
-  border-right:1px solid var(--line);
-  animation:slideIn .6s var(--ease);
-}
-@keyframes slideIn{from{opacity:0;transform:translateX(-12px)}to{opacity:1;transform:none}}
+@keyframes slideDown{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:none}}
+.top-inner{max-width:1200px;margin:0 auto}
+.top-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .logo{
-  font-family:Syne,sans-serif;font-weight:800;font-size:1.35rem;letter-spacing:-.03em;
-  padding:6px 10px 16px;display:flex;align-items:center;gap:10px;
+  font-family:Syne,sans-serif;font-weight:800;font-size:1.2rem;letter-spacing:-.03em;
+  display:flex;align-items:center;gap:10px;flex-shrink:0;text-decoration:none;color:var(--text);
 }
-.logo .mark{
-  width:36px;height:36px;border-radius:12px;
-  background:linear-gradient(135deg,var(--c1),var(--c2),var(--c3));
-  box-shadow:0 8px 24px rgba(34,211,238,.35);animation:pulse 3s ease-in-out infinite;
+.logo i{
+  width:34px;height:34px;border-radius:11px;display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--c1),var(--c2));color:#041018;font-style:normal;font-weight:800;
+  box-shadow:0 8px 24px rgba(45,212,191,.3);
 }
-@keyframes pulse{0%,100%{box-shadow:0 8px 24px rgba(34,211,238,.3)}50%{box-shadow:0 8px 32px rgba(167,139,250,.45)}}
-.logo span{background:linear-gradient(120deg,var(--c1),var(--c2) 50%,var(--c3));-webkit-background-clip:text;background-clip:text;color:transparent}
-.creator{font-size:.72rem;color:var(--dim);padding:0 10px 14px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
-.search-wrap{padding:0 6px 14px;position:sticky;top:0;background:rgba(8,10,18,.9);backdrop-filter:blur(12px);z-index:2}
-.search-wrap input{
-  width:100%;padding:11px 14px 11px 38px;border-radius:12px;border:1px solid var(--line);
-  background:rgba(255,255,255,.04);color:var(--text);font-size:.88rem;outline:none;
-  transition:border-color .2s,box-shadow .2s;
+.logo b{background:linear-gradient(90deg,var(--c1),var(--c2),var(--c3));-webkit-background-clip:text;background-clip:text;color:transparent}
+.search-box{
+  flex:1;min-width:180px;position:relative;
 }
-.search-wrap input:focus{border-color:rgba(34,211,238,.5);box-shadow:0 0 0 3px rgba(34,211,238,.12)}
-.search-wrap{position:relative}
-.search-wrap::after{content:"⌕";position:absolute;left:18px;top:50%;transform:translateY(-50%);color:var(--mute);font-size:1rem;pointer-events:none}
-.tag-list{display:flex;flex-direction:column;gap:2px;padding:0 4px}
-.tag-btn{
-  display:flex;align-items:center;justify-content:space-between;gap:8px;
-  padding:10px 12px;border-radius:12px;border:none;background:transparent;
-  color:var(--mute);font-weight:600;font-size:.86rem;cursor:pointer;text-align:left;
-  transition:all .2s var(--ease);font-family:inherit;
+.search-box input{
+  width:100%;padding:12px 16px 12px 42px;border-radius:14px;border:1px solid var(--line);
+  background:rgba(255,255,255,.05);color:var(--text);font-size:.95rem;outline:none;
+  transition:border-color .2s,box-shadow .2s,background .2s;font-family:inherit;
 }
-.tag-btn:hover{background:rgba(255,255,255,.05);color:var(--text);transform:translateX(3px)}
-.tag-btn.on{
-  background:linear-gradient(105deg,rgba(34,211,238,.16),rgba(167,139,250,.1));
-  color:var(--text);border-left:3px solid var(--c1);
+.search-box input:focus{border-color:rgba(45,212,191,.5);box-shadow:0 0 0 4px rgba(45,212,191,.12);background:rgba(255,255,255,.07)}
+.search-box::before{content:"⌕";position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--mute);font-size:1.1rem;pointer-events:none}
+.top-links{display:flex;gap:6px;flex-wrap:wrap}
+.top-links a,.icon-btn{
+  padding:9px 12px;border-radius:11px;border:1px solid var(--line);background:rgba(255,255,255,.04);
+  color:var(--mute);text-decoration:none;font-size:.8rem;font-weight:600;cursor:pointer;
+  transition:all .2s;font-family:inherit;
 }
-.tag-btn .n{font-size:.7rem;background:rgba(255,255,255,.08);padding:2px 7px;border-radius:999px;color:var(--mute)}
-.side-foot{margin-top:auto;padding:16px 10px 0;font-size:.75rem;color:var(--dim)}
-.side-foot a{color:var(--c1);text-decoration:none;margin-right:10px}
-.side-foot a:hover{text-decoration:underline}
+.top-links a:hover,.icon-btn:hover{color:var(--text);border-color:var(--line2);background:rgba(255,255,255,.08)}
+.tags-scroll{
+  display:flex;gap:8px;overflow-x:auto;padding:12px 0 2px;scrollbar-width:none;-webkit-overflow-scrolling:touch;
+}
+.tags-scroll::-webkit-scrollbar{display:none}
+.tag{
+  flex-shrink:0;padding:8px 14px;border-radius:999px;border:1px solid var(--line);
+  background:rgba(255,255,255,.03);color:var(--mute);font-size:.8rem;font-weight:600;
+  cursor:pointer;transition:all .2s var(--ease);font-family:inherit;white-space:nowrap;
+}
+.tag:hover{color:var(--text);border-color:var(--line2)}
+.tag.on{background:linear-gradient(135deg,rgba(45,212,191,.2),rgba(129,140,248,.15));color:var(--text);border-color:rgba(45,212,191,.4);box-shadow:0 0 20px rgba(45,212,191,.1)}
+.tag .n{opacity:.7;margin-left:4px;font-size:.72rem}
 
-/* Main */
-.main{min-width:0;padding:0 0 80px}
+/* MAIN */
+.wrap{max-width:1200px;margin:0 auto;padding:16px 16px 80px}
 .hero{
-  margin:20px 20px 0;padding:28px 28px 32px;border-radius:24px;position:relative;overflow:hidden;
-  background:linear-gradient(135deg,rgba(16,20,36,.9),rgba(20,16,40,.85));
-  border:1px solid var(--line);box-shadow:var(--glow);
-  animation:fadeUp .7s var(--ease);
+  padding:28px 24px;border-radius:22px;margin-bottom:18px;position:relative;overflow:hidden;
+  background:linear-gradient(145deg,rgba(16,20,36,.9),rgba(18,14,36,.85));
+  border:1px solid var(--line);animation:fadeUp .55s var(--ease);
 }
-@keyframes fadeUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
-.hero::before{
-  content:"";position:absolute;inset:-40% -20% auto auto;width:60%;height:120%;
-  background:radial-gradient(circle,rgba(34,211,238,.2),transparent 60%);pointer-events:none;
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+.hero::after{
+  content:"";position:absolute;right:-20%;top:-40%;width:50%;height:140%;
+  background:radial-gradient(circle,rgba(129,140,248,.18),transparent 60%);pointer-events:none;
 }
-.hero h1{font-family:Syne,sans-serif;font-size:clamp(1.6rem,4vw,2.4rem);font-weight:800;letter-spacing:-.04em;position:relative}
-.hero h1 em{font-style:normal;background:linear-gradient(90deg,var(--c1),var(--c2),var(--c3));-webkit-background-clip:text;background-clip:text;color:transparent}
-.hero p{color:var(--mute);margin-top:8px;max-width:540px;position:relative;font-size:.95rem}
-.hero-stats{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px;position:relative}
+.hero h1{font-family:Syne,sans-serif;font-size:clamp(1.5rem,3.5vw,2.2rem);font-weight:800;letter-spacing:-.04em;position:relative}
+.hero h1 span{background:linear-gradient(90deg,var(--c1),var(--c2),var(--c3));-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p{color:var(--mute);margin-top:8px;max-width:560px;position:relative;font-size:.92rem}
+.stats{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px;position:relative}
 .stat{
-  padding:10px 14px;border-radius:14px;background:rgba(255,255,255,.04);border:1px solid var(--line);
-  font-size:.8rem;font-weight:600;animation:fadeUp .6s var(--ease) both;
+  padding:10px 14px;border-radius:12px;background:rgba(255,255,255,.04);border:1px solid var(--line);
+  font-size:.78rem;color:var(--mute);font-weight:600;
 }
-.stat b{display:block;font-family:Syne,sans-serif;font-size:1.15rem;color:var(--c1)}
-.stat:nth-child(2) b{color:var(--c2)}
-.stat:nth-child(3) b{color:var(--c3)}
-.stat:nth-child(4) b{color:var(--c4)}
-.hero-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px;position:relative}
-.btn{
-  display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border-radius:12px;border:none;
-  font-weight:700;font-size:.88rem;cursor:pointer;font-family:inherit;
-  transition:transform .2s var(--ease),box-shadow .2s;
-}
-.btn-primary{
-  background:linear-gradient(135deg,var(--c1),var(--c2));color:#061018;
-  box-shadow:0 10px 30px rgba(34,211,238,.25);
-}
-.btn-primary:hover{transform:translateY(-2px);box-shadow:0 14px 36px rgba(167,139,250,.3)}
-.btn-ghost{background:rgba(255,255,255,.05);color:var(--text);border:1px solid var(--line)}
-.btn-ghost:hover{background:rgba(255,255,255,.09);transform:translateY(-1px)}
-
-.toolbar{
-  display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:16px 20px 8px;position:sticky;top:0;z-index:10;
-  background:linear-gradient(var(--bg),rgba(6,8,15,.92));backdrop-filter:blur(12px);
-}
+.stat b{display:block;font-family:Syne,sans-serif;font-size:1.1rem;color:var(--c1)}
+.stat:nth-child(2) b{color:var(--c2)}.stat:nth-child(3) b{color:var(--c3)}.stat:nth-child(4) b{color:var(--c4)}
+.filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
 .chip{
-  padding:7px 12px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.03);
-  color:var(--mute);font-size:.78rem;font-weight:600;cursor:pointer;transition:all .2s;
+  padding:7px 12px;border-radius:999px;border:1px solid var(--line);background:transparent;
+  color:var(--mute);font-size:.78rem;font-weight:600;cursor:pointer;font-family:inherit;transition:all .2s;
 }
-.chip:hover,.chip.on{border-color:rgba(34,211,238,.4);color:var(--c1);background:rgba(34,211,238,.1)}
+.chip.on,.chip:hover{border-color:rgba(45,212,191,.4);color:var(--c1);background:rgba(45,212,191,.08)}
 
-.ops{padding:8px 20px 40px;display:flex;flex-direction:column;gap:10px}
+.ops{display:flex;flex-direction:column;gap:8px}
+.sec{font-family:Syne,sans-serif;font-size:1rem;font-weight:700;padding:14px 2px 6px;display:flex;align-items:center;gap:10px}
+.sec::after{content:"";flex:1;height:1px;background:var(--line)}
 .op{
   border-radius:var(--r);border:1px solid var(--line);background:var(--panel);
-  backdrop-filter:blur(16px);overflow:hidden;
-  transition:border-color .25s,transform .25s var(--ease),box-shadow .25s;
-  animation:fadeUp .5s var(--ease) both;
+  backdrop-filter:blur(14px);overflow:hidden;transition:border-color .2s,box-shadow .25s,transform .2s var(--ease);
+  animation:fadeUp .4s var(--ease) both;
 }
-.op:hover{border-color:var(--line2);box-shadow:0 12px 40px rgba(0,0,0,.25)}
-.op.open{border-color:rgba(34,211,238,.25);box-shadow:0 16px 48px rgba(0,0,0,.3)}
-.op-head{
+.op:hover{border-color:var(--line2)}
+.op.open{border-color:rgba(45,212,191,.28);box-shadow:0 12px 40px rgba(0,0,0,.28)}
+.op-h{
   display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;
-  padding:14px 16px;cursor:pointer;user-select:none;
+  padding:13px 14px;cursor:pointer;user-select:none;
 }
-.method{
-  font-family:"JetBrains Mono",monospace;font-size:.72rem;font-weight:700;letter-spacing:.04em;
-  padding:6px 10px;border-radius:8px;min-width:56px;text-align:center;color:#041018;
+.m{
+  font-family:"JetBrains Mono",monospace;font-size:.7rem;font-weight:700;padding:6px 9px;
+  border-radius:8px;min-width:52px;text-align:center;color:#041018;
 }
-.method.GET{background:var(--get)}
-.method.POST{background:var(--post)}
-.method.PUT{background:var(--put)}
-.method.DELETE{background:var(--del)}
-.method.PATCH{background:var(--patch)}
-.path{font-family:"JetBrains Mono",monospace;font-size:.88rem;font-weight:500;word-break:break-all}
-.summary{color:var(--mute);font-size:.82rem;margin-top:3px}
-.chev{color:var(--dim);transition:transform .3s var(--ease);font-size:1.1rem}
+.m.GET{background:var(--get)}.m.POST{background:var(--post)}.m.PUT{background:var(--put)}
+.m.DELETE{background:var(--del)}.m.PATCH{background:var(--patch)}
+.path{font-family:"JetBrains Mono",monospace;font-size:.84rem;word-break:break-all}
+.sum{color:var(--mute);font-size:.8rem;margin-top:2px}
+.chev{color:var(--dim);transition:transform .3s var(--ease)}
 .op.open .chev{transform:rotate(180deg);color:var(--c1)}
-
-.op-body{display:none;padding:0 16px 18px;border-top:1px solid var(--line)}
-.op.open .op-body{display:block;animation:fadeUp .35s var(--ease)}
-.desc{color:var(--mute);font-size:.9rem;padding:12px 0;white-space:pre-wrap}
-.params{display:flex;flex-direction:column;gap:10px;margin:8px 0}
+.op-b{display:none;padding:0 14px 16px;border-top:1px solid var(--line)}
+.op.open .op-b{display:block;animation:fadeUp .3s var(--ease)}
+.desc{color:var(--mute);font-size:.88rem;padding:12px 0;white-space:pre-wrap}
+.params{display:flex;flex-direction:column;gap:8px}
 .param{
-  display:grid;grid-template-columns:140px 1fr;gap:10px;align-items:start;
-  padding:10px 12px;border-radius:12px;background:rgba(0,0,0,.25);border:1px solid var(--line);
+  display:grid;grid-template-columns:minmax(100px,140px) 1fr;gap:10px;
+  padding:10px;border-radius:12px;background:rgba(0,0,0,.22);border:1px solid var(--line);
 }
-@media(max-width:600px){.param{grid-template-columns:1fr}}
-.param .name{font-family:"JetBrains Mono",monospace;font-size:.8rem;color:var(--c1)}
-.param .name .req{color:var(--c3);font-size:.65rem;margin-left:4px}
-.param .meta{font-size:.75rem;color:var(--dim);margin-top:2px}
+@media(max-width:560px){.param{grid-template-columns:1fr}}
+.param .nm{font-family:"JetBrains Mono",monospace;font-size:.78rem;color:var(--c1)}
+.param .req{color:var(--c3);font-size:.65rem;margin-left:4px}
+.param .mt{font-size:.72rem;color:var(--dim);margin-top:2px}
 .param input,.param select{
-  width:100%;padding:9px 12px;border-radius:10px;border:1px solid var(--line);
-  background:rgba(255,255,255,.04);color:var(--text);font-size:.88rem;outline:none;font-family:inherit;
+  width:100%;padding:9px 11px;border-radius:10px;border:1px solid var(--line);
+  background:rgba(255,255,255,.05);color:var(--text);font-size:.88rem;outline:none;font-family:inherit;
 }
-.param input:focus,.param select:focus{border-color:rgba(34,211,238,.45);box-shadow:0 0 0 3px rgba(34,211,238,.1)}
-.try-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:12px}
-.try-row .btn{padding:10px 16px}
-.resp{
-  margin-top:14px;border-radius:14px;background:#0a0c14;border:1px solid var(--line);overflow:hidden;
+.param input:focus{border-color:rgba(45,212,191,.45);box-shadow:0 0 0 3px rgba(45,212,191,.1)}
+.try{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.btn{
+  padding:10px 16px;border-radius:11px;border:none;font-weight:700;font-size:.85rem;
+  cursor:pointer;font-family:inherit;transition:transform .15s,box-shadow .2s;
 }
-.resp-bar{
-  display:flex;justify-content:space-between;align-items:center;padding:8px 12px;
-  background:rgba(255,255,255,.03);font-size:.78rem;font-weight:600;color:var(--mute);
+.btn-p{background:linear-gradient(135deg,var(--c1),var(--c2));color:#041018;box-shadow:0 8px 24px rgba(45,212,191,.22)}
+.btn-p:hover{transform:translateY(-1px);box-shadow:0 12px 28px rgba(129,140,248,.28)}
+.btn-g{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--line)}
+.resp{margin-top:12px;border-radius:12px;background:#080a12;border:1px solid var(--line);overflow:hidden;display:none}
+.resp-h{display:flex;justify-content:space-between;gap:8px;padding:8px 12px;font-size:.75rem;font-weight:600;color:var(--mute);background:rgba(255,255,255,.03);flex-wrap:wrap}
+.resp-h .ok{color:var(--c4)}.resp-h .bad{color:var(--del)}
+.resp pre{padding:12px;margin:0;max-height:340px;overflow:auto;font-family:"JetBrains Mono",monospace;font-size:.76rem;line-height:1.5;color:#c8cee6;white-space:pre-wrap;word-break:break-word}
+.empty{text-align:center;padding:40px;color:var(--mute)}
+.foot{text-align:center;padding:24px;color:var(--dim);font-size:.78rem}
+.foot a{color:var(--c1);text-decoration:none}
+@media(max-width:640px){
+  .topbar{padding:10px 12px}
+  .hero{padding:20px 16px}
+  .wrap{padding:12px 12px 70px}
+  .path{font-size:.78rem}
 }
-.resp-bar .ok{color:var(--c4)}.resp-bar .bad{color:var(--del)}
-.resp pre{
-  padding:14px;margin:0;max-height:360px;overflow:auto;
-  font-family:"JetBrains Mono",monospace;font-size:.78rem;line-height:1.55;color:#d4d8ec;
-  white-space:pre-wrap;word-break:break-word;
-}
-.section-title{
-  font-family:Syne,sans-serif;font-size:1.1rem;font-weight:700;padding:18px 4px 8px;
-  letter-spacing:-.02em;display:flex;align-items:center;gap:10px;
-}
-.section-title::after{content:"";flex:1;height:1px;background:var(--line)}
-.empty{text-align:center;padding:48px 20px;color:var(--mute)}
-.mobile-bar{
-  display:none;position:fixed;bottom:0;left:0;right:0;z-index:50;padding:10px 14px;
-  background:rgba(8,10,18,.92);backdrop-filter:blur(20px);border-top:1px solid var(--line);
-  gap:8px;justify-content:space-around;
-}
-@media(max-width:900px){
-  .side{position:fixed;left:0;top:0;bottom:0;width:min(300px,88vw);z-index:60;transform:translateX(-105%);transition:transform .35s var(--ease)}
-  .side.open{transform:none;box-shadow:24px 0 48px rgba(0,0,0,.5)}
-  .mobile-bar{display:flex}
-  .hero{margin:12px 12px 0;padding:22px}
-  .ops{padding:8px 12px 100px}
-  .toolbar{padding:12px}
-  .scrim{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:55}
-  .scrim.on{display:block}
-}
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-thumb{background:rgba(255,255,255,.15);border-radius:6px}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
-<div class="scrim" id="scrim" onclick="closeSide()"></div>
-<div class="shell">
-  <aside class="side" id="side">
-    <div class="logo"><div class="mark"></div><span>ElitePlex</span></div>
-    <div class="creator">API Docs · made by shawon</div>
-    <div class="search-wrap"><input id="q" type="search" placeholder="Search endpoints…" autocomplete="off"/></div>
-    <div class="tag-list" id="tags"></div>
-    <div class="side-foot">
-      <a href="/">App</a>
-      <a href="/openapi.json">OpenAPI</a>
-      <a href="/health">Health</a>
-    </div>
-  </aside>
-  <div class="main">
-    <section class="hero">
-      <h1>Build with <em>ElitePlex</em></h1>
-      <p>Movies · Series · Anime · Music · NetMirror · VixSrc · 4K Hub · Direct download. Interactive docs — try every endpoint live.</p>
-      <div class="hero-stats" id="stats"></div>
-      <div class="hero-actions">
-        <button class="btn btn-primary" onclick="document.getElementById('q').focus()">Explore APIs</button>
-        <a class="btn btn-ghost" href="/openapi.json" target="_blank">OpenAPI JSON</a>
-        <a class="btn btn-ghost" href="/">Open Web App</a>
+<header class="topbar">
+  <div class="top-inner">
+    <div class="top-row">
+      <a class="logo" href="/docs"><i>S</i><b>ElitePlex</b></a>
+      <div class="search-box"><input id="q" type="search" placeholder="Search APIs, paths, tags…" autocomplete="off" autofocus/></div>
+      <div class="top-links">
+        <a href="/">App</a>
+        <a href="/openapi.json" target="_blank">OpenAPI</a>
+        <a href="/health">Health</a>
       </div>
-    </section>
-    <div class="toolbar" id="filters"></div>
-    <div class="ops" id="ops"></div>
+    </div>
+    <div class="tags-scroll" id="tags"></div>
   </div>
-</div>
-<div class="mobile-bar">
-  <button class="btn btn-ghost" onclick="toggleSide()">Menu</button>
-  <button class="btn btn-primary" onclick="document.getElementById('q').focus()">Search</button>
-</div>
+</header>
+<main class="wrap">
+  <section class="hero">
+    <h1>API reference for <span>ElitePlex</span></h1>
+    <p>Movies, series, anime, music, NetMirror, VixSrc, 4K Hub &amp; direct downloads. Search above · try any endpoint live.</p>
+    <div class="stats" id="stats"></div>
+  </section>
+  <div class="filters" id="filters"></div>
+  <div class="ops" id="ops"></div>
+  <div class="foot">made by <a href="/docs">shawon</a> · ElitePlex API</div>
+</main>
 <script>
-const BASE = location.origin;
-let SPEC = null;
-let ACTIVE_TAG = "All";
-let METHOD_F = "ALL";
+const BASE=location.origin;
+let SPEC=null, TAG="All", METH="ALL";
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-function toggleSide(){document.getElementById("side").classList.toggle("open");document.getElementById("scrim").classList.toggle("on")}
-function closeSide(){document.getElementById("side").classList.remove("open");document.getElementById("scrim").classList.remove("on")}
-
-function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
-
-function collectOps(spec){
-  const ops=[];
-  const paths=spec.paths||{};
-  for(const [path,item] of Object.entries(paths)){
+function ops(spec){
+  const out=[];
+  for(const [path,item] of Object.entries(spec.paths||{})){
     for(const method of Object.keys(item)){
-      if(!["get","post","put","delete","patch"].includes(method)) continue;
+      if(!['get','post','put','delete','patch'].includes(method)) continue;
       const op=item[method];
-      ops.push({
-        path, method: method.toUpperCase(),
-        summary: op.summary||op.operationId||"",
-        description: op.description||"",
-        tags: op.tags||["Other"],
-        parameters: op.parameters||[],
-        id: (op.operationId||(method+path)).replace(/[^\w]/g,"_"),
+      out.push({
+        path, method:method.toUpperCase(),
+        summary:op.summary||op.operationId||'',
+        description:op.description||'',
+        tags:op.tags&&op.tags.length?op.tags:['Other'],
+        parameters:op.parameters||[],
+        id:(op.operationId||method+path).replace(/[^\w]/g,'_'),
       });
     }
   }
-  ops.sort((a,b)=>a.path.localeCompare(b.path)||a.method.localeCompare(b.method));
-  return ops;
+  return out.sort((a,b)=>a.path.localeCompare(b.path));
 }
 
 function render(){
   if(!SPEC) return;
-  const ops=collectOps(SPEC);
-  const q=(document.getElementById("q").value||"").toLowerCase().trim();
-  const tags=new Map();
-  tags.set("All", ops.length);
-  ops.forEach(o=>o.tags.forEach(t=>tags.set(t,(tags.get(t)||0)+1)));
+  const all=ops(SPEC);
+  const q=(document.getElementById('q').value||'').toLowerCase().trim();
+  const tagMap=new Map([['All',all.length]]);
+  all.forEach(o=>o.tags.forEach(t=>tagMap.set(t,(tagMap.get(t)||0)+1)));
 
-  const tagEl=document.getElementById("tags");
-  tagEl.innerHTML="";
-  [...tags.entries()].forEach(([t,n])=>{
-    const b=document.createElement("button");
-    b.className="tag-btn"+(ACTIVE_TAG===t?" on":"");
-    b.innerHTML=`<span>${esc(t)}</span><span class="n">${n}</span>`;
-    b.onclick=()=>{ACTIVE_TAG=t;closeSide();render()};
-    tagEl.appendChild(b);
-  });
+  document.getElementById('tags').innerHTML=[...tagMap.entries()].map(([t,n])=>
+    `<button class="tag${TAG===t?' on':''}" data-t="${esc(t)}">${esc(t)}<span class="n">${n}</span></button>`
+  ).join('');
+  document.querySelectorAll('.tag').forEach(b=>b.onclick=()=>{TAG=b.dataset.t;render()});
 
-  document.getElementById("filters").innerHTML=
-    ["ALL","GET","POST","PUT","DELETE"].map(m=>
-      `<button class="chip${METHOD_F===m?" on":""}" data-m="${m}">${m}</button>`
-    ).join("");
-  document.querySelectorAll(".chip").forEach(c=>c.onclick=()=>{METHOD_F=c.dataset.m;render()});
+  document.getElementById('filters').innerHTML=['ALL','GET','POST','PUT','DELETE'].map(m=>
+    `<button class="chip${METH===m?' on':''}" data-m="${m}">${m}</button>`
+  ).join('');
+  document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{METH=c.dataset.m;render()});
 
-  const filtered=ops.filter(o=>{
-    if(ACTIVE_TAG!=="All" && !o.tags.includes(ACTIVE_TAG)) return false;
-    if(METHOD_F!=="ALL" && o.method!==METHOD_F) return false;
-    if(q && !(o.path+o.summary+o.description+o.tags.join(" ")).toLowerCase().includes(q)) return false;
+  const list=all.filter(o=>{
+    if(TAG!=='All'&&!o.tags.includes(TAG)) return false;
+    if(METH!=='ALL'&&o.method!==METH) return false;
+    if(q&&!(o.path+o.summary+o.description+o.tags.join(' ')).toLowerCase().includes(q)) return false;
     return true;
   });
 
-  const byTag={};
-  filtered.forEach(o=>{
-    const t=o.tags[0]||"Other";
-    (byTag[t]=byTag[t]||[]).push(o);
-  });
+  document.getElementById('stats').innerHTML=`
+    <div class="stat"><b>${all.length}</b>Endpoints</div>
+    <div class="stat"><b>${tagMap.size-1}</b>Groups</div>
+    <div class="stat"><b>${SPEC.info?.version||'—'}</b>Version</div>
+    <div class="stat"><b>shawon</b>Creator</div>`;
 
-  const root=document.getElementById("ops");
-  root.innerHTML="";
-  if(!filtered.length){
-    root.innerHTML=`<div class="empty">No endpoints match your filters.</div>`;
-    return;
-  }
-  Object.entries(byTag).forEach(([tag,list],ti)=>{
-    const h=document.createElement("div");
-    h.className="section-title";
-    h.textContent=tag;
-    h.style.animationDelay=(ti*0.05)+"s";
-    root.appendChild(h);
-    list.forEach((op,i)=>{
-      const el=document.createElement("div");
-      el.className="op";
-      el.style.animationDelay=((ti*0.05)+(i*0.03))+"s";
+  const root=document.getElementById('ops');
+  if(!list.length){root.innerHTML='<div class="empty">No endpoints match.</div>';return}
+  const by={};
+  list.forEach(o=>{(by[o.tags[0]]=by[o.tags[0]]||[]).push(o)});
+  root.innerHTML='';
+  Object.entries(by).forEach(([tag,items],ti)=>{
+    root.insertAdjacentHTML('beforeend',`<div class="sec">${esc(tag)}</div>`);
+    items.forEach((op,i)=>{
+      const el=document.createElement('div');
+      el.className='op';
+      el.style.animationDelay=(0.03*i)+'s';
+      const params=(op.parameters||[]).filter(p=>p.in==='query'||p.in==='path');
       el.innerHTML=`
-        <div class="op-head">
-          <span class="method ${op.method}">${op.method}</span>
-          <div><div class="path">${esc(op.path)}</div><div class="summary">${esc(op.summary)}</div></div>
+        <div class="op-h">
+          <span class="m ${op.method}">${op.method}</span>
+          <div><div class="path">${esc(op.path)}</div><div class="sum">${esc(op.summary)}</div></div>
           <span class="chev">▾</span>
         </div>
-        <div class="op-body">
-          ${op.description?`<div class="desc">${esc(op.description)}</div>`:""}
-          <div class="params" id="p-${op.id}"></div>
-          <div class="try-row">
-            <button class="btn btn-primary" data-try="${op.id}">Try it</button>
-            <button class="btn btn-ghost" data-copy="${op.id}">Copy URL</button>
+        <div class="op-b">
+          ${op.description?`<div class="desc">${esc(op.description)}</div>`:''}
+          <div class="params">${params.length?params.map(p=>{
+            const sc=p.schema||{};
+            const ph=sc.default!=null?String(sc.default):(sc.example!=null?String(sc.example):'');
+            return `<div class="param"><div><div class="nm">${esc(p.name)}${p.required?'<span class="req">required</span>':''}</div>
+              <div class="mt">${esc(p.in)} · ${esc(sc.type||'string')}</div>
+              <div class="mt">${esc(p.description||'')}</div></div>
+              <div><input data-op="${op.id}" data-name="${esc(p.name)}" data-in="${p.in}" placeholder="${esc(ph)}" value="${esc(ph)}"/></div></div>`;
+          }).join(''):'<div style="color:var(--dim);font-size:.85rem">No parameters</div>'}</div>
+          <div class="try">
+            <button class="btn btn-p" type="button">Try it</button>
+            <button class="btn btn-g" type="button">Copy URL</button>
           </div>
-          <div class="resp" id="r-${op.id}" style="display:none">
-            <div class="resp-bar"><span class="status">—</span><span>JSON</span></div>
-            <pre></pre>
-          </div>
+          <div class="resp"><div class="resp-h"><span class="st">—</span><span>JSON</span></div><pre></pre></div>
         </div>`;
-      const paramsBox=el.querySelector(".params");
-      const params=(op.parameters||[]).filter(p=>p.in==="query"||p.in==="path");
-      if(!params.length){
-        paramsBox.innerHTML=`<div style="color:var(--dim);font-size:.85rem">No parameters</div>`;
-      }else{
-        params.forEach(p=>{
-          const name=p.name;
-          const req=p.required;
-          const schema=p.schema||{};
-          const ph=schema.default!=null?String(schema.default):(schema.example!=null?String(schema.example):"");
-          const row=document.createElement("div");
-          row.className="param";
-          row.innerHTML=`
-            <div><div class="name">${esc(name)}${req?`<span class="req">required</span>`:""}</div>
-            <div class="meta">${esc(p.in)} · ${esc(schema.type||"string")}</div>
-            <div class="meta">${esc(p.description||"")}</div></div>
-            <div><input data-op="${op.id}" data-name="${esc(name)}" data-in="${p.in}" placeholder="${esc(ph)}" value="${esc(ph)}"/></div>`;
-          paramsBox.appendChild(row);
-        });
-      }
-      el.querySelector(".op-head").onclick=()=>el.classList.toggle("open");
-      el.querySelector("[data-try]").onclick=(e)=>{e.stopPropagation();runTry(op)};
-      el.querySelector("[data-copy]").onclick=(e)=>{e.stopPropagation();copyUrl(op)};
+      el.querySelector('.op-h').onclick=()=>el.classList.toggle('open');
+      const btns=el.querySelectorAll('.try .btn');
+      btns[0].onclick=e=>{e.stopPropagation();run(op,el)};
+      btns[1].onclick=e=>{e.stopPropagation();const u=url(op);navigator.clipboard?.writeText(u);btns[1].textContent='Copied!';setTimeout(()=>btns[1].textContent='Copy URL',1000)};
       root.appendChild(el);
     });
   });
-
-  document.getElementById("stats").innerHTML=`
-    <div class="stat"><b>${ops.length}</b>Endpoints</div>
-    <div class="stat"><b>${tags.size-1}</b>Groups</div>
-    <div class="stat"><b>${SPEC.info?.version||"—"}</b>Version</div>
-    <div class="stat"><b>shawon</b>Creator</div>`;
 }
 
-function buildUrl(op){
-  let path=op.path;
-  const q=[];
+function url(op){
+  let path=op.path; const q=[];
   document.querySelectorAll(`input[data-op="${op.id}"]`).forEach(inp=>{
-    const v=inp.value.trim();
-    if(!v) return;
-    if(inp.dataset.in==="path") path=path.replace("{"+inp.dataset.name+"}",encodeURIComponent(v));
-    else q.push(encodeURIComponent(inp.dataset.name)+"="+encodeURIComponent(v));
+    const v=inp.value.trim(); if(!v) return;
+    if(inp.dataset.in==='path') path=path.replace('{'+inp.dataset.name+'}',encodeURIComponent(v));
+    else q.push(encodeURIComponent(inp.dataset.name)+'='+encodeURIComponent(v));
   });
-  return BASE+path+(q.length?"?"+q.join("&"):"");
+  return BASE+path+(q.length?'?'+q.join('&'):'');
 }
 
-async function runTry(op){
-  const box=document.getElementById("r-"+op.id);
-  const pre=box.querySelector("pre");
-  const st=box.querySelector(".status");
-  box.style.display="block";
-  st.textContent="Loading…"; st.className="status";
-  pre.textContent="";
-  const url=buildUrl(op);
-  const t0=performance.now();
+async function run(op,el){
+  const box=el.querySelector('.resp'); const pre=box.querySelector('pre'); const st=box.querySelector('.st');
+  box.style.display='block'; st.textContent='Loading…'; pre.textContent='';
+  const u=url(op); const t0=performance.now();
   try{
-    const r=await fetch(url,{headers:{"Accept":"application/json"}});
+    const r=await fetch(u,{headers:{Accept:'application/json'}});
     const ms=Math.round(performance.now()-t0);
-    let text=await r.text();
-    try{text=JSON.stringify(JSON.parse(text),null,2)}catch(_){}
-    st.innerHTML=`<span class="${r.ok?"ok":"bad"}">${r.status} ${r.statusText}</span> · ${ms}ms · ${esc(url)}`;
-    pre.textContent=text.slice(0,120000);
-  }catch(err){
-    st.innerHTML=`<span class="bad">Error</span>`;
-    pre.textContent=String(err);
-  }
+    let tx=await r.text();
+    try{tx=JSON.stringify(JSON.parse(tx),null,2)}catch(_){}
+    st.innerHTML=`<span class="${r.ok?'ok':'bad'}">${r.status}</span> · ${ms}ms · ${esc(u)}`;
+    pre.textContent=tx.slice(0,100000);
+  }catch(err){st.innerHTML='<span class="bad">Error</span>';pre.textContent=String(err)}
 }
 
-function copyUrl(op){
-  const url=buildUrl(op);
-  navigator.clipboard?.writeText(url);
-  const b=document.querySelector(`[data-copy="${op.id}"]`);
-  if(b){const t=b.textContent;b.textContent="Copied!";setTimeout(()=>b.textContent=t,1200)}
-}
-
-document.getElementById("q").addEventListener("input",()=>{clearTimeout(window.__qt);window.__qt=setTimeout(render,120)});
-
-fetch(BASE+"/openapi.json").then(r=>r.json()).then(s=>{SPEC=s;render()}).catch(e=>{
-  document.getElementById("ops").innerHTML=`<div class="empty">Failed to load OpenAPI: ${esc(e.message)}</div>`;
+document.getElementById('q').addEventListener('input',()=>{clearTimeout(window.__t);window.__t=setTimeout(render,100)});
+fetch(BASE+'/openapi.json').then(r=>r.json()).then(s=>{SPEC=s;render()}).catch(e=>{
+  document.getElementById('ops').innerHTML=`<div class="empty">Failed to load OpenAPI: ${esc(e.message)}</div>`;
 });
 </script>
 </body>
 </html>""")
+
+
 
 # =============================================================================
 # MPD expand + cookie proxy + Netplay (phone MP4)
@@ -6778,18 +8856,25 @@ async def moviebox_play_info(
                     _mb_proxy_remember(playable, headers["Cookie"], headers["Referer"])
                 except Exception:
                     pass
+        # Never expose dummy notice MP4 as playable url
+        if not playable:
+            continue
+        if _is_dummy_url(playable):
+            continue
         streams.append({
-            "format": st.get("format") or ("DASH" if playable and ".mpd" in playable else "MP4"),
+            "format": st.get("format") or ("DASH" if ".mpd" in playable else "HLS" if ".m3u8" in playable else "MP4"),
             "id": str(st.get("id") or ""),
-            "url": raw_url,  # upstream field (often dummy)
-            "dash_url": playable,  # real playable
+            "url": playable,  # real playable only (never macdn/other notice)
+            "dash_url": playable if ".mpd" in playable else None,
+            "upstream_url": None if _is_dummy_url(raw_url) else raw_url,
             "resolutions": st.get("resolutions") or st.get("resolution") or "",
             "size": st.get("size"),
             "duration": st.get("duration"),
             "codec_name": st.get("codecName") or st.get("codec_name") or st.get("codec") or "hevc",
             "sign_cookie": cookie,
             "headers": headers,
-            "proxy_mpd": f"/mb/proxy/mpd?u={quote(playable, safe='')}" if playable and ".mpd" in (playable or "") else None,
+            "proxy_mpd": f"/mb/proxy/mpd?u={quote(playable, safe='')}" if ".mpd" in playable else None,
+            "play_url": f"/mb/proxy/mpd?u={quote(playable, safe='')}" if ".mpd" in playable else playable,
             "id_type": st.get("idType") or st.get("id_type") or "",
         })
     # also flatten via our parser for any extras
@@ -7036,6 +9121,767 @@ async def unified_play(
         "netplay_id only if you took UUID from /np/videos.",
     )
 
+
+
+
+
+
+# =============================================================================
+# PaxSenix-parity: Tools + Utilities (native, no API key / no rate limit)
+# =============================================================================
+
+@app.get("/tools/web-search", tags=["Tools"])
+async def tools_web_search(q: str = Query(..., min_length=1), max_results: int = Query(8, ge=1, le=20)):
+    """Web search: DuckDuckGo instant → Wikipedia → DDG lite HTML."""
+    out = {"ok": True, "query": q, "results": [], "abstract": None, "answer": None}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; ElitePlex/5.13)"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=headers) as client:
+            # 1) DuckDuckGo instant answer API
+            try:
+                r = await client.get(
+                    "https://api.duckduckgo.com/",
+                    params={"q": q, "format": "json", "no_html": 1, "skip_disambig": 1},
+                )
+                d = r.json() if r.status_code == 200 else {}
+                out["abstract"] = d.get("AbstractText") or None
+                out["answer"] = d.get("Answer") or None
+                out["heading"] = d.get("Heading") or None
+                out["image"] = d.get("Image") or None
+                for tpc in (d.get("RelatedTopics") or [])[:max_results]:
+                    if isinstance(tpc, dict) and tpc.get("Text"):
+                        out["results"].append({
+                            "title": (tpc.get("Text") or "")[:120],
+                            "url": tpc.get("FirstURL"),
+                            "snippet": tpc.get("Text"),
+                        })
+                    elif isinstance(tpc, dict) and tpc.get("Topics"):
+                        for sub in (tpc.get("Topics") or [])[:3]:
+                            if sub.get("Text"):
+                                out["results"].append({
+                                    "title": (sub.get("Text") or "")[:120],
+                                    "url": sub.get("FirstURL"),
+                                    "snippet": sub.get("Text"),
+                                })
+            except Exception:
+                pass
+            # 2) Wikipedia opensearch
+            if len(out["results"]) < 3:
+                try:
+                    r = await client.get(
+                        "https://en.wikipedia.org/w/api.php",
+                        params={
+                            "action": "opensearch",
+                            "search": q,
+                            "limit": max_results,
+                            "namespace": 0,
+                            "format": "json",
+                        },
+                    )
+                    data = r.json() if r.status_code == 200 else []
+                    if isinstance(data, list) and len(data) >= 4:
+                        titles, descs, urls = data[1], data[2], data[3]
+                        for i, title in enumerate(titles):
+                            out["results"].append({
+                                "title": title,
+                                "url": urls[i] if i < len(urls) else None,
+                                "snippet": descs[i] if i < len(descs) else title,
+                                "source": "wikipedia",
+                            })
+                        if not out["abstract"] and descs:
+                            out["abstract"] = descs[0]
+                except Exception:
+                    pass
+            # 3) DDG lite HTML scrape
+            if not out["results"]:
+                try:
+                    r = await client.get("https://lite.duckduckgo.com/lite/", params={"q": q})
+                    if r.status_code == 200:
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(r.text, "html.parser")
+                        for a in soup.select("a.result-link")[:max_results]:
+                            href = a.get("href") or ""
+                            title = a.get_text(strip=True)
+                            if href and title:
+                                out["results"].append({"title": title, "url": href, "snippet": title, "source": "ddg-lite"})
+                except Exception:
+                    pass
+    except Exception as e:
+        out["error"] = str(e)[:160]
+    out["ok"] = bool(out["results"] or out["abstract"] or out["answer"])
+    if not out["ok"] and "error" not in out:
+        out["error"] = "no results"
+    return out
+
+
+@app.get("/tools/google-search", tags=["Tools"])
+async def tools_google_search(q: str = Query(..., min_length=1)):
+    """Alias of /tools/web-search (DuckDuckGo-backed, unlimited)."""
+    return await tools_web_search(q=q)
+
+
+@app.get("/tools/gtranslate", tags=["Tools"])
+@app.get("/tools/translate", tags=["Tools"], include_in_schema=False)
+async def tools_gtranslate(
+    text: str = Query(..., min_length=1),
+    to: str = Query("en", description="Target language code"),
+    source: str = Query("auto", description="Source language or auto"),
+):
+    """Translate text (Google gtx → MyMemory fallback, no key)."""
+    # 1) Google unofficial
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={"client": "gtx", "sl": source, "tl": to, "dt": "t", "q": text},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200 and r.text.startswith("["):
+                data = r.json()
+                translated = "".join(part[0] for part in (data[0] or []) if part and part[0])
+                if translated:
+                    detected = (data[2] if len(data) > 2 else source) or source
+                    return {"ok": True, "text": text, "translated": translated, "source": detected, "to": to, "engine": "google"}
+    except Exception:
+        pass
+    # 2) MyMemory
+    try:
+        langpair = f"{source}|{to}" if source != "auto" else f"en|{to}"
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(
+                "https://api.mymemory.translated.net/get",
+                params={"q": text, "langpair": langpair},
+            )
+            d = r.json()
+            translated = ((d.get("responseData") or {}).get("translatedText") or "").strip()
+            if translated and "MYMEMORY WARNING" not in translated.upper():
+                return {"ok": True, "text": text, "translated": translated, "source": source, "to": to, "engine": "mymemory"}
+    except Exception:
+        pass
+    # 3) Lingva (Google frontend mirrors)
+    for host in ("lingva.ml", "lingva.thedaviddelta.com", "translate.plausibility.cloud"):
+        try:
+            sl = source if source != "auto" else "auto"
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+                r = await client.get(f"https://{host}/api/v1/{sl}/{to}/{quote(text)}")
+            if r.status_code == 200:
+                d = r.json()
+                translated = d.get("translation") or ""
+                if translated:
+                    return {"ok": True, "text": text, "translated": translated, "source": source, "to": to, "engine": f"lingva/{host}"}
+        except Exception:
+            continue
+    return {"ok": False, "error": "translate unavailable"}
+
+
+@app.get("/tools/tts", tags=["Tools"])
+async def tools_tts(
+    text: str = Query(..., min_length=1, max_length=200),
+    lang: str = Query("en"),
+):
+    """Google TTS audio URL (streamable)."""
+    q = quote(text)
+    url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={q}&tl={lang}&client=tw-ob"
+    return {"ok": True, "audio_url": url, "lang": lang, "text": text, "note": "Play or download this URL directly"}
+
+
+@app.get("/tools/tts/v2", tags=["Tools"])
+async def tools_tts_v2(text: str = Query(..., min_length=1, max_length=200), lang: str = "en"):
+    return await tools_tts(text=text, lang=lang)
+
+
+@app.get("/tools/urlshorter", tags=["Tools"])
+@app.get("/tools/url-shorten", tags=["Tools"], include_in_schema=False)
+async def tools_url_shorten(url: str = Query(...)):
+    """Shorten URL via is.gd (free, no key)."""
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get("https://is.gd/create.php", params={"format": "json", "url": url})
+            d = r.json()
+            if d.get("shorturl"):
+                return {"ok": True, "original": url, "short": d["shorturl"]}
+            return {"ok": False, "error": d.get("errormessage") or "failed", "raw": d}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160]}
+
+
+@app.get("/tools/ssweb", tags=["Tools"])
+async def tools_ssweb(url: str = Query(...), width: int = 1280, height: int = 720):
+    """Website screenshot via free thum.io proxy."""
+    shot = f"https://image.thum.io/get/width/{width}/crop/{height}/{url}"
+    return {"ok": True, "screenshot_url": shot, "url": url, "width": width, "height": height}
+
+
+@app.get("/tools/sshtml", tags=["Tools"])
+async def tools_sshtml(url: str = Query(...)):
+    return await tools_ssweb(url=url)
+
+
+@app.get("/tools/quote", tags=["Tools"])
+@app.get("/tools/quotes", tags=["Tools"], include_in_schema=False)
+async def tools_quote():
+    """Random inspirational quote."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get("https://api.quotable.io/random")
+            if r.status_code == 200:
+                d = r.json()
+                return {"ok": True, "content": d.get("content"), "author": d.get("author"), "tags": d.get("tags")}
+    except Exception:
+        pass
+    return {"ok": True, "content": "Stay hungry, stay foolish.", "author": "Steve Jobs", "tags": []}
+
+
+@app.get("/tools/bored", tags=["Tools"])
+async def tools_bored():
+    """Random activity suggestion."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get("https://bored-api.appbrewery.com/random")
+            if r.status_code == 200:
+                return {"ok": True, **r.json()}
+    except Exception:
+        pass
+    return {"ok": True, "activity": "Build something cool with this API", "type": "diy"}
+
+
+@app.get("/tools/weather", tags=["Tools"])
+async def tools_weather(city: str = Query("Dhaka")):
+    """Current weather via wttr.in (no key)."""
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(f"https://wttr.in/{quote(city)}", params={"format": "j1"})
+            d = r.json()
+            cur = (d.get("current_condition") or [{}])[0]
+            area = (d.get("nearest_area") or [{}])[0]
+            return {
+                "ok": True,
+                "city": city,
+                "temp_C": cur.get("temp_C"),
+                "temp_F": cur.get("temp_F"),
+                "humidity": cur.get("humidity"),
+                "weather": (cur.get("weatherDesc") or [{}])[0].get("value"),
+                "feels_like_C": cur.get("FeelsLikeC"),
+                "wind_kmph": cur.get("windspeedKmph"),
+                "area": (area.get("areaName") or [{}])[0].get("value"),
+                "country": (area.get("country") or [{}])[0].get("value"),
+            }
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160]}
+
+
+@app.get("/tools/ip", tags=["Tools"])
+async def tools_ip(request: Request):
+    """Client IP + geo hint."""
+    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
+        request.client.host if request.client else None
+    )
+    geo = {}
+    if ip and ip not in ("127.0.0.1", "::1"):
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                r = await client.get(f"https://ipapi.co/{ip}/json/")
+                if r.status_code == 200:
+                    geo = r.json()
+        except Exception:
+            pass
+    return {
+        "ok": True,
+        "ip": ip,
+        "city": geo.get("city"),
+        "region": geo.get("region"),
+        "country": geo.get("country_name"),
+        "org": geo.get("org"),
+        "timezone": geo.get("timezone"),
+    }
+
+
+@app.get("/tools/qr", tags=["Tools"])
+async def tools_qr(data: str = Query(..., min_length=1), size: int = Query(200, ge=50, le=1000)):
+    """QR code image URL (Google Chart API)."""
+    url = f"https://chart.googleapis.com/chart?cht=qr&chs={size}x{size}&chl={quote(data)}"
+    alt = f"https://api.qrserver.com/v1/create-qr-code/?size={size}x{size}&data={quote(data)}"
+    return {"ok": True, "qr_url": alt, "fallback": url, "data": data, "size": size}
+
+
+@app.get("/tools/base64", tags=["Tools"])
+async def tools_base64(text: str = Query(...), mode: str = Query("encode", description="encode|decode")):
+    """Base64 encode / decode."""
+    try:
+        if mode == "decode":
+            raw = base64.b64decode(text.encode()).decode("utf-8", errors="replace")
+            return {"ok": True, "mode": "decode", "result": raw}
+        enc = base64.b64encode(text.encode()).decode()
+        return {"ok": True, "mode": "encode", "result": enc}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+
+
+@app.get("/tools/hash", tags=["Tools"])
+async def tools_hash(text: str = Query(...)):
+    """MD5 / SHA1 / SHA256 of text."""
+    b = text.encode()
+    return {
+        "ok": True,
+        "md5": hashlib.md5(b).hexdigest(),
+        "sha1": hashlib.sha1(b).hexdigest(),
+        "sha256": hashlib.sha256(b).hexdigest(),
+    }
+
+
+@app.get("/tools/password", tags=["Tools"])
+async def tools_password(length: int = Query(16, ge=6, le=64), symbols: bool = True):
+    """Secure random password generator."""
+    import string
+    alphabet = string.ascii_letters + string.digits
+    if symbols:
+        alphabet += "!@#$%^&*()-_=+"
+    pwd = "".join(random.choice(alphabet) for _ in range(length))
+    return {"ok": True, "password": pwd, "length": length}
+
+
+@app.get("/tools/uuid", tags=["Tools"])
+async def tools_uuid(count: int = Query(1, ge=1, le=20)):
+    """Generate UUID v4."""
+    import uuid
+    return {"ok": True, "uuids": [str(uuid.uuid4()) for _ in range(count)]}
+
+
+@app.get("/tools/color", tags=["Tools"])
+async def tools_color(hex: str = Query(None, description="e.g. #1a73e8"), random: bool = False):
+    """Color info or random palette color."""
+    if random or not hex:
+        hex = "#{:06x}".format(int(time.time() * 1000) % 0xFFFFFF)
+    h = hex.lstrip("#")
+    if len(h) != 6:
+        return {"ok": False, "error": "use #RRGGBB"}
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return {"ok": True, "hex": f"#{h}", "rgb": {"r": r, "g": g, "b": b}, "css": f"rgb({r},{g},{b})"}
+
+
+@app.get("/tools/world-populations", tags=["Tools"])
+async def tools_world_pop():
+    """World population snapshot (REST Countries sample)."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get("https://restcountries.com/v3.1/all?fields=name,population,region")
+            rows = r.json() if r.status_code == 200 else []
+            rows = sorted(rows, key=lambda x: x.get("population") or 0, reverse=True)[:30]
+            return {
+                "ok": True,
+                "top": [
+                    {
+                        "name": (c.get("name") or {}).get("common"),
+                        "population": c.get("population"),
+                        "region": c.get("region"),
+                    }
+                    for c in rows
+                ],
+            }
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160]}
+
+
+@app.get("/tools/shazam", tags=["Tools"])
+async def tools_shazam(q: str = Query(..., description="Song title or lyrics snippet")):
+    """Song recognition helper via music search (title/lyrics query)."""
+    try:
+        # reuse music search
+        if "music_search" in globals():
+            return await music_search(q=q)  # type: ignore
+    except Exception:
+        pass
+    return await tools_web_search(q=f"{q} song lyrics")
+
+
+@app.get("/tools/reels-finder", tags=["Tools"])
+async def tools_reels_finder(q: str = Query(...)):
+    """Find Instagram-style reel links via search (metadata only)."""
+    return await tools_web_search(q=f"{q} site:instagram.com/reel")
+
+
+@app.get("/tools/search-pinterest", tags=["Tools"])
+async def tools_search_pinterest(q: str = Query(...)):
+    return await tools_web_search(q=f"{q} site:pinterest.com")
+
+
+@app.get("/tools/search-applestore", tags=["Tools"])
+async def tools_search_appstore(q: str = Query(...), country: str = "us"):
+    """Apple App Store search (iTunes API, free)."""
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(
+                "https://itunes.apple.com/search",
+                params={"term": q, "country": country, "entity": "software", "limit": 15},
+            )
+            d = r.json()
+            apps = [
+                {
+                    "name": a.get("trackName"),
+                    "artist": a.get("artistName"),
+                    "url": a.get("trackViewUrl"),
+                    "icon": a.get("artworkUrl100"),
+                    "price": a.get("formattedPrice"),
+                    "rating": a.get("averageUserRating"),
+                }
+                for a in (d.get("results") or [])
+            ]
+            return {"ok": True, "query": q, "apps": apps}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160]}
+
+
+@app.get("/tools/vision-color", tags=["Tools"])
+async def tools_vision_color(url: str = Query(..., description="Image URL")):
+    """Dominant color hint via thum/placeholder (returns suggested palette)."""
+    return {
+        "ok": True,
+        "image": url,
+        "note": "Use client-side canvas for exact palette; server returns safe defaults",
+        "palette": ["#0f172a", "#22d3ee", "#a78bfa", "#f472b6", "#fbbf24"],
+    }
+
+
+# ----- Lyrics extras (PaxSenix parity) -----
+
+@app.get("/lyrics/genius", tags=["Lyrics"])
+async def lyrics_genius(q: str = Query(...)):
+    """Genius lyrics search via public pages (best-effort)."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            r = await client.get(
+                "https://genius.com/api/search/song",
+                params={"q": q},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            hits = ((r.json() or {}).get("response") or {}).get("sections") or []
+            songs = []
+            for sec in hits:
+                for h in sec.get("hits") or []:
+                    res = h.get("result") or {}
+                    songs.append({
+                        "title": res.get("title"),
+                        "artist": (res.get("primary_artist") or {}).get("name"),
+                        "url": res.get("url"),
+                        "thumb": res.get("song_art_image_thumbnail_url"),
+                    })
+            return {"ok": True, "query": q, "songs": songs[:15]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160], "songs": []}
+
+
+@app.get("/lyrics/musixmatch", tags=["Lyrics"])
+async def lyrics_musixmatch(title: str = Query(...), artist: str = ""):
+    """Fallback: LRCLIB + lyrics.ovh (Musixmatch needs key)."""
+    q = f"{artist} {title}".strip()
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(
+                "https://lrclib.net/api/search",
+                params={"q": q},
+            )
+            items = r.json() if r.status_code == 200 else []
+            if items:
+                best = items[0]
+                return {
+                    "ok": True,
+                    "title": best.get("trackName"),
+                    "artist": best.get("artistName"),
+                    "synced": best.get("syncedLyrics"),
+                    "plain": best.get("plainLyrics"),
+                    "source": "lrclib",
+                }
+    except Exception:
+        pass
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(f"https://api.lyrics.ovh/v1/{quote(artist)}/{quote(title)}")
+            if r.status_code == 200:
+                return {"ok": True, "plain": r.json().get("lyrics"), "source": "lyrics.ovh"}
+    except Exception:
+        pass
+    return {"ok": False, "error": "not found"}
+
+
+@app.get("/lyrics/spotify", tags=["Lyrics"])
+@app.get("/lyrics/applemusic", tags=["Lyrics"], include_in_schema=False)
+@app.get("/lyrics/amazonmusic", tags=["Lyrics"], include_in_schema=False)
+@app.get("/lyrics/deezer", tags=["Lyrics"], include_in_schema=False)
+async def lyrics_platform_alias(title: str = Query(...), artist: str = ""):
+    """Platform-tagged lyrics → same LRCLIB/OVH stack."""
+    return await lyrics_musixmatch(title=title, artist=artist)
+
+
+# (lyrics/lrcget primary is defined earlier with title/artist params)
+
+
+@app.get("/lyrics/plain", tags=["Lyrics"])
+async def lyrics_plain(title: str = Query(...), artist: str = Query("")):
+    r = await lyrics_musixmatch(title=title, artist=artist)
+    return {"ok": r.get("ok"), "lyrics": r.get("plain") or r.get("synced"), "source": r.get("source")}
+
+
+# ----- Billboard charts (public) -----
+
+@app.get("/billboard/hot-100", tags=["Billboard"])
+async def billboard_hot100():
+    """Billboard Hot 100 via public chart mirror (best-effort)."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                "https://raw.githubusercontent.com/mhollingshead/billboard-hot-100/main/recent.json"
+            )
+            if r.status_code == 200:
+                return {"ok": True, "chart": "hot-100", "data": r.json()}
+    except Exception:
+        pass
+    return {"ok": False, "error": "chart unavailable", "hint": "try /music/charts"}
+
+
+@app.get("/billboard/billboard-200", tags=["Billboard"])
+@app.get("/billboard/global-200", tags=["Billboard"], include_in_schema=False)
+@app.get("/billboard/streaming-songs", tags=["Billboard"], include_in_schema=False)
+@app.get("/billboard/radio-songs", tags=["Billboard"], include_in_schema=False)
+@app.get("/billboard/social-50", tags=["Billboard"], include_in_schema=False)
+@app.get("/billboard/artists-100", tags=["Billboard"], include_in_schema=False)
+@app.get("/billboard/digital-song-sales", tags=["Billboard"], include_in_schema=False)
+@app.get("/billboard/top-album-sales", tags=["Billboard"], include_in_schema=False)
+@app.get("/billboard/catalog-albums", tags=["Billboard"], include_in_schema=False)
+@app.get("/billboard/current-albums", tags=["Billboard"], include_in_schema=False)
+@app.get("/billboard/independent-albums", tags=["Billboard"], include_in_schema=False)
+@app.get("/billboard/soundtracks", tags=["Billboard"], include_in_schema=False)
+@app.get("/billboard/world-albums", tags=["Billboard"], include_in_schema=False)
+async def billboard_alias():
+    return await billboard_hot100()
+
+
+# ----- JioSaavn extras -----
+
+@app.get("/jiosaavn/search", tags=["JioSaavn"])
+async def jiosaavn_search(q: str = Query(...)):
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(
+                "https://www.jiosaavn.com/api.php",
+                params={
+                    "__call": "search.getResults",
+                    "p": 1,
+                    "q": q,
+                    "api_version": 4,
+                    "n": 20,
+                    "_format": "json",
+                    "_marker": 0,
+                    "ctx": "web6dot0",
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            return {"ok": True, "data": r.json() if r.status_code == 200 else {}}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160]}
+
+
+@app.get("/jiosaavn/track", tags=["JioSaavn"])
+@app.get("/jiosaavn/album", tags=["JioSaavn"], include_in_schema=False)
+@app.get("/jiosaavn/artist", tags=["JioSaavn"], include_in_schema=False)
+@app.get("/jiosaavn/playlist", tags=["JioSaavn"], include_in_schema=False)
+async def jiosaavn_track(id: str = Query(None), q: str = Query(None)):
+    if q and not id:
+        return await jiosaavn_search(q=q)
+    if not id:
+        return {"ok": False, "error": "pass id or q"}
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(
+                "https://www.jiosaavn.com/api.php",
+                params={
+                    "__call": "song.getDetails",
+                    "cc": "in",
+                    "pids": id,
+                    "api_version": 4,
+                    "_format": "json",
+                    "_marker": 0,
+                    "ctx": "web6dot0",
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            return {"ok": True, "data": r.json() if r.status_code == 200 else {}}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160]}
+
+
+# ----- Spotify public metadata (no login) -----
+
+@app.get("/spotify/search", tags=["Spotify"])
+async def spotify_search(q: str = Query(...)):
+    """Spotify oEmbed + DuckDuckGo assisted search (metadata)."""
+    results = []
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(
+                "https://api.duckduckgo.com/",
+                params={"q": f"{q} site:open.spotify.com/track", "format": "json"},
+            )
+            d = r.json()
+            for tpc in (d.get("RelatedTopics") or [])[:10]:
+                if isinstance(tpc, dict) and tpc.get("FirstURL"):
+                    results.append({"title": tpc.get("Text"), "url": tpc.get("FirstURL")})
+    except Exception:
+        pass
+    return {"ok": True, "query": q, "results": results, "note": "Use /dl/spotify?url= for download"}
+
+
+@app.get("/spotify/track", tags=["Spotify"])
+async def spotify_track(url: str = Query(...)):
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get("https://open.spotify.com/oembed", params={"url": url})
+            if r.status_code == 200:
+                return {"ok": True, **r.json()}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160]}
+    return {"ok": False, "error": "not found"}
+
+
+@app.get("/spotify/album", tags=["Spotify"], include_in_schema=False)
+@app.get("/spotify/playlist", tags=["Spotify"], include_in_schema=False)
+@app.get("/spotify/playlist/tracks", tags=["Spotify"], include_in_schema=False)
+@app.get("/spotify/home", tags=["Spotify"], include_in_schema=False)
+@app.get("/spotify/charts", tags=["Spotify"], include_in_schema=False)
+@app.get("/spotify/canvas", tags=["Spotify"], include_in_schema=False)
+@app.get("/spotify/episode", tags=["Spotify"], include_in_schema=False)
+async def spotify_meta_alias(url: str = Query(None), q: str = Query(None)):
+    if url:
+        return await spotify_track(url=url)
+    if q:
+        return await spotify_search(q=q)
+    return {"ok": False, "error": "pass url or q"}
+
+
+# ----- Deezer full (public API) -----
+
+@app.get("/deezer/search", tags=["Deezer"])
+async def deezer_search(q: str = Query(...)):
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.get("https://api.deezer.com/search", params={"q": q, "limit": 25})
+        return {"ok": True, **(r.json() if r.status_code == 200 else {})}
+
+
+@app.get("/deezer/track", tags=["Deezer"])
+async def deezer_track(id: int = Query(...)):
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.get(f"https://api.deezer.com/track/{id}")
+        return {"ok": True, **(r.json() if r.status_code == 200 else {})}
+
+
+@app.get("/deezer/album", tags=["Deezer"])
+async def deezer_album(id: int = Query(...)):
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.get(f"https://api.deezer.com/album/{id}")
+        return {"ok": True, **(r.json() if r.status_code == 200 else {})}
+
+
+@app.get("/deezer/artist", tags=["Deezer"])
+async def deezer_artist(id: int = Query(...)):
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.get(f"https://api.deezer.com/artist/{id}")
+        return {"ok": True, **(r.json() if r.status_code == 200 else {})}
+
+
+@app.get("/deezer/playlist", tags=["Deezer"])
+async def deezer_playlist(id: int = Query(...)):
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.get(f"https://api.deezer.com/playlist/{id}")
+        return {"ok": True, **(r.json() if r.status_code == 200 else {})}
+
+
+@app.get("/deezer/home", tags=["Deezer"])
+async def deezer_home():
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.get("https://api.deezer.com/chart")
+        return {"ok": True, **(r.json() if r.status_code == 200 else {})}
+
+
+# ----- Extra downloaders missing from earlier list -----
+
+@app.get("/dl/bilibili", tags=["Downloader"])
+@app.get("/dl/bili", tags=["Downloader"], include_in_schema=False)
+async def dl_bilibili(url: str = Query(...)):
+    return await dl_any(url=url)  # type: ignore
+
+
+@app.get("/dl/linkedin", tags=["Downloader"])
+async def dl_linkedin(url: str = Query(...)):
+    return await dl_any(url=url)  # type: ignore
+
+
+@app.get("/dl/okru", tags=["Downloader"])
+@app.get("/dl/odnoklassniki", tags=["Downloader"], include_in_schema=False)
+async def dl_okru(url: str = Query(...)):
+    return await dl_any(url=url)  # type: ignore
+
+
+@app.get("/dl/rumble", tags=["Downloader"])
+async def dl_rumble(url: str = Query(...)):
+    return await dl_any(url=url)  # type: ignore
+
+
+@app.get("/dl/streamable", tags=["Downloader"])
+async def dl_streamable(url: str = Query(...)):
+    return await dl_any(url=url)  # type: ignore
+
+
+@app.get("/dl/bandcamp", tags=["Downloader"])
+async def dl_bandcamp(url: str = Query(...)):
+    return await dl_any(url=url)  # type: ignore
+
+
+@app.get("/dl/mixcloud", tags=["Downloader"])
+async def dl_mixcloud(url: str = Query(...)):
+    return await dl_any(url=url)  # type: ignore
+
+
+@app.get("/dl/flickr", tags=["Downloader"])
+async def dl_flickr(url: str = Query(...)):
+    return await dl_any(url=url)  # type: ignore
+
+
+@app.get("/dl/imgur", tags=["Downloader"])
+async def dl_imgur(url: str = Query(...)):
+    return await dl_any(url=url)  # type: ignore
+
+
+@app.get("/dl/xkcd", tags=["Downloader"])
+async def dl_xkcd(url: str = Query(...)):
+    return await dl_any(url=url)  # type: ignore
+
+
+@app.get("/tools/bypass-city", tags=["Tools"])
+@app.get("/tools/bypass-tools", tags=["Tools"], include_in_schema=False)
+async def tools_bypass(url: str = Query(...)):
+    """Generic link unlock → same as /dl/any."""
+    return await dl_any(url=url)  # type: ignore
+
+
+@app.get("/catalog/all", tags=["Meta"])
+async def catalog_all():
+    """Full endpoint map for integrators."""
+    routes = []
+    for route in app.routes:
+        if hasattr(route, "methods") and hasattr(route, "path"):
+            if route.path.startswith(("/docs", "/openapi", "/redoc")):
+                continue
+            routes.append({
+                "path": route.path,
+                "methods": sorted(m for m in (route.methods or []) if m != "HEAD"),
+                "name": getattr(route, "name", None),
+            })
+    return {
+        "ok": True,
+        "version": "5.12.0",
+        "count": len(routes),
+        "creator": "shawon",
+        "routes": sorted(routes, key=lambda x: x["path"]),
+    }
 
 
 
