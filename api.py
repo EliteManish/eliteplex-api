@@ -65,11 +65,11 @@ class CreatorMiddleware(BaseHTTPMiddleware):
                 body += chunk
             data = _json.loads(body.decode("utf-8") or "null")
             if isinstance(data, dict) and "creator" not in data:
-                data = {"creator": "shawon", **data}
+                data = {"creator": "ElitePlex", **data}
             elif isinstance(data, list):
-                data = {"creator": "shawon", "items": data}
+                data = {"creator": "ElitePlex", "items": data}
             else:
-                data = {"creator": "shawon", "data": data}
+                data = {"creator": "ElitePlex", "data": data}
             raw = _json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
             headers = dict(response.headers)
             headers.pop("content-length", None)
@@ -8343,7 +8343,7 @@ body{
 <header class="topbar">
   <div class="top-inner">
     <div class="top-row">
-      <a class="logo" href="/docs"><i>S</i><b>ElitePlex</b></a>
+      <a class="logo" href="/docs"><i>E</i><b>ElitePlex</b></a>
       <div class="search-box"><input id="q" type="search" placeholder="Search APIs, paths, tags…" autocomplete="off" autofocus/></div>
       <div class="top-links">
         <a href="/">App</a>
@@ -8362,7 +8362,7 @@ body{
   </section>
   <div class="filters" id="filters"></div>
   <div class="ops" id="ops"></div>
-  <div class="foot">made by <a href="/docs">shawon</a> · ElitePlex API</div>
+  <div class="foot">made by <a href="/docs">ElitePlex</a> · ElitePlex API</div>
 </main>
 <script>
 const BASE=location.origin;
@@ -8416,7 +8416,7 @@ function render(){
     <div class="stat"><b>${all.length}</b>Endpoints</div>
     <div class="stat"><b>${tagMap.size-1}</b>Groups</div>
     <div class="stat"><b>${SPEC.info?.version||'—'}</b>Version</div>
-    <div class="stat"><b>shawon</b>Creator</div>`;
+    <div class="stat"><b>ElitePlex</b>Creator</div>`;
 
   const root=document.getElementById('ops');
   if(!list.length){root.innerHTML='<div class="empty">No endpoints match.</div>';return}
@@ -9879,7 +9879,7 @@ async def catalog_all():
         "ok": True,
         "version": "5.12.0",
         "count": len(routes),
-        "creator": "shawon",
+        "creator": "ElitePlex",
         "routes": sorted(routes, key=lambda x: x["path"]),
     }
 
