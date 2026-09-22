@@ -16,6 +16,11 @@ from typing import Optional, Any, List, Dict, Tuple
 
 import httpx
 try:
+    from wasmtime import Store, Module, Instance, Engine
+    _HAS_WASM = True
+except Exception:
+    _HAS_WASM = False
+try:
     from bs4 import BeautifulSoup
 except ImportError:  # pragma: no cover
     BeautifulSoup = None  # type: ignore
@@ -36,7 +41,7 @@ app = FastAPI(
         "**Catalog** `/api/*` · **Play** embeds · **Music** · **Downloader** (yt-dlp + ffmpeg merge)\n"
         "**MovieBox** `/mb/*` · **4KHDHub** `/fk/*` · **Tools** `/tools/*`"
     ),
-    version="5.14.2",
+    version="5.18.0",
     docs_url=None,
     redoc_url=None,
 )
@@ -1206,7 +1211,7 @@ def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return {"ok": True, "version": "5.14.2", "providers": ["tmdb", "vidsrc", "4khdhub", "hubcloud", "ytmusic", "jiosaavn", "deezer", "piped", "lrclib", "moviebox-api", "netmirror", "vixsrc"]}
+    return {"ok": True, "version": "5.18.0", "providers": ["tmdb", "vidsrc", "4khdhub", "hubcloud", "ytmusic", "jiosaavn", "deezer", "piped", "lrclib", "moviebox-api", "netmirror", "vixsrc"]}
 
 
 # ----- Mov
@@ -7686,8 +7691,9 @@ async def music_yt_play(video_id: str):
 # =============================================================================
 
 HA_BASE = "https://www.hindianime.site"
+HA_STREAM = "https://stream.hindianime.site"
 HA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Referer": "https://www.hindianime.site/",
     "Origin": "https://www.hindianime.site",
     "Accept": "application/json, text/plain, */*",
@@ -7737,6 +7743,60 @@ async def _ha_get(path: str, params: Optional[dict] = None) -> Any:
         return r.json()
 
 
+
+@app.get("/anime/status", tags=["Anime"])
+async def anime_status():
+    """Check if HindiAnime catalog + stream tunnel are reachable."""
+    out = {"provider": "hindianime", "catalog": False, "master": False, "tunnel": False}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.hindianime.site/",
+        "Accept": "*/*",
+    }
+    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+        try:
+            r = await client.get("https://www.hindianime.site/api/catalog", headers={**headers, "Accept": "application/json"})
+            out["catalog"] = r.status_code == 200 and "series" in (r.text or "")
+        except Exception as e:
+            out["catalog_error"] = str(e)[:80]
+        # use a known hash from catalog if possible — fixed probe hash
+        probe = "8eb42db3c9772af6dba6f1b9f7095feb"
+        try:
+            r = await client.get(
+                f"https://www.hindianime.site/api/proxy/master.m3u8?hash={probe}",
+                headers=headers,
+            )
+            out["master"] = r.status_code == 200 and (r.text or "").lstrip().startswith("#EXTM3U")
+        except Exception as e:
+            out["master_error"] = str(e)[:80]
+        try:
+            r = await client.get(
+                f"https://stream.hindianime.site/api/proxy/master.m3u8?hash={probe}",
+                headers=headers,
+            )
+            master_ok = r.status_code == 200 and (r.text or "").lstrip().startswith("#EXTM3U")
+            out["stream_host_master"] = master_ok
+            if master_ok:
+                # probe first variant
+                lines = (r.text or "").splitlines()
+                for i, line in enumerate(lines):
+                    if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+                        u = lines[i + 1].strip()
+                        full = "https://stream.hindianime.site" + u if u.startswith("/") else u
+                        pr = await client.get(full, headers=headers)
+                        out["tunnel"] = pr.status_code == 200 and (pr.text or "").lstrip().startswith("#EXTM3U")
+                        out["tunnel_status"] = pr.status_code
+                        break
+        except Exception as e:
+            out["tunnel_error"] = str(e)[:80]
+    out["ok"] = out["catalog"] and out["tunnel"]
+    out["note"] = (
+        "Streaming fully available"
+        if out["ok"]
+        else "Catalog may work but stream tunnel is down — video playback unavailable until HindiAnime restores stream.hindianime.site"
+    )
+    return out
+
 @app.get("/anime/home", tags=["Anime"])
 async def anime_home():
     """HindiAnime home sections: airing, popular, latest, movies, genres."""
@@ -7756,6 +7816,35 @@ async def anime_home():
         "genres": data.get("genres") or [],
         "provider": "hindianime",
     }
+
+
+@app.get("/anime/hero", tags=["Anime"])
+async def anime_hero():
+    """HindiAnime hero banners."""
+    data = await _ha_get("/api/hero")
+    items = [_ha_card(x) for x in (data.get("hero") or []) if isinstance(x, dict)]
+    return {"items": items, "provider": "hindianime"}
+
+
+@app.get("/anime/spotlights", tags=["Anime"])
+async def anime_spotlights():
+    """HindiAnime spotlight rotation."""
+    data = await _ha_get("/api/spotlights")
+    items = [_ha_card(x) for x in (data.get("all") or data.get("spotlights") or []) if isinstance(x, dict)]
+    return {
+        "items": items,
+        "is_custom": data.get("isCustom"),
+        "rotation": data.get("rotationPeriodDays"),
+        "provider": "hindianime",
+    }
+
+
+@app.get("/anime/top10", tags=["Anime"])
+async def anime_top10():
+    """Best-effort top10 from home sections (site top10 may be SPA-only)."""
+    data = await _ha_get("/api/home-sections")
+    items = [_ha_card(x) for x in (data.get("mostPopular") or data.get("topAiring") or [])[:10] if isinstance(x, dict)]
+    return {"items": items, "provider": "hindianime"}
 
 
 @app.get("/anime/catalog", tags=["Anime"])
@@ -7834,68 +7923,586 @@ async def anime_detail(slug: str):
 
 
 
+
+# --- HindiAnime multi-server embeds (from their watch page logic) ---
+_HA_TMDB_KEY = "8265bd1679663a7ea12ac168da84d2e8"  # same key used by hindianime.site frontend
+_HA_TMDB_MAP = {
+    "demon slayer": "85937", "jujutsu kaisen": "95479", "naruto shippuden": "31910",
+    "naruto": "46260", "one piece": "37854", "bleach": "30984", "solo leveling": "205120",
+    "chainsaw man": "114410", "spy x family": "120089", "attack on titan": "1429",
+    "tokyo ghoul": "61374", "classroom of the elite": "72636", "oshi no ko": "203737",
+    "my hero academia": "65930", "death note": "13916", "hunter x hunter": "46298",
+    "kaiju no 8": "207347", "dandadan": "240411", "blue lock": "136283",
+    "frieren": "209867", "your name": "372058", "suzume": "916224",
+    "weathering with you": "568160", "spirited away": "129",
+    "trapped in a dating sim": "124361",
+}
+
+
+async def _ha_tmdb_id(title: str, is_movie: bool = False) -> Optional[str]:
+    if not title:
+        return None
+    clean = re.sub(r"\(.*?\)", "", title)
+    clean = re.sub(r"Season\s+\d+", "", clean, flags=re.I)
+    clean = re.sub(r"Hindi|Dub|Sub|Multi", "", clean, flags=re.I)
+    clean = re.sub(r"[-_]+", " ", clean).strip()
+    norm = clean.lower()
+    for k, v in _HA_TMDB_MAP.items():
+        if norm == k or k in norm or norm in k:
+            return v
+    endpoint = "movie" if is_movie else "tv"
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(
+                f"https://api.themoviedb.org/3/search/{endpoint}",
+                params={"api_key": _HA_TMDB_KEY, "query": clean},
+            )
+            if r.status_code == 200:
+                results = (r.json() or {}).get("results") or []
+                if results:
+                    return str(results[0].get("id"))
+    except Exception:
+        pass
+    # try the other type
+    try:
+        endpoint = "tv" if is_movie else "movie"
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(
+                f"https://api.themoviedb.org/3/search/{endpoint}",
+                params={"api_key": _HA_TMDB_KEY, "query": clean},
+            )
+            if r.status_code == 200:
+                results = (r.json() or {}).get("results") or []
+                if results:
+                    return str(results[0].get("id"))
+    except Exception:
+        pass
+    return None
+
+
+def _ha_embed_servers(tmdb_id: str, is_movie: bool, season: int = 1, episode: int = 1) -> List[dict]:
+    """Mirror hindianime.site watch-page embed server list."""
+    if not tmdb_id:
+        return []
+    sN, eN = int(season or 1), int(episode or 1)
+    if is_movie:
+        return [
+            {"name": "Server 4 (VidLink Fast)", "type": "iframe", "url": f"https://vidlink.pro/movie/{tmdb_id}"},
+            {"name": "Server 5 (VidSrc PM)", "type": "iframe", "url": f"https://vidsrc.pm/embed/movie/{tmdb_id}"},
+            {"name": "Server 6 (VidSrc TO)", "type": "iframe", "url": f"https://vidsrc.to/embed/movie/{tmdb_id}"},
+            {"name": "Server 7 (2Embed Stream)", "type": "iframe", "url": f"https://www.2embed.cc/embed/{tmdb_id}"},
+            {"name": "Server 8 (AnimeDekho Multi)", "type": "iframe", "url": f"https://animedekho.app/embed/{tmdb_id}"},
+            {"name": "Server 9 (AutoEmbed Stream)", "type": "iframe", "url": f"https://player.autoembed.cc/embed/movie/{tmdb_id}"},
+            {"name": "Server 10 (MultiEmbed VIP)", "type": "iframe", "url": f"https://multiembed.mov/?video_id={tmdb_id}&tmdb=1"},
+            {"name": "Server 11 (VidSrc Net)", "type": "iframe", "url": f"https://vidsrc.net/embed/movie/{tmdb_id}"},
+            {"name": "Server 12 (MoviesAPI Club)", "type": "iframe", "url": f"https://moviesapi.club/movie/{tmdb_id}"},
+            {"name": "Server 13 (SmashyStream)", "type": "iframe", "url": f"https://embed.smashystream.com/playere.php?tmdb={tmdb_id}"},
+            {"name": "Server 14 (VidSrc In)", "type": "iframe", "url": f"https://vidsrc.in/embed/movie/{tmdb_id}"},
+            {"name": "Server 15 (VidSrc XYZ)", "type": "iframe", "url": f"https://vidsrc.xyz/embed/movie/{tmdb_id}"},
+            {"name": "Server 16 (VidSrc CC)", "type": "iframe", "url": f"https://vidsrc.cc/v2/embed/movie/{tmdb_id}"},
+        ]
+    return [
+        {"name": "Server 4 (VidLink Fast)", "type": "iframe", "url": f"https://vidlink.pro/tv/{tmdb_id}/{sN}/{eN}"},
+        {"name": "Server 5 (VidSrc PM)", "type": "iframe", "url": f"https://vidsrc.pm/embed/tv/{tmdb_id}/{sN}/{eN}"},
+        {"name": "Server 6 (VidSrc TO)", "type": "iframe", "url": f"https://vidsrc.to/embed/tv/{tmdb_id}/{sN}/{eN}"},
+        {"name": "Server 7 (2Embed Stream)", "type": "iframe", "url": f"https://www.2embed.cc/embedtv/{tmdb_id}&s={sN}&e={eN}"},
+        {"name": "Server 8 (AnimeDekho Multi)", "type": "iframe", "url": f"https://animedekho.app/embed/{tmdb_id}/{sN}-{eN}"},
+        {"name": "Server 9 (AutoEmbed Stream)", "type": "iframe", "url": f"https://player.autoembed.cc/embed/tv/{tmdb_id}/{sN}/{eN}"},
+        {"name": "Server 10 (MultiEmbed VIP)", "type": "iframe", "url": f"https://multiembed.mov/?video_id={tmdb_id}&tmdb=1&s={sN}&e={eN}"},
+        {"name": "Server 11 (VidSrc Net)", "type": "iframe", "url": f"https://vidsrc.net/embed/tv/{tmdb_id}/{sN}/{eN}"},
+        {"name": "Server 12 (MoviesAPI Club)", "type": "iframe", "url": f"https://moviesapi.club/tv/{tmdb_id}-{sN}-{eN}"},
+        {"name": "Server 13 (SmashyStream)", "type": "iframe", "url": f"https://embed.smashystream.com/playere.php?tmdb={tmdb_id}&season={sN}&episode={eN}"},
+        {"name": "Server 14 (VidSrc In)", "type": "iframe", "url": f"https://vidsrc.in/embed/tv/{tmdb_id}/{sN}/{eN}"},
+        {"name": "Server 15 (VidSrc XYZ)", "type": "iframe", "url": f"https://vidsrc.xyz/embed/tv/{tmdb_id}/{sN}/{eN}"},
+        {"name": "Server 16 (VidSrc CC)", "type": "iframe", "url": f"https://vidsrc.cc/v2/embed/tv/{tmdb_id}/{sN}/{eN}"},
+    ]
+
+
+
+# =============================================================================
+# VidSrc / CDN direct m3u8 resolver (WASM ChaCha20 decrypt + host token)
+# =============================================================================
+
+_VIDSRC_DATA = "https://data.vidsrc.sh/api.php"
+_wasm_module_cache: Dict[str, Any] = {}
+
+
+def _vidsrc_decrypt_stream_urls(enc_b64: str, wasm_url: str) -> List[str]:
+    """Decrypt data.stream_urls using the rotating ChaCha20 WASM from data.vidsrc.sh."""
+    if not _HAS_WASM:
+        return []
+    try:
+        import base64 as _b64
+        enc = _b64.b64decode(enc_b64)
+        # fetch wasm
+        with httpx.Client(timeout=20.0, verify=False) as client:
+            wasm_bytes = client.get(wasm_url, headers={"User-Agent": "Mozilla/5.0"}).content
+        engine = Engine()
+        store = Store(engine)
+        module = Module(engine, wasm_bytes)
+        instance = Instance(store, module, [])
+        ex = instance.exports(store)
+        alloc = ex["alloc"]
+        decrypt = ex["decrypt"]
+        memory = ex["memory"]
+        ptr = alloc(store, len(enc))
+        memory.write(store, enc, ptr)
+        out_len = decrypt(store, ptr, len(enc))
+        raw = memory.read(store, ptr + 12, ptr + 12 + out_len)
+        text = bytes(raw).decode("utf-8", errors="ignore")
+        return [ln.strip() for ln in text.splitlines() if ln.strip().startswith("http")]
+    except Exception as e:
+        return []
+
+
+async def _vidsrc_token_for(host: str) -> Optional[str]:
+    """IP-bound JWT from {origin}/generate.php — required to play CDN m3u8."""
+    from urllib.parse import urlparse
+    try:
+        if "://" in host:
+            origin = f"{urlparse(host).scheme}://{urlparse(host).netloc}"
+        else:
+            origin = f"https://{host}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://cloudorchestranova.com/",
+            "Accept": "*/*",
+        }
+        async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
+            for attempt in range(3):
+                r = await client.get(f"{origin}/generate.php", headers=headers)
+                tok = (r.text or "").strip()
+                if r.status_code == 200 and tok.startswith("eyJ"):
+                    return tok
+                if r.status_code == 429:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+    except Exception:
+        pass
+    return None
+
+
+async def _vidsrc_resolve_cdn(
+    tmdb_id: str,
+    media_type: str = "tv",
+    season: int = 1,
+    episode: int = 1,
+) -> Dict[str, Any]:
+    """Return direct CDN master.m3u8 URLs (with tokens) for a TMDB title."""
+    out: Dict[str, Any] = {
+        "ok": False,
+        "tmdb_id": tmdb_id,
+        "type": media_type,
+        "season": season if media_type == "tv" else None,
+        "episode": episode if media_type == "tv" else None,
+        "streams": [],
+        "title": None,
+        "provider": "vidsrc-cdn",
+    }
+    if not tmdb_id:
+        out["error"] = "tmdb_id required"
+        return out
+
+    if media_type == "movie":
+        api = f"{_VIDSRC_DATA}?type=movie&tmdb={tmdb_id}&stream_urls"
+    else:
+        api = f"{_VIDSRC_DATA}?type=tv&tmdb={tmdb_id}&season={season}&episode={episode}&stream_urls"
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0, verify=False) as client:
+            r = await client.get(
+                api,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json",
+                    "Referer": "https://cloudorchestranova.com/",
+                },
+            )
+            j = r.json()
+    except Exception as e:
+        out["error"] = f"api fetch failed: {e}"
+        return out
+
+    code = str(j.get("status_code") or j.get("status") or "")
+    data = j.get("data") or {}
+    if code not in ("200", "200.0") or not data:
+        out["error"] = f"vidsrc status {code} (title may not be in catalog)"
+        out["raw_status"] = code
+        return out
+
+    out["title"] = data.get("title")
+    out["imdb_id"] = data.get("imdb_id")
+    su = data.get("stream_urls")
+
+    urls: List[str] = []
+    if isinstance(su, list):
+        urls = [u for u in su if isinstance(u, str) and u.startswith("http")]
+    elif isinstance(su, str):
+        vs = j.get("vs") or {}
+        wasm_url = vs.get("wasm_url")
+        if wasm_url:
+            # run sync decrypt in thread to avoid blocking
+            urls = await asyncio.to_thread(_vidsrc_decrypt_stream_urls, su, wasm_url)
+        if not urls:
+            out["error"] = "encrypted stream_urls but WASM decrypt failed (install wasmtime)"
+            out["encrypted"] = True
+            return out
+    else:
+        out["error"] = "no stream_urls"
+        return out
+
+    streams = []
+    from urllib.parse import urlparse
+    token_cache: Dict[str, Optional[str]] = {}
+    for i, raw in enumerate(urls):
+        host = urlparse(raw).netloc
+        if host not in token_cache:
+            token_cache[host] = await _vidsrc_token_for(host)
+        tok = token_cache[host]
+        play = raw
+        if tok:
+            sep = "&" if "?" in raw else "?"
+            play = f"{raw}{sep}token={tok}"
+        streams.append({
+            "label": f"CDN {i + 1}",
+            "type": "hls",
+            "url": play,
+            "direct": raw,
+            "host": host,
+            "token": bool(tok),
+        })
+
+    out["ok"] = bool(streams)
+    out["streams"] = streams
+    out["count"] = len(streams)
+    out["note"] = "Direct CDN master.m3u8 with IP-bound token. Tokens expire ~4h; call again for fresh links."
+    return out
+
+
+@app.get("/anime/cdn", tags=["Anime"])
+async def anime_cdn(
+    tmdb_id: Optional[str] = Query(None),
+    title: Optional[str] = Query(None),
+    type: str = Query("series", description="series|movie"),
+    season: int = Query(1, ge=1),
+    episode: int = Query(1, ge=1),
+):
+    """Direct CDN m3u8 links (VidSrc data API + WASM decrypt + host token).
+
+    Prefer this over iframe embeds when you need real playable HLS URLs for VLC / native players.
+    """
+    is_movie = (type or "").lower() in ("movie", "movies", "film")
+    tid = tmdb_id
+    if not tid and title:
+        tid = await _ha_tmdb_id(title, is_movie=is_movie)
+    if not tid:
+        raise HTTPException(400, "tmdb_id or title required")
+    result = await _vidsrc_resolve_cdn(
+        str(tid),
+        media_type="movie" if is_movie else "tv",
+        season=season,
+        episode=episode,
+    )
+    result["creator"] = "ElitePlex"
+    return result
+
+
+@app.get("/play/cdn", tags=["Play"])
+async def play_cdn(
+    tmdb_id: Optional[str] = Query(None),
+    title: Optional[str] = Query(None),
+    type: str = Query("movie"),
+    season: int = Query(1, ge=1),
+    episode: int = Query(1, ge=1),
+):
+    """Alias of /anime/cdn for movies & series (same resolver)."""
+    return await anime_cdn(tmdb_id=tmdb_id, title=title, type=type, season=season, episode=episode)
+
+@app.get("/anime/servers", tags=["Anime"])
+async def anime_servers(
+    title: Optional[str] = Query(None, description="Anime/movie title"),
+    slug: Optional[str] = Query(None, description="hindianime slug"),
+    hash: Optional[str] = Query(None, description="videoHash for native HLS"),
+    type: str = Query("series", description="series|movie"),
+    season: int = Query(1, ge=1),
+    episode: int = Query(1, ge=1),
+    request: Request = None,
+):
+    """All playback servers like hindianime.site watch page (HLS + 13 embeds).
+
+    When stream tunnel is up: Server 1–3 are native multi-audio HLS.
+    Always: Server 4–16 are embed iframes (VidLink, VidSrc, 2Embed, …) via TMDB id.
+    """
+    is_movie = (type or "").lower() in ("movie", "movies", "film")
+    resolved_title = title
+    video_hash = hash
+
+    if slug and not video_hash:
+        try:
+            data = await _ha_get(f"/extracted/{slug.strip().strip('/')}.json")
+            resolved_title = resolved_title or data.get("title")
+            is_movie = is_movie or (data.get("type") == "movie")
+            eps = data.get("episodes") or []
+            # pick matching season/episode
+            pick = None
+            for ep in eps:
+                if int(ep.get("season") or 1) == season and int(ep.get("episode") or 1) == episode:
+                    pick = ep
+                    break
+            if not pick and eps:
+                pick = eps[0]
+            if pick:
+                video_hash = pick.get("videoHash") or video_hash
+                if pick.get("season"):
+                    season = int(pick.get("season") or season)
+                if pick.get("episode"):
+                    episode = int(pick.get("episode") or episode)
+        except Exception:
+            pass
+
+    servers: List[dict] = []
+    tunnel_ok = False
+    play_url = None
+    stream_url = None
+
+    # Native HLS servers (1-3) when hash present
+    if video_hash:
+        host = "https://stream.hindianime.site"
+        master = f"{host}/api/proxy/master.m3u8?hash={video_hash}"
+        # probe tunnel
+        try:
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+                r = await client.get(
+                    master,
+                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.hindianime.site/", "Accept": "*/*"},
+                )
+                if r.status_code == 200 and (r.text or "").lstrip().startswith("#EXTM3U"):
+                    # probe sub
+                    lines = (r.text or "").splitlines()
+                    for i, line in enumerate(lines):
+                        if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+                            u = lines[i + 1].strip()
+                            full = host + u if u.startswith("/") else u
+                            pr = await client.get(full, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.hindianime.site/"})
+                            tunnel_ok = pr.status_code == 200 and (pr.text or "").lstrip().startswith("#EXTM3U")
+                            break
+        except Exception:
+            tunnel_ok = False
+
+        stream_url = master
+        try:
+            base = str(request.base_url).rstrip("/") if request is not None else ""
+        except Exception:
+            base = ""
+        play_url = f"{base}/anime/hls?u={quote(master, safe='')}" if base else f"/anime/hls?u={quote(master, safe='')}"
+
+        if tunnel_ok:
+            servers.append({"name": "Server 1 (Multi-Audio HD)", "type": "hls", "url": play_url, "direct": stream_url, "hash": video_hash})
+            servers.append({
+                "name": "Server 2 (Zephyrix Fast)", "type": "hls",
+                "url": f"{play_url}&cdn=fast" if "?" in play_url else play_url,
+                "direct": f"{master}&cdn=fast", "hash": video_hash, "isMirror": True,
+            })
+            servers.append({
+                "name": "Server 3 (AniPlayz Backup)", "type": "hls",
+                "url": f"{play_url}&cdn=backup" if "?" in play_url else play_url,
+                "direct": f"{master}&cdn=backup", "hash": video_hash, "isBackup": True,
+            })
+        else:
+            # still list native with note — client can retry
+            servers.append({
+                "name": "Server 1 (Multi-Audio HD)", "type": "hls", "url": play_url, "direct": stream_url,
+                "hash": video_hash, "available": False, "note": "stream tunnel offline",
+            })
+
+    # Embed servers 4-16 via TMDB
+    tmdb_id = await _ha_tmdb_id(resolved_title or slug or "", is_movie=is_movie)
+    embeds = _ha_embed_servers(tmdb_id, is_movie=is_movie, season=season, episode=episode) if tmdb_id else []
+    servers.extend(embeds)
+
+    # default playable: first available hls else first embed
+    default = next((s for s in servers if s.get("type") == "hls" and s.get("available", True)), None)
+    if not default:
+        default = next((s for s in servers if s.get("type") == "iframe"), None)
+
+    return {
+        "ok": bool(servers),
+        "title": resolved_title,
+        "slug": slug,
+        "hash": video_hash,
+        "tmdb_id": tmdb_id,
+        "type": "movie" if is_movie else "series",
+        "season": season,
+        "episode": episode,
+        "tunnel_ok": tunnel_ok,
+        "server_count": len(servers),
+        "servers": servers,
+        "default": default,
+        "play_url": (default or {}).get("url"),
+        "provider": "hindianime",
+        "note": (
+            "Use servers[].url — type=hls via our proxy, type=iframe embed in player. "
+            + ("Native HLS up." if tunnel_ok else "Native HLS tunnel down — use embed servers 4–16.")
+        ),
+    }
+
+
 @app.get("/anime/stream", tags=["Anime"])
 async def anime_stream(
     hash: Optional[str] = Query(None, description="videoHash from episode"),
     url: Optional[str] = Query(None, description="episode page url fallback"),
+    request: Request = None,
 ):
-    """Resolve HindiAnime HLS master playlist from videoHash (proxy m3u8)."""
+    """Resolve HindiAnime HLS.
+
+    HindiAnime serves master on both hosts, but **sub-playlists + segments only work
+    when stream.hindianime.site Cloudflare Tunnel origin is up**. We always return
+    `play_url` through our `/anime/hls` proxy so the browser never hits their tunnel
+    directly — only our server does.
+    """
     if not hash and not url:
         raise HTTPException(400, "hash or url required")
+
+    headers = {
+        "User-Agent": HA_HEADERS.get("User-Agent", "Mozilla/5.0"),
+        "Referer": "https://www.hindianime.site/",
+        "Origin": "https://www.hindianime.site",
+        "Accept": "*/*",
+    }
     stream = None
-    mirrors: List[dict] = []
-    # Primary: direct master.m3u8 proxy (resolve-stream often returns HTML now)
+    master_body = ""
+    host_used = None
+    tunnel_ok = False
+    errors: List[str] = []
+
+    host_list = [
+        "https://stream.hindianime.site",
+        "https://www.hindianime.site",
+    ]
+
     if hash:
-        stream = f"{HA_BASE}/api/proxy/master.m3u8?hash={hash}"
-        # light probe
-        try:
-            async with httpx.AsyncClient(timeout=18.0, follow_redirects=True) as client:
-                r = await client.get(
-                    stream,
-                    headers={
-                        "User-Agent": HA_HEADERS.get("User-Agent", "Mozilla/5.0"),
-                        "Referer": "https://www.hindianime.site/",
-                        "Accept": "*/*",
-                    },
-                )
-                if r.status_code >= 400 or not (r.text or "").lstrip().startswith("#EXTM3U"):
-                    stream = None
-        except Exception:
-            stream = None
-    # Fallback: try resolve-stream JSON if still alive
-    if not stream:
-        params = {}
-        if hash:
-            params["hash"] = hash
-        elif url:
-            params["url"] = url
-        try:
-            data = await _ha_get("/api/resolve-stream", params)
-            stream = data.get("streamUrl") or data.get("proxyUrl") or ""
-            if stream.startswith("/"):
-                stream = HA_BASE + stream
-            for s in data.get("servers") or data.get("mirrors") or []:
-                if isinstance(s, dict) and s.get("url"):
-                    u = s["url"]
-                    if u.startswith("/"):
-                        u = HA_BASE + u
-                    mirrors.append({"label": s.get("name") or "Server", "url": u})
-        except Exception:
-            pass
+        async with httpx.AsyncClient(timeout=22.0, follow_redirects=True) as client:
+            for host in host_list:
+                candidate = f"{host}/api/proxy/master.m3u8?hash={hash}"
+                try:
+                    r = await client.get(candidate, headers=headers)
+                    body = r.text or ""
+                    if r.status_code == 200 and body.lstrip().startswith("#EXTM3U"):
+                        stream = candidate
+                        master_body = body
+                        host_used = host
+                        # Probe one sub-playlist to know if tunnel/origin is alive
+                        lines = body.splitlines()
+                        probe_uri = None
+                        for i, line in enumerate(lines):
+                            if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+                                probe_uri = lines[i + 1].strip()
+                                break
+                        if probe_uri:
+                            if probe_uri.startswith("/"):
+                                probe_url = host + probe_uri
+                            else:
+                                probe_url = probe_uri.replace("www.hindianime.site", "stream.hindianime.site")
+                                if not probe_url.startswith("http"):
+                                    probe_url = "https://stream.hindianime.site" + (probe_uri if probe_uri.startswith("/") else "/" + probe_uri)
+                            try:
+                                pr = await client.get(probe_url, headers=headers)
+                                if pr.status_code == 200 and (pr.text or "").lstrip().startswith("#EXTM3U"):
+                                    tunnel_ok = True
+                                    stream = stream.replace("www.hindianime.site", "stream.hindianime.site")
+                                    host_used = "https://stream.hindianime.site"
+                                    break
+                                else:
+                                    errors.append(f"sub@{host.split('//')[1]}:{pr.status_code}")
+                            except Exception as e:
+                                errors.append(f"sub@{host.split('//')[1]}:{type(e).__name__}")
+                        if tunnel_ok:
+                            break
+                    else:
+                        errors.append(f"master@{host.split('//')[1]}:{r.status_code}")
+                except Exception as e:
+                    errors.append(f"master@{host.split('//')[1]}:{type(e).__name__}")
+
     if not stream and hash:
-        # last resort: still return constructed master URL (player proxy will surface errors)
-        stream = f"{HA_BASE}/api/proxy/master.m3u8?hash={hash}"
+        stream = f"https://stream.hindianime.site/api/proxy/master.m3u8?hash={hash}"
+
     if not stream:
         raise HTTPException(502, "Could not resolve stream")
+
+    # Normalize to stream host when tunnel works; keep whichever served master otherwise
+    if tunnel_ok:
+        stream = stream.replace("www.hindianime.site", "stream.hindianime.site")
+
+    qualities: List[dict] = []
+    audio_tracks: List[dict] = []
+    abs_host = "https://stream.hindianime.site" if tunnel_ok else (host_used or "https://www.hindianime.site")
+    lines = (master_body or "").splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in line:
+            lang = re.search(r'LANGUAGE="([^"]*)"', line)
+            name = re.search(r'NAME="([^"]*)"', line)
+            uri_m = re.search(r'URI="([^"]*)"', line)
+            if uri_m:
+                u = uri_m.group(1)
+                if u.startswith("/"):
+                    u = abs_host + u
+                elif "www.hindianime.site" in u and tunnel_ok:
+                    u = u.replace("www.hindianime.site", "stream.hindianime.site")
+                audio_tracks.append({
+                    "language": lang.group(1) if lang else "",
+                    "name": name.group(1) if name else "Audio",
+                    "url": u,
+                })
+        if line.startswith("#EXT-X-STREAM-INF"):
+            bw = re.search(r"BANDWIDTH=(\d+)", line)
+            res = re.search(r"RESOLUTION=([\dx]+)", line)
+            name = re.search(r'NAME="([^"]*)"', line)
+            if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
+                u = lines[i + 1].strip()
+                if u.startswith("/"):
+                    u = abs_host + u
+                elif "www.hindianime.site" in u and tunnel_ok:
+                    u = u.replace("www.hindianime.site", "stream.hindianime.site")
+                qualities.append({
+                    "label": (name.group(1) if name else None) or (res.group(1) if res else "auto"),
+                    "bandwidth": int(bw.group(1)) if bw else None,
+                    "resolution": res.group(1) if res else None,
+                    "url": u,
+                })
+
+    try:
+        base = str(request.base_url).rstrip("/") if request is not None else ""
+    except Exception:
+        base = ""
+    play_url = f"{base}/anime/hls?u={quote(stream, safe='')}" if base else f"/anime/hls?u={quote(stream, safe='')}"
+
+    note = (
+        "Use play_url in web player (our CORS proxy). stream_url is absolute master.m3u8."
+        if tunnel_ok
+        else (
+            "HindiAnime stream tunnel (stream.hindianime.site) is DOWN — Cloudflare Error 1033. "
+            "Master playlist was found but quality sub-playlists/segments are unreachable until "
+            "their origin comes back. Retry later."
+        )
+    )
+
     return {
         "success": True,
+        "ok": tunnel_ok,
         "stream_url": stream,
+        "direct_url": stream,
+        "play_url": play_url,
         "hash": hash,
-        "mirrors": mirrors,
+        "qualities": qualities,
+        "audio_tracks": audio_tracks,
+        "type": "hls",
+        "tunnel_ok": tunnel_ok,
+        "host": host_used,
         "provider": "hindianime",
+        "note": note,
+        "errors": errors or None,
     }
-
-
 
 
 @app.get("/anime/hls", tags=["Anime"])
@@ -7904,23 +8511,20 @@ async def anime_hls_proxy(request: Request, u: str = Query(..., min_length=8)):
     if not (u.startswith("http://") or u.startswith("https://")):
         raise HTTPException(400, "url must be http(s)")
 
-    def _unwrap(url: str) -> str:
-        """If HindiAnime segment proxy, prefer the real CDN URL inside ?url=."""
+    def _ha_force_stream_host(url: str) -> str:
+        """www returns SPA HTML for sub/segment; stream.* returns real media."""
         try:
             p = urlparse(url)
             host = (p.hostname or "").lower()
-            if "hindianime" in host and "/api/proxy/segment" in (p.path or ""):
-                q = dict(parse_qsl(p.query, keep_blank_values=True))
-                inner = q.get("url") or q.get("u")
-                if inner:
-                    inner = unquote(inner)
-                    if inner.startswith("http"):
-                        return inner
+            if host in ("www.hindianime.site", "hindianime.site") and "/api/proxy/" in (p.path or ""):
+                return "https://stream.hindianime.site" + (p.path or "") + (("?" + p.query) if p.query else "")
             return url
         except Exception:
             return url
 
-    target = _unwrap(u)
+    # Do NOT unwrap segment→CDN (zn-grid returns 403 without their edge cookies).
+    # Always fetch via stream.hindianime.site proxy paths.
+    target = _ha_force_stream_host(u)
     range_header = request.headers.get("range")
     headers = {
         "User-Agent": (
@@ -7949,13 +8553,17 @@ async def anime_hls_proxy(request: Request, u: str = Query(..., min_length=8)):
                 or "text/html" in ctype0
                 or head0.startswith(b"<!doctype")
                 or head0.startswith(b"<html")
+                or (r.status_code == 410)
             ):
                 alts = []
+                # force stream host
+                forced = _ha_force_stream_host(u)
+                if forced != target:
+                    alts.append(forced)
+                if "www.hindianime.site" in target:
+                    alts.append(target.replace("www.hindianime.site", "stream.hindianime.site"))
                 if target != u:
                     alts.append(u)
-                # try CDN without query noise
-                if target != u:
-                    alts.append(target)
                 for alt in alts:
                     try:
                         r2 = await client.get(alt, headers=headers)
@@ -7971,7 +8579,10 @@ async def anime_hls_proxy(request: Request, u: str = Query(..., min_length=8)):
         raise HTTPException(502, f"hls fetch: {e}")
 
     if r.status_code >= 400:
-        raise HTTPException(502, f"upstream {r.status_code}")
+        detail = f"upstream {r.status_code}"
+        if r.status_code in (530, 1033, 502, 503):
+            detail += " — HindiAnime stream tunnel may be offline (Cloudflare 1033). Retry later."
+        raise HTTPException(502, detail)
 
     ctype = (r.headers.get("content-type") or "").lower()
     body = r.content
@@ -8003,10 +8614,10 @@ async def anime_hls_proxy(request: Request, u: str = Query(..., min_length=8)):
                         if uri.startswith("http://") or uri.startswith("https://"):
                             full_u = uri
                         elif uri.startswith("/"):
-                            full_u = "https://www.hindianime.site" + uri
+                            full_u = "https://stream.hindianime.site" + uri
                         else:
                             full_u = urljoin(_base, uri)
-                        full_u = _unwrap(full_u)
+                        full_u = _ha_force_stream_host(full_u)
                         return 'URI="/anime/hls?u=' + quote(full_u, safe="") + '"'
                     line = re.sub(r'URI="([^"]+)"', _rew, line)
                 lines.append(line)
@@ -8014,10 +8625,10 @@ async def anime_hls_proxy(request: Request, u: str = Query(..., min_length=8)):
             if raw.startswith("http://") or raw.startswith("https://"):
                 full_u = raw
             elif raw.startswith("/"):
-                full_u = "https://www.hindianime.site" + raw
+                full_u = "https://stream.hindianime.site" + raw
             else:
                 full_u = urljoin(base, raw)
-            full_u = _unwrap(full_u)
+            full_u = _ha_force_stream_host(full_u)
             lines.append("/anime/hls?u=" + quote(full_u, safe=""))
         out = "\n".join(lines) + "\n"
         return Response(
@@ -8051,7 +8662,7 @@ async def anime_hls_proxy(request: Request, u: str = Query(..., min_length=8)):
 async def anime_tracks(hash: Optional[str] = Query(None), url: Optional[str] = Query(None)):
     """Parse master m3u8 for quality levels + audio tracks (VLC-style list)."""
     if hash:
-        stream = f"{HA_BASE}/api/proxy/master.m3u8?hash={hash}"
+        stream = f"{HA_STREAM}/api/proxy/master.m3u8?hash={hash}"
     elif url:
         stream = url
     else:
