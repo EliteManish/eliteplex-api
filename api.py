@@ -41,7 +41,7 @@ app = FastAPI(
         "**Catalog** `/api/*` · **Play** embeds · **Music** · **Downloader** (yt-dlp + ffmpeg merge)\n"
         "**MovieBox** `/mb/*` · **4KHDHub** `/fk/*` · **Tools** `/tools/*`"
     ),
-    version="5.18.0",
+    version="5.30.1",
     docs_url=None,
     redoc_url=None,
 )
@@ -53,4394 +53,906 @@ app.add_middleware(
 )
 
 
-# Inject creator on every JSON response
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response as StarletteResponse
-import json as _json
-
-class CreatorMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response = await call_next(request)
-        ct = (response.headers.get("content-type") or "").lower()
-        if "application/json" not in ct:
-            return response
-        try:
-            body = b""
-            async for chunk in response.body_iterator:
-                body += chunk
-            data = _json.loads(body.decode("utf-8") or "null")
-            if isinstance(data, dict) and "creator" not in data:
-                data = {"creator": "ElitePlex", **data}
-            elif isinstance(data, list):
-                data = {"creator": "ElitePlex", "items": data}
-            else:
-                data = {"creator": "ElitePlex", "data": data}
-            raw = _json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-            headers = dict(response.headers)
-            headers.pop("content-length", None)
-            return StarletteResponse(
-                content=raw,
-                status_code=response.status_code,
-                media_type="application/json",
-                headers=headers,
-            )
-        except Exception:
-            return response
-
-app.add_middleware(CreatorMiddleware)
-
-
 # =============================================================================
-# MOVIEBOX
+# HindiAnime (www.hindianime.site) — robust catalog + HLS stream
+# Public JSON: /api/home-sections, /api/hero, /api/catalog, /api/browse-index.json
+# Episodes: /extracted/{slug}.json  Stream: stream.hindianime.site/api/proxy/master.m3u8?hash=
 # =============================================================================
 
-MB_HOSTS = [
-    "https://api6.aoneroom.com",
-    "https://api5.aoneroom.com",
-    "https://api4.aoneroom.com",
-    "https://api4sg.aoneroom.com",
-    "https://api3.aoneroom.com",
-    "https://api6sg.aoneroom.com",
-    "https://api7.aoneroom.com",
-    "https://api8.aoneroom.com",
-    "https://api.inmoviebox.com",
-]
-MB_SECRET = "76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O"
-STREAM_REFERER = "https://sportslive.wine"
-RETRY_CODES = {403, 406, 407, 429, 500, 502, 503, 504}
+HA_BASE = globals().get("HA_BASE") or "https://www.hindianime.site"
+HA_STREAM = globals().get("HA_STREAM") or "https://stream.hindianime.site"
+HA_HEADERS = globals().get("HA_HEADERS") or {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.hindianime.site/",
+    "Origin": "https://www.hindianime.site",
+}
 
-_mb_token: Optional[str] = None
-_mb_idx: int = 0
-_mb_ua: str = ""
-_mb_info: str = ""
-_mb_ip: str = ""
+_ha_catalog_cache: Dict[str, Any] = {"ts": 0, "data": None}
+_ha_browse_cache: Dict[str, Any] = {"ts": 0, "data": None}
 
 
-def _b64_decode(s: str) -> bytes:
-    return base64.b64decode(s + "=" * ((4 - len(s) % 4) % 4))
+def _ha_slug_from_link(link: str) -> str:
+    if not link:
+        return ""
+    return link.rstrip("/").split("/")[-1].strip()
 
 
-def _md5_hex(data: bytes) -> str:
-    return hashlib.md5(data).hexdigest()
-
-
-def _random_hex(n: int) -> str:
-    return "".join(random.choices("0123456789abcdef", k=n))
-
-
-def _random_uuid() -> str:
-    return f"{_random_hex(8)}-{_random_hex(4)}-{_random_hex(4)}-{_random_hex(4)}-{_random_hex(12)}"
-
-
-def _ensure_mb_identity() -> None:
-    global _mb_ua, _mb_info, _mb_ip
-    if _mb_ua:
-        return
-    android = random.choice([("12", "S1B.220414.015"), ("13", "TQ2A.230405.003")])
-    device = random.choice([("23078RKD5C", "Redmi"), ("M2012K11AG", "Redmi")])
-    vcode = random.choice([50020117, 50020118, 50020119, 50020120, 50020121])
-    _mb_ua = (
-        f"com.community.oneroom/{vcode} (Linux; U; Android {android[0]}; en_US; "
-        f"{device[0]}; Build/{android[1]}; Cronet/135.0.7012.3)"
-    )
-    _mb_info = json.dumps(
-        {
-            "package_name": "com.community.oneroom",
-            "version_name": "4.0.01.0813.03",
-            "version_code": vcode,
-            "os": "android",
-            "os_version": android[0],
-            "install_ch": "ps",
-            "device_id": _random_hex(32),
-            "install_store": "ps",
-            "gaid": _random_uuid(),
-            "brand": device[1],
-            "model": device[0],
-            "system_language": "en",
-            "net": "NETWORK_WIFI",
-            "region": "US",
-            "timezone": "Asia/Dhaka",
-            "sp_code": "40401",
-            "X-Play-Mode": "2",
-        },
-        separators=(",", ":"),
-    )
-    prefix = random.choice(["103.241", "49.36", "117.195", "106.198"])
-    _mb_ip = f"{prefix}.{random.randint(1, 253)}.{random.randint(1, 253)}"
-
-
-def _sorted_query(url: str) -> str:
-    parsed = urlparse(url)
-    params = sorted(parse_qsl(parsed.query, keep_blank_values=True), key=lambda x: x[0])
-    return urlencode(params, doseq=True) if params else ""
-
-
-def _canonical_string(method: str, url: str, body: Optional[str], ts: int) -> str:
-    parsed = urlparse(url)
-    path = parsed.path or "/"
-    query = _sorted_query(url)
-    canonical_url = f"{path}?{query}" if query else path
-    body_hash = body_len = ""
-    if body is not None:
-        raw = body.encode()
-        body_hash = _md5_hex(raw[:102400])
-        body_len = str(len(raw))
-    return "\n".join(
-        [method.upper(), "application/json", "application/json", body_len, str(ts), body_hash, canonical_url]
-    )
-
-
-def _mb_headers(method: str, url: str, body: Optional[str] = None, token: Optional[str] = None) -> dict:
-    _ensure_mb_identity()
-    ts = int(time.time() * 1000)
-    canonical = _canonical_string(method, url, body, ts)
-    sig = hmac.new(_b64_decode(MB_SECRET), canonical.encode(), hashlib.md5).digest()
-    headers = {
-        "User-Agent": _mb_ua,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Connection": "keep-alive",
-        "x-client-token": f"{ts},{_md5_hex(str(ts)[::-1].encode())}",
-        "x-tr-signature": f"{ts}|2|{base64.b64encode(sig).decode()}",
-        "x-client-info": _mb_info,
-        "x-client-status": "0",
-        "x-forwarded-for": _mb_ip,
+def _ha_card(x: dict) -> dict:
+    if not isinstance(x, dict):
+        return {}
+    link = x.get("link") or x.get("url") or x.get("perma_url") or ""
+    title = x.get("title") or x.get("name") or ""
+    poster = x.get("poster") or x.get("image") or x.get("thumb") or x.get("thumbnail") or ""
+    slug = x.get("slug") or _ha_slug_from_link(link)
+    return {
+        "id": x.get("id") or slug or title,
+        "title": title,
+        "slug": slug,
+        "link": link,
+        "url": link,
+        "poster": poster,
+        "thumb": poster,
+        "type": (x.get("type") or ("movie" if "/movie" in (link or "") else "series")).lower(),
+        "episodes": x.get("episodes") or x.get("episode") or x.get("eps"),
+        "rank": x.get("rank"),
+        "genres": x.get("genres") or x.get("g") or [],
+        "languages": x.get("languages") or x.get("lang") or [],
+        "provider": "hindianime",
     }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
 
 
-async def _mb_login(client: httpx.AsyncClient) -> str:
-    global _mb_token, _mb_idx
-    path = "/wefeed-mobile-bff/user-api/visitor-login"
-    body = "{}"
-    for i in range(len(MB_HOSTS)):
-        idx = (_mb_idx + i) % len(MB_HOSTS)
-        url = MB_HOSTS[idx] + path
+async def _ha_get(path: str, params: Optional[dict] = None, timeout: float = 30.0) -> Any:
+    base = globals().get("HA_BASE") or HA_BASE or "https://www.hindianime.site"
+    headers = globals().get("HA_HEADERS") or HA_HEADERS
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        r = await client.get(base.rstrip("/") + path, params=params or {}, headers=headers)
+        if r.status_code >= 400:
+            raise HTTPException(502, f"HindiAnime {path} HTTP {r.status_code}")
         try:
-            resp = await client.post(url, headers=_mb_headers("POST", url, body), content=body, timeout=12.0)
-            if resp.status_code in RETRY_CODES:
-                continue
-            data = resp.json()
-            token = data.get("token") or (data.get("data") or {}).get("token")
-            x_user = resp.headers.get("x-user")
-            if x_user:
-                try:
-                    token = json.loads(x_user).get("token") or token
-                except Exception:
-                    pass
-            if token:
-                _mb_token = token
-                _mb_idx = idx
-                return token
+            return r.json()
         except Exception:
-            continue
-    raise HTTPException(status_code=502, detail="MovieBox visitor-login failed")
+            raise HTTPException(502, f"HindiAnime {path} non-JSON")
 
 
-async def mb_request(method: str, path: str, body: Optional[dict] = None) -> Any:
-    global _mb_token, _mb_idx
-    body_str = json.dumps(body, separators=(",", ":")) if body is not None else None
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as client:
-        if not _mb_token:
-            await _mb_login(client)
-        for attempt in range(2):
-            start = _mb_idx
-            for i in range(len(MB_HOSTS)):
-                idx = (start + i) % len(MB_HOSTS)
-                url = MB_HOSTS[idx] + path
-                try:
-                    headers = _mb_headers(method, url, body_str, _mb_token)
-                    if method.upper() == "POST":
-                        resp = await client.post(url, headers=headers, content=body_str or "{}")
-                    else:
-                        resp = await client.get(url, headers=headers)
-                    x_user = resp.headers.get("x-user")
-                    if x_user:
-                        try:
-                            nt = json.loads(x_user).get("token")
-                            if nt:
-                                _mb_token = nt
-                        except Exception:
-                            pass
-                    if resp.status_code in (401, 403) and attempt == 0:
-                        _mb_token = None
-                        await _mb_login(client)
-                        break
-                    if resp.status_code in RETRY_CODES or resp.status_code != 200:
-                        continue
-                    data = resp.json()
-                    _mb_idx = idx
-                    return data.get("data", data) if isinstance(data, dict) else data
-                except HTTPException:
-                    raise
-                except Exception:
-                    continue
-            else:
-                continue
-            break
-    raise HTTPException(status_code=502, detail=f"MovieBox request failed: {path}")
+async def _ha_catalog(force: bool = False) -> dict:
+    now = time.time()
+    if not force and _ha_catalog_cache["data"] and now - _ha_catalog_cache["ts"] < 600:
+        return _ha_catalog_cache["data"]
+    data = await _ha_get("/api/catalog")
+    _ha_catalog_cache["data"] = data
+    _ha_catalog_cache["ts"] = now
+    return data
 
 
-def _is_dummy_url(url: str) -> bool:
-    """True for MovieBox App-Upgrade notice / promo dummy MP4s (never play these)."""
-    u = (url or "").lower().strip()
-    if not u:
-        return True
-    # Known notice hashes / paths
-    markers = (
-        "1c7de0bd3393702d9191801f15f88f8d",
-        "9a0461bc39da389663bf3dbb17091d3f",
-        "b164fbfb43477929",
-        "aa348f2541d13ffe",
-        "b164fbfb4347792950bdfbfb563d39d9",
-        "/notice.mp4",
-        "app-upgrade",
-        "upgrade-notice",
-        "discontinued",
-    )
-    if any(m in u for m in markers):
-        return True
-    # Entire macdn "other" bucket is promotional / notice clips
-    if "macdn.aoneroom.com" in u and "/other/" in u:
-        return True
-    if "macdn.aoneroom.com" in u and u.rstrip("/").endswith(".mp4"):
-        # short promo clips on macdn root-ish paths
-        if "/dash/" not in u and "/hls/" not in u:
-            return True
-    return False
+async def _ha_browse(force: bool = False) -> dict:
+    now = time.time()
+    if not force and _ha_browse_cache["data"] and now - _ha_browse_cache["ts"] < 600:
+        return _ha_browse_cache["data"]
+    try:
+        data = await _ha_get("/api/browse-index.json")
+    except Exception:
+        data = {"index": {}, "meta": {}}
+    _ha_browse_cache["data"] = data
+    _ha_browse_cache["ts"] = now
+    return data
 
 
-def _dash_from_sign_cookie(cookie: str) -> Optional[str]:
-    """Extract real DASH/HLS URL from MovieBox signCookie / Edge-Cache-Cookie."""
-    if not cookie:
+async def _ha_find_by_title(title: str) -> Optional[dict]:
+    if not title:
         return None
-    # 1) CloudFront-Policy resource
-    for part in cookie.split(";"):
-        trimmed = part.strip()
-        if not trimmed.startswith("CloudFront-Policy="):
+    qn = title.lower().strip()
+    cat = await _ha_catalog()
+    best = None
+    best_score = 0
+    for x in list(cat.get("series") or []) + list(cat.get("movies") or []):
+        if not isinstance(x, dict):
             continue
-        raw = trimmed[len("CloudFront-Policy=") :].strip()
-        normalized = raw.replace("-", "+").replace("_", "/").replace("~", "/")
+        xt = (x.get("title") or "").lower().strip()
+        if not xt:
+            continue
+        if qn == xt:
+            return x
+        if qn in xt or xt in qn:
+            score = 100 - abs(len(xt) - len(qn))
+            if score > best_score:
+                best_score = score
+                best = x
+    return best
+
+
+async def _ha_extracted(slug: str) -> dict:
+    slug = (slug or "").strip().strip("/")
+    if not slug:
+        raise HTTPException(400, "slug required")
+    return await _ha_get(f"/extracted/{slug}.json")
+
+
+def _ha_pick_episode(eps: list, season: int, episode: int) -> Optional[dict]:
+    if not eps:
+        return None
+    if isinstance(eps, dict):
+        eps = list(eps.values())
+    pick = None
+    for ep in eps:
+        if not isinstance(ep, dict):
+            continue
         try:
-            pad = (4 - len(normalized) % 4) % 4
-            policy = json.loads(base64.b64decode(normalized + ("=" * pad)))
-            resource = policy["Statement"][0]["Resource"]
-            base = resource.rstrip("*").rstrip("/")
-            if base.startswith("http"):
-                return f"{base}/index.mpd"
+            if int(ep.get("season") or 1) == int(season) and int(ep.get("episode") or ep.get("number") or 1) == int(episode):
+                return ep
         except Exception:
             continue
-    # 2) Edge-Cache-Cookie=urlprefix=<b64>:sign=...:t=...
-    if "urlprefix=" in cookie:
-        try:
-            part = cookie.split("urlprefix=", 1)[1]
-            # stop at sign / semicolon / ampersand
-            for sep in (":sign=", ";", "&", " "):
-                if sep in part:
-                    part = part.split(sep, 1)[0]
-            part = part.strip().strip('"').strip("'")
-            pad = (4 - len(part) % 4) % 4
-            base = base64.b64decode(part + ("=" * pad)).decode("utf-8", errors="strict")
-            # strip any non-printable leftover
-            base = "".join(ch for ch in base if ch.isprintable()).strip()
-            if base.startswith("http"):
-                if base.endswith((".mpd", ".m3u8")):
-                    return base
-                return base.rstrip("/") + "/index.mpd"
-        except Exception:
-            pass
+    for ep in eps:
+        if isinstance(ep, dict):
+            return ep
     return None
 
-
-async def _mb_h5_domain() -> str:
-    """Discover current H5 player domain (moviebox rotates: mzfi.me, netfilm.world, …)."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Referer": "https://moviebox.ph/",
-        "Origin": "https://moviebox.ph",
-        "Accept": "application/json",
-        "X-Client-Info": '{"timezone":"Asia/Dhaka"}',
-        "X-Request-Lang": "en",
-    }
-    for base in (
-        "https://h5-api.aoneroom.com",
-        "https://h5.aoneroom.com",
-    ):
-        try:
-            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-                r = await client.get(f"{base}/wefeed-h5api-bff/media-player/get-domain", headers=headers)
-                if r.status_code == 200:
-                    d = r.json().get("data")
-                    if isinstance(d, str) and d.startswith("http"):
-                        return d.rstrip("/")
-        except Exception:
-            continue
-    return "https://mzfi.me"
-
-
-async def _mb_h5_play(subject_id: str, se: int = 0, ep: int = 0, detail_path: str = "") -> dict:
-    """H5 subject/play + download — often returns H.264 when mobile is HEVC-only."""
-    domain = await _mb_h5_domain()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Origin": domain,
-        "Referer": f"{domain}/",
-        "X-Client-Info": '{"timezone":"Asia/Dhaka"}',
-        "X-Request-Lang": "en",
-    }
-    out: dict = {}
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        params = {"subjectId": subject_id, "se": se, "ep": ep}
-        if detail_path:
-            params["detailPath"] = detail_path
-        for path in (
-            f"{domain}/wefeed-h5api-bff/subject/play",
-            "https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/play",
-            "https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/download",
-        ):
-            try:
-                r = await client.get(path, params=params, headers=headers)
-                if r.status_code != 200:
-                    continue
-                data = (r.json() or {}).get("data") or {}
-                if not isinstance(data, dict):
-                    continue
-                # merge streams
-                for key in ("streams", "dash", "hls", "downloads"):
-                    if data.get(key):
-                        out.setdefault(key, [])
-                        if isinstance(data[key], list):
-                            out[key].extend(data[key])
-                        else:
-                            out[key].append(data[key])
-                if data.get("hasResource") is not None:
-                    out["hasResource"] = data.get("hasResource")
-            except Exception:
-                continue
-    return out
-
-
-def _is_mb_notice_url(url: str) -> bool:
-    """Filter MovieBox 'App Upgrade Notice' / dummy promo clips."""
-    if not url or _is_dummy_url(url):
-        return True
-    u = url.lower()
-    bad = (
-        "upgrade", "notice", "app-upgrade", "discontinu", "legacy",
-        "update-now", "movieboxdownload", "promo", "/notice/",
-        "macdn.aoneroom.com/other",
-    )
-    return any(b in u for b in bad)
-
-
-def _parse_mb_play_info(data: dict, user_agent: str) -> List[dict]:
-    out: List[dict] = []
-    seen = set()
-    streams = data.get("streams") or data.get("streamList") or []
-    if not isinstance(streams, list):
-        streams = []
-    for stream in streams:
-        if not isinstance(stream, dict):
-            continue
-        cookie = stream.get("signCookie") or stream.get("cookie") or ""
-        raw_url = stream.get("url") or ""
-        playable = _dash_from_sign_cookie(cookie)
-        if not playable and raw_url and not _is_dummy_url(raw_url):
-            playable = raw_url
-        if not playable or playable in seen or _is_mb_notice_url(playable):
-            continue
-        seen.add(playable)
-        res = stream.get("resolutions") or stream.get("resolution") or stream.get("quality") or "?"
-        fmt = stream.get("format") or (
-            "DASH" if ".mpd" in playable else "HLS" if ".m3u8" in playable else "MP4"
-        )
-        headers = {"User-Agent": user_agent or _mb_ua, "Referer": "https://sportslive.wine"}
-        if cookie:
-            headers["Cookie"] = "; ".join(p.strip() for p in cookie.strip(";").split(";") if p.strip())
-        out.append(
-            {
-                "resolution": f"{res}p" if str(res).replace(",", "").isdigit() else str(res),
-                "format": fmt,
-                "url": playable,
-                "size": stream.get("size"),
-                "duration": stream.get("duration"),
-                "codec": stream.get("codecName") or stream.get("codec"),
-                "id": stream.get("id"),
-                "headers": headers,
-                "source": "play-info",
-            }
-        )
-    for detector in data.get("resourceDetectors") or []:
-        if not isinstance(detector, dict):
-            continue
-        for video in detector.get("resolutionList") or []:
-            if not isinstance(video, dict):
-                continue
-            link = video.get("resourceLink") or video.get("url")
-            if not link or link in seen or _is_dummy_url(link):
-                continue
-            seen.add(link)
-            out.append(
-                {
-                    "resolution": f"{video.get('resolution', '?')}p",
-                    "format": "MP4",
-                    "url": link,
-                    "headers": {"User-Agent": user_agent or _mb_ua},
-                    "source": "resourceDetector",
-                }
-            )
-    for key in ("dash", "hls"):
-        for item in data.get(key) or []:
-            if not isinstance(item, dict):
-                continue
-            link = item.get("url") or item.get("resourceLink")
-            if not link or link in seen or _is_dummy_url(link):
-                continue
-            seen.add(link)
-            out.append(
-                {
-                    "resolution": str(item.get("resolutions") or item.get("resolution") or "auto"),
-                    "format": key.upper(),
-                    "url": link,
-                    "headers": {"User-Agent": user_agent or _mb_ua},
-                    "source": key,
-                }
-            )
-    return out
-
-
-async def _mb_resource_links(subject_id: str, se: int, ep: int) -> List[dict]:
-    try:
-        if se == 0 and ep == 0:
-            path = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&page=1&perPage=30"
-        else:
-            path = (
-                f"/wefeed-mobile-bff/subject-api/resource"
-                f"?subjectId={subject_id}&se={se}&ep={ep}&page=1&perPage=30"
-            )
-        data = await mb_request("GET", path)
-        items = data.get("list") or []
-        out: List[dict] = []
-        seen = set()
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            link = item.get("resourceLink") or item.get("url")
-            if not link or link in seen or _is_dummy_url(link):
-                continue
-            seen.add(link)
-            fmt = "DASH" if ".mpd" in link else "HLS" if ".m3u8" in link else "MP4" if ".mp4" in link else "FILE"
-            out.append(
-                {
-                    "resolution": f"{item.get('resolution', '?')}p",
-                    "format": fmt,
-                    "url": link,
-                    "size": item.get("size"),
-                    "filename": item.get("fileName") or item.get("title"),
-                    "id": item.get("resourceId") or item.get("id"),
-                    "headers": {"User-Agent": _mb_ua},
-                    "source": "resource",
-                }
-            )
-        return out
-    except Exception:
-        return []
-
-
-# =============================================================================
-# HUBCLOUD / HUBDRIVE RESOLVER
-# =============================================================================
-
-FK_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
-
-
-def _pixeldrain_file_id(url: str) -> Optional[str]:
-    try:
-        p = urlparse(url)
-        host = (p.hostname or "").lower()
-        if "pixeldrain." not in host and "pixeldra.in" not in host and "pixeldrain.eu.cc" not in host:
-            return None
-        path = p.path or ""
-        fid = None
-        if "/u/" in path:
-            fid = path.split("/u/")[-1].strip("/").split("/")[0]
-        elif "/api/file/" in path:
-            fid = path.split("/api/file/")[-1].strip("/").split("/")[0].split("?")[0]
-        else:
-            # bare /{id} on bypass CDN
-            parts = [x for x in path.split("/") if x]
-            if len(parts) == 1 and re.match(r"^[\w\-]+$", parts[0]):
-                fid = parts[0]
-        if fid and re.match(r"^[\w\-]+$", fid):
-            return fid
-    except Exception:
-        return None
-    return None
-
-
-def _pixeldrain_api(url: str) -> Optional[str]:
-    """GameDrive bypass CDN entry (resolved further at preflight)."""
-    fid = _pixeldrain_file_id(url)
-    if not fid:
-        return None
-    return f"https://cdn.pixeldrain.eu.cc/{fid}"
-
-
-def _pixeldrain_bypass_urls(api_url: str) -> List[str]:
-    """GameDrive / pixeldrain-bypass.gamedrive.org CDN first, then official API."""
-    fid = _pixeldrain_file_id(api_url)
-    if not fid:
-        # try extract from any url string
-        m = re.search(r"(?:pixeldrain\.[a-z.]+/(?:u|api/file)/|cdn\.pixeldrain\.eu\.cc/)([\w\-]+)", api_url or "")
-        fid = m.group(1) if m else None
-    urls = []
-    if fid:
-        urls.append(f"https://cdn.pixeldrain.eu.cc/{fid}")
-        urls.append(f"https://pixeldrain.com/api/file/{fid}?download")
-        urls.append(f"https://pixeldrain.dev/api/file/{fid}?download")
-    if api_url and api_url not in urls:
-        urls.append(api_url)
-    out, seen = [], set()
-    for u in urls:
-        if u and u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
-
-
-
-async def preflight_url(url: str, headers: Optional[dict] = None) -> Optional[str]:
-    """Light probe — HEAD first, then tiny Range GET. Keeps final redirected URL."""
-    h = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-    }
-    if headers:
-        h.update({k: v for k, v in headers.items() if k.lower() not in ("range",)})
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-            # HEAD is enough for CDN availability
-            try:
-                rh = await client.head(url, headers=h)
-                if rh.status_code in (200, 206):
-                    ctype = (rh.headers.get("content-type") or "").lower()
-                    if "text/html" not in ctype and "application/json" not in ctype:
-                        final = str(rh.url)
-                        if _is_playable_direct(final):
-                            return final
-            except Exception:
-                pass
-            h2 = {**h, "Range": "bytes=0-1023"}
-            r = await client.get(url, headers=h2)
-            if r.status_code not in (200, 206):
-                return None
-            if len(r.content) < 32:
-                return None
-            ctype = (r.headers.get("content-type") or "").lower()
-            if "text/html" in ctype or "application/json" in ctype:
-                return None
-            head = r.content[:120].lstrip().lower()
-            if head.startswith(b"<!doctype") or head.startswith(b"<html") or head.startswith(b"{"):
-                return None
-            final = str(r.url)
-            if not _is_playable_direct(final):
-                return None
-            return final
-    except Exception:
-        return None
-    return None
-
-
-
-
-async def collect_4k_mirrors(title: str, se: int = 0, ep: int = 0, limit: int = 12) -> List[dict]:
-    """Search 4KHDHub by title → releases → HubCloud resolve → preflight working links only."""
-    mirrors: List[dict] = []
-    clean = re.sub(r"\[[^\]]*\]", " ", title or "")
-    clean = re.sub(r"\([^)]*\)", " ", clean)
-    clean = re.sub(r"\s+", " ", clean).strip()
-    if not clean:
-        return []
-    try:
-        html = await fk_fetch(f"?s={clean}")
-        items = fk_parse_search(html)
-    except Exception:
-        return []
-    if not items:
-        return []
-    # pick best match page
-    page_id = items[0].get("id")
-    if not page_id:
-        return []
-    try:
-        page_html = await fk_fetch(page_id)
-        releases = fk_parse_releases(page_html, se if se else 0, ep if ep else 0)
-    except Exception:
-        return []
-    for rel in releases[:8]:
-        for mirror in (rel.get("mirrors") or [])[:6]:
-            if len(mirrors) >= limit:
-                break
-            url = mirror.get("url") or ""
-            label = mirror.get("label") or "Mirror"
-            fname = rel.get("filename") or rel.get("title") or ""
-            direct_list = []
-            if mirror.get("needs_resolve") or ("hubcloud." in url and "/drive/" in url):
-                try:
-                    direct_list = await resolve_any(url)
-                except Exception:
-                    direct_list = []
-            elif url.startswith("https://"):
-                direct_list = [{"url": url, "label": label, "headers": {"User-Agent": FK_UA, "Referer": url}}]
-            for d in direct_list:
-                du = d.get("url") or ""
-                if not du:
-                    continue
-                # expand pixeldrain variants
-                variants = _pixeldrain_bypass_urls(du) if "pixeldrain." in du else [du]
-                ok = None
-                hdrs = d.get("headers") or {"User-Agent": FK_UA}
-                for v in variants:
-                    ok = await preflight_url(v, hdrs)
-                    if ok:
-                        du = ok
-                        break
-                if not ok:
-                    continue
-                # browser-playable preference
-                low = du.lower()
-                fmt = "MP4" if ".mp4" in low else ("MKV" if ".mkv" in low else "FILE")
-                mirrors.append({
-                    "provider": "4khdhub",
-                    "label": f"{fname[:40] + ' · ' if fname else ''}{d.get('label') or label}"[:70],
-                    "url": du,
-                    "format": fmt,
-                    "type": "direct",
-                    "headers": hdrs,
-                    "play_url": None,  # filled later if needs proxy; file hosts usually not
-                    "filename": fname,
-                })
-                if len(mirrors) >= limit:
-                    break
-        if len(mirrors) >= limit:
-            break
-    return mirrors
-
-
-
-def _unwrap_pages_dev(url: str) -> Optional[str]:
-    try:
-        p = urlparse(url)
-        if not p.hostname or "pages.dev" not in p.hostname:
-            return None
-        qs = dict(parse_qsl(p.query))
-        b64 = qs.get("u")
-        if not b64:
-            return None
-        pad = (4 - len(b64) % 4) % 4
-        decoded = base64.b64decode(b64 + ("=" * pad)).decode("utf-8", errors="ignore")
-        if decoded.startswith("https://"):
-            return decoded
-    except Exception:
-        pass
-    return None
-
-
-def _is_playable_direct(url: str) -> bool:
-    """Only CDN / file hosts — reject ads, telegram, intermediate download pages."""
-    try:
-        p = urlparse(url)
-        if p.scheme != "https" or not p.hostname:
-            return False
-        host = p.hostname.lower()
-        path = p.path.lower()
-        full = url.lower()
-        if host in ("localhost",) or host.endswith(".local"):
-            return False
-        if path.endswith((".zip", ".rar", ".7z")) or "login.php" in path or "logout" in path:
-            return False
-        if "hubcloud." in host and path.startswith("/drive/"):
-            return False
-        block = (
-            "t.me", "telegram.", "tinyurl.", "bit.ly", "one.one.one.one",
-            "cloudflare.com", "hdhub4u", "facebook.", "youtube.", "instagram.",
-            "twitter.", "x.com", "reddit.", "gamerxyt.", "how-to", "vpn",
-            "idm.", "chrome.", "play.google.",
-        )
-        if any(b in host for b in block):
-            return False
-        if "telegram" in full or "t.me/" in full:
-            return False
-        # Allowed CDN / storage hosts (MovieBox-TUI priority list)
-        good = (
-            "pixeldrain.", "pixeldrain.eu.cc", "workers.dev", "r2.dev", "cloudflarestorage",
-            "googleusercontent.com", "storage.googleapis.com", "googleapis.com",
-            "gofile.", "workupload.", "streamtape.", "pixel.",
-            "download.", "cdn.", "hubcloud.fans", "hubcloud.cx", "hubcloud.ist",
-        )
-        if any(g in host for g in good):
-            return True
-        if any(path.endswith(ext) for ext in (".mp4", ".mkv", ".m3u8", ".mpd", ".avi", ".mov", ".webm")):
-            return True
-        return False
-    except Exception:
-        return False
-
-
-def _score_mirror(url: str, label: str) -> int:
-    v = f"{url} {label}".lower()
-    if any(
-        x in v
-        for x in (
-            "cloudflarestorage.com",
-            "r2.cloudflarestorage.com",
-            "r2.dev",
-            "workers.dev",
-            "fsl server",
-            "watch online",
-        )
-    ):
-        return 0
-    if any(x in v for x in ("storage.googleapis.com", "hubcloud.cx/re/", "hubcloud.fans/re/")):
-        return 1
-    if "pixeldrain" in v:
-        return 2
-    if any(x in v for x in ("googleusercontent.com", "googlevideo.com", "testzip.php", "gpdl.")):
-        return 3
-    return 4
-
-
-
-def _rot13(s: str) -> str:
-    out = []
-    for c in s:
-        if "a" <= c <= "z":
-            out.append(chr((ord(c) - 97 + 13) % 26 + 97))
-        elif "A" <= c <= "Z":
-            out.append(chr((ord(c) - 65 + 13) % 26 + 65))
-        else:
-            out.append(c)
-    return "".join(out)
-
-
-def _b64pad(s: str) -> str:
-    return s + ("=" * ((4 - len(s) % 4) % 4))
-
-
-def _decode_greenmotors_payload(payload: str) -> Optional[str]:
-    """MovieBox-TUI compatible greenmotors decode pipeline."""
-    try:
-        s1 = base64.b64decode(_b64pad(payload)).decode("utf-8")
-        s2 = base64.b64decode(_b64pad(s1)).decode("utf-8")
-        s3 = _rot13(s2)
-        s4 = base64.b64decode(_b64pad(s3)).decode("utf-8")
-        j = json.loads(s4)
-        target_b64 = j.get("o") or ""
-        return base64.b64decode(_b64pad(target_b64)).decode("utf-8")
-    except Exception:
-        return None
-
-
-async def resolve_greenmotors(url: str) -> List[dict]:
-    """greenmotors.club/?id=… → hubcloud/hubdrive/direct (MovieBox-TUI)."""
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://4khdhub.one/",
-    }) as client:
-        r = await client.get(url)
-        html = r.text
-    payload = None
-    m = re.search(r"s\(\s*['\"]o['\"]\s*,\s*['\"]([^'\"]+)['\"]", html)
-    if m:
-        payload = m.group(1)
-    if not payload:
-        # try id query as last resort
-        m = re.search(r"[?&]id=([^&]+)", url)
-        if m:
-            payload = unquote(m.group(1))
-    target = _decode_greenmotors_payload(payload) if payload else None
-    if not target:
-        raise HTTPException(502, "GreenMotors: could not decode target")
-    if "hubcloud." in target and "/drive/" in target:
-        return await resolve_hubcloud(target)
-    if "hubdrive." in target:
-        return await resolve_hubdrive(target)
-    return [{"url": target, "label": "Direct", "source": "greenmotors"}]
-
-
-async def resolve_hubcloud(drive_url: str) -> List[dict]:
-    """
-    hubcloud.*/drive/xxx  →  all direct mirrors (FSL, 10Gbps, PixelDrain, Watch Online, R2…)
-    """
-    if "hubcloud." not in drive_url or "/drive/" not in drive_url:
-        raise HTTPException(400, "Not a HubCloud /drive/ URL")
-
-    headers = {
-        "User-Agent": FK_UA,
-        "Referer": drive_url,
-        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-    }
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0, headers=headers) as client:
-        r1 = await client.get(drive_url)
-        if r1.status_code != 200:
-            raise HTTPException(502, f"HubCloud page HTTP {r1.status_code}")
-        soup1 = BeautifulSoup(r1.text, "html.parser")
-        title = (soup1.title.string or "").strip() if soup1.title else ""
-
-        resolver_urls: List[str] = []
-        for a in soup1.select("a[href]"):
-            href = (a.get("href") or "").strip()
-            if not href.startswith("http"):
-                continue
-            low = href.lower()
-            if any(x in low for x in ("gamerxyt.com", "hubcloud.php", "/download/", "generate")):
-                if href not in resolver_urls:
-                    resolver_urls.append(href)
-        if not resolver_urls:
-            m = re.search(
-                r"https?://gamerxyt\.com/hubcloud\.php\?[^\s\"'<>]+",
-                r1.text,
-            )
-            if m:
-                resolver_urls.append(m.group(0).rstrip("\\';'\""))
-        if not resolver_urls:
-            raise HTTPException(502, "HubCloud: download / generate link not found")
-
-        html2 = ""
-        for ru in resolver_urls:
-            try:
-                r2 = await client.get(ru, headers={**headers, "Referer": drive_url})
-                if r2.status_code == 200 and len(r2.text) > 200 and "404" not in r2.text[:20]:
-                    html2 = r2.text
-                    break
-            except Exception:
-                continue
-        if not html2:
-            raise HTTPException(502, "HubCloud resolver page failed (gamerxyt/mirror down)")
-
-        soup2 = BeautifulSoup(html2, "html.parser")
-        candidates: List[Tuple[int, str, str]] = []
-
-        def _add(url: str, label: str, score: int = 50):
-            if not url or not url.startswith("http"):
-                return
-            # normalize pixeldrain
-            pd = _pixeldrain_api(url) if "pixeldrain" in url.lower() or "pixeldra" in url.lower() else None
-            final = pd or url
-            try:
-                unwrapped = _unwrap_pages_dev(final)
-                if unwrapped and unwrapped.startswith("http"):
-                    final = unwrapped
-            except Exception:
-                pass
-            candidates.append((score, final, label[:100]))
-
-        for a in soup2.select("a[href]"):
-            href = (a.get("href") or "").strip()
-            if not href.startswith("http"):
-                continue
-            label = a.get_text(" ", strip=True) or "Direct"
-            low = (label + " " + href).lower()
-            if any(x in low for x in (
-                "telegram", "winexch", "login", "vpn", "tutorial", "idm", "ida",
-                "google.com/search", "movies4u", "hdhub4u", "facebook", "twitter",
-                "instagram", "youtube.com", "t.me/", "favicon", "bootstrap",
-            )):
-                continue
-            try:
-                from urllib.parse import urlparse as _up
-                path=(_up(href).path or "").strip("/")
-                host=(_up(href).hostname or "").lower()
-                junk_hosts=("movies4u.","hdhub4u.","t.me","telegram","facebook.","twitter.","instagram.")
-                if any(host.endswith(j.rstrip(".")) or j in host for j in junk_hosts):
-                    continue
-                if not path and not any(x in host for x in ("pixeldrain","r2.cloudflare","workers.dev","bunker.monster","hubcloud")):
-                    continue
-            except Exception:
-                pass
-            score = 50
-            if "fsl" in low:
-                score = 5
-            elif "10gbps" in low or "10 gbps" in low:
-                score = 10
-            elif "pixel" in low:
-                score = 15
-            elif "watch" in low:
-                score = 20
-            elif "r2.cloudflare" in low or "workers.dev" in low:
-                score = 12
-            elif "hubcdn" in low or "gpdl.hubcloud" in low:
-                score = 18
-            _add(href, label, score)
-
-        # raw pixeldrain strings in HTML
-        for m in re.finditer(
-            r"https?://(?:www\.)?pixeldrain\.(?:com|dev|net)/[u/]+([A-Za-z0-9_-]+)",
-            html2,
-        ):
-            fid = m.group(1)
-            _add(f"https://cdn.pixeldrain.eu.cc/{fid}", "PixelDrain", 15)
-            _add(f"https://pixeldrain.com/api/file/{fid}?download", "PixelDrain API", 16)
-
-        candidates.sort(key=lambda x: x[0])
-        seen = set()
-        results = []
-        for score, url, label in candidates:
-            if url in seen:
-                continue
-            seen.add(url)
-            results.append(
-                {
-                    "label": label,
-                    "url": url,
-                    "priority": score,
-                    "direct": True,
-                    "title": title or None,
-                    "source": "hubcloud",
-                }
-            )
-        if not results:
-            raise HTTPException(502, "HubCloud: no direct links extracted")
-        return results
-
-
-async def resolve_hubdrive(file_url: str) -> List[dict]:
-    """
-    hubdrive.*/file/xxx → HubCloud server → same mirrors as HubCloud.
-    """
-    if "hubdrive." not in file_url:
-        raise HTTPException(400, "Not a HubDrive URL")
-    headers = {"User-Agent": FK_UA, "Referer": file_url, "Accept": "text/html,*/*"}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=25.0, headers=headers) as client:
-        r = await client.get(file_url)
-        if r.status_code != 200:
-            raise HTTPException(502, f"HubDrive HTTP {r.status_code}")
-        soup = BeautifulSoup(r.text, "html.parser")
-        title = (soup.title.string or "").strip() if soup.title else ""
-        hub_links: List[str] = []
-        for a in soup.select("a[href]"):
-            href = (a.get("href") or "").strip()
-            text = a.get_text(" ", strip=True)
-            if "hubcloud" in href.lower() or "hubcloud" in text.lower():
-                if href.startswith("/"):
-                    href = str(r.url).rstrip("/") + href  # unlikely
-                if href.startswith("http") and href not in hub_links:
-                    hub_links.append(href)
-        # relative hubcloud sometimes
-        if not hub_links:
-            m = re.search(r"https?://hubcloud\.[a-z.]+/drive/[A-Za-z0-9_-]+", r.text)
-            if m:
-                hub_links.append(m.group(0))
-        if not hub_links:
-            raise HTTPException(502, "HubDrive: HubCloud server link not found")
-        all_links: List[dict] = []
-        seen = set()
-        for hl in hub_links[:3]:
-            try:
-                part = await resolve_hubcloud(hl)
-                for item in part:
-                    u = item.get("url")
-                    if u and u not in seen:
-                        seen.add(u)
-                        item = dict(item)
-                        item["hubdrive"] = file_url
-                        item["hubcloud"] = hl
-                        if title and not item.get("title"):
-                            item["title"] = title
-                        all_links.append(item)
-            except Exception:
-                continue
-        if not all_links:
-            raise HTTPException(502, "HubDrive: could not resolve HubCloud mirrors")
-        return all_links
-
-
-async def resolve_any(url: str) -> List[dict]:
-    u = url.strip()
-    low = u.lower()
-    if "hubcloud." in low and "/drive/" in low:
-        return await resolve_hubcloud(u)
-    if "hubdrive." in low:
-        return await resolve_hubdrive(u)
-    if "gamerxyt.com/hubcloud.php" in low:
-        # treat as already-resolved generator page — wrap as drive if possible
-        m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", u)
-        if m:
-            return await resolve_hubcloud(f"https://hubcloud.ist/drive/{m.group(1)}")
-    if "pixeldrain." in low:
-        api = _pixeldrain_api(u)
-        if api:
-            return [{"label": "PixelDrain", "url": api, "priority": 10, "direct": True, "source": "pixeldrain"}]
-    if "greenmotors." in low or "greenmountmotors." in low:
-        return await resolve_greenmotors(u)
-    raise HTTPException(
-        400,
-        "Supported: hubcloud.*/drive/..., hubdrive.*/file/..., greenmotors, pixeldrain",
-    )
-
-
-# =============================================================================
-# 4KHDHub scrape
-# =============================================================================
-
-FK_BASES = [
-    "https://4khdhub.one/",
-    "https://4khdhub.link/",
-    "https://4khdhub.click/",
-    "https://4khdhub.ink/",
-]
-_fk_base = FK_BASES[0]
-
-
-async def fk_fetch(path_or_url: str) -> str:
-    global _fk_base
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20.0, headers={"User-Agent": FK_UA}) as client:
-        candidates = (
-            [path_or_url]
-            if path_or_url.startswith("http")
-            else [urljoin(b, path_or_url.lstrip("/")) for b in FK_BASES]
-        )
-        last_err = None
-        for url in candidates:
-            try:
-                resp = await client.get(url)
-                if resp.status_code == 200 and len(resp.text) > 400:
-                    p = urlparse(str(resp.url))
-                    _fk_base = f"{p.scheme}://{p.netloc}/"
-                    return resp.text
-            except Exception as e:
-                last_err = e
-        raise HTTPException(502, f"4KHDHub unreachable: {last_err}")
-
-
-def fk_parse_search(html: str) -> List[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    items = []
-    for card in soup.select("a.movie-card"):
-        href = card.get("href") or ""
-        title_el = card.select_one(".movie-card-title")
-        title = title_el.get_text(strip=True) if title_el else ""
-        if not title or not href:
-            continue
-        meta_el = card.select_one(".movie-card-meta")
-        meta_text = meta_el.get_text(" ", strip=True) if meta_el else ""
-        img = card.select_one("img")
-        year = None
-        m = re.search(r"(19|20)\d{2}", meta_text or title)
-        if m:
-            year = m.group(0)
-        path = urlparse(href).path if href.startswith("http") else href
-        items.append(
-            {
-                "name": title,
-                "id": path,
-                "poster_url": img.get("src") if img else None,
-                "year": year,
-                "type": "series" if "-series-" in href else "movie",
-                "provider": "4khdhub",
-            }
-        )
-    return items
-
-
-def fk_parse_releases(html: str, season: int = 0, episode: int = 0) -> List[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    item_sel = "#episodes .episode-download-item" if season > 0 else ".download-item"
-    title_sel = ".episode-file-title" if season > 0 else ".file-title"
-    releases = []
-    for item in soup.select(item_sel):
-        title_el = item.select_one(title_sel)
-        filename = title_el.get_text(strip=True) if title_el else ""
-        if not filename or filename.lower().endswith((".zip", ".rar", ".7z")):
-            continue
-        if season > 0:
-            m = re.search(r"S0*(\d+)\s*E0*(\d+)", filename, re.I)
-            if not m or int(m.group(1)) != season or int(m.group(2)) != episode:
-                continue
-        mirrors = []
-        for link in item.select("a[href]"):
-            href = link.get("href") or ""
-            if not href.startswith("https://") or "logout" in href.lower():
-                continue
-            mirrors.append(
-                {
-                    "label": link.get_text(strip=True) or "Source",
-                    "url": href,
-                    "needs_resolve": any(x in href for x in ("hubcloud.", "hubdrive.", "greenmotors.", "gamerxyt.")),
-                }
-            )
-        if not mirrors:
-            continue
-        quality = None
-        for q in ("2160", "1080", "720", "480", "360"):
-            if q in filename:
-                quality = f"{q}p"
-                break
-        size_el = item.select_one(".badge-size, .badge")
-        releases.append(
-            {
-                "filename": filename,
-                "quality": quality,
-                "size": size_el.get_text(strip=True) if size_el else None,
-                "mirrors": mirrors,
-            }
-        )
-    return releases
-
-
-# =============================================================================
-# UI
-# =============================================================================
-
-# (old static landing removed — SPA at / and /site)
-
-
-# =============================================================================
-# ROUTES
-# =============================================================================
-
-
-# old root replaced by SPA below
 
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return {"ok": True, "version": "5.18.0", "providers": ["tmdb", "vidsrc", "4khdhub", "hubcloud", "ytmusic", "jiosaavn", "deezer", "piped", "lrclib", "moviebox-api", "netmirror", "vixsrc"]}
+    return {"ok": True, "version": "5.34.0", "creator": "ElitePlex", "providers": ["hindianime", "ytmusic", "deezer", "jiosaavn", "tmdb"]}
+
+@app.get("/anime/status", tags=["Anime"])
+async def anime_status():
+    """Health of HindiAnime catalog + stream tunnel."""
+    out: Dict[str, Any] = {"provider": "hindianime", "ok": False}
+    try:
+        cat = await _ha_catalog()
+        out["catalog"] = True
+        out["series"] = cat.get("totalSeries") or len(cat.get("series") or [])
+        out["movies"] = cat.get("totalMovies") or len(cat.get("movies") or [])
+    except Exception as e:
+        out["catalog"] = False
+        out["catalog_error"] = str(e)[:100]
+    # tunnel probe with known hash if possible
+    try:
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+            r = await client.get(
+                f"{HA_STREAM}/api/proxy/master.m3u8?hash=36660e59856b4de58a219bcf4e27eba3",
+                headers={"User-Agent": "Mozilla/5.0", "Referer": HA_BASE + "/", "Accept": "*/*"},
+            )
+            out["tunnel"] = r.status_code == 200 and (r.text or "").lstrip().startswith("#EXTM3U")
+            out["tunnel_status"] = r.status_code
+    except Exception as e:
+        out["tunnel"] = False
+        out["tunnel_error"] = str(e)[:80]
+    out["ok"] = bool(out.get("catalog"))
+    out["note"] = "Streaming via /anime/stream or /anime/hls"
+    return out
 
 
-# ----- Mov
-# =============================================================================
-# STREAM PROXY — MovieBox-TUI style (Cookie/UA on every segment + Range + MPD rewrite)
-# =============================================================================
-
-def _b64url_encode(obj: dict) -> str:
-    raw = json.dumps(obj, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
-
-
-def _b64url_decode(s: str) -> dict:
-    pad = "=" * ((4 - len(s) % 4) % 4)
-    return json.loads(base64.urlsafe_b64decode(s + pad))
-
-
-def _proxy_url(src: dict, base: str = "") -> str:
-    """play_url for browser: /proxy/file/{token} where token holds url+cookie+ua+referer."""
-    if src.get("type") != "direct" or not src.get("url"):
-        return src.get("url") or ""
-    h = src.get("headers") or {}
-    tok = _b64url_encode({
-        "u": src["url"],
-        "c": h.get("Cookie") or h.get("cookie") or "",
-        "r": h.get("Referer") or h.get("referer") or "https://sportslive.wine",
-        "a": h.get("User-Agent") or h.get("user-agent") or (_mb_ua or "Mozilla/5.0"),
-    })
-    return f"/proxy/file/{tok}"
-
-
-def _auth_headers(cookie: str, referer: str, ua: str) -> dict:
-    h = {
-        "User-Agent": ua or "Mozilla/5.0",
-        "Accept": "*/*",
-        "Referer": referer or "https://sportslive.wine",
-        "Origin": "https://sportslive.wine",
+@app.get("/anime/home", tags=["Anime"])
+async def anime_home():
+    """Home sections from HindiAnime."""
+    data = await _ha_get("/api/home-sections")
+    def ml(key):
+        return [_ha_card(x) for x in (data.get(key) or []) if isinstance(x, dict)]
+    posts = data.get("popularPosts") or {}
+    return {
+        "ok": True,
+        "top_airing": ml("topAiring"),
+        "most_popular": ml("mostPopular"),
+        "completed": ml("completedSeries"),
+        "latest_episodes": ml("latestEpisodes"),
+        "latest_movies": ml("latestMovies"),
+        "upcoming": ml("upcoming"),
+        "popular_day": [_ha_card(x) for x in (posts.get("day") or []) if isinstance(x, dict)],
+        "popular_week": [_ha_card(x) for x in (posts.get("week") or []) if isinstance(x, dict)],
+        "genres": data.get("genres") or [],
+        "provider": "hindianime",
     }
-    if cookie:
-        h["Cookie"] = cookie
-    return h
 
 
-@app.get("/proxy/file/{token}", tags=["Playback"])
-async def proxy_file(token: str, request: Request):
-    try:
-        meta = _b64url_decode(token)
-    except Exception:
-        raise HTTPException(400, "bad token")
-    url = meta.get("u") or ""
-    return await _proxy_upstream(
-        url,
-        meta.get("c") or "",
-        meta.get("r") or "https://sportslive.wine",
-        meta.get("a") or "Mozilla/5.0",
-        range_header=request.headers.get("range") if request else None,
-        rewrite_manifest=True,
-        token_cookie=meta.get("c") or "",
-        token_ref=meta.get("r") or "https://sportslive.wine",
-        token_ua=meta.get("a") or "Mozilla/5.0",
-    )
+@app.get("/anime/hero", tags=["Anime"])
+async def anime_hero():
+    data = await _ha_get("/api/hero")
+    items = [_ha_card(x) for x in (data.get("hero") or []) if isinstance(x, dict)]
+    return {"ok": True, "items": items, "count": len(items), "provider": "hindianime"}
 
 
-@app.api_route("/proxy/cdn/{token}/{path:path}", methods=["GET", "HEAD"], tags=["Playback"])
-async def proxy_cdn(token: str, path: str, request: Request):
-    """Segment/path under CDN — TUI equivalent of /https/host/path with auth."""
-    try:
-        meta = _b64url_decode(token)
-    except Exception:
-        raise HTTPException(400, "bad token")
-    base = (meta.get("u") or "").rstrip("/")
-    # meta.u is directory URL ending with /
-    if not base.endswith("/"):
-        base = base + "/"
-    url = base + path.lstrip("/")
-    return await _proxy_upstream(
-        url,
-        meta.get("c") or "",
-        meta.get("r") or "https://sportslive.wine",
-        meta.get("a") or "Mozilla/5.0",
-        range_header=request.headers.get("range"),
-        rewrite_manifest=False,
-    )
+@app.get("/anime/spotlights", tags=["Anime"])
+async def anime_spotlights():
+    data = await _ha_get("/api/spotlights")
+    items = [_ha_card(x) for x in (data.get("all") or data.get("spotlights") or []) if isinstance(x, dict)]
+    return {
+        "ok": True,
+        "items": items,
+        "is_custom": data.get("isCustom"),
+        "rotation": data.get("rotationPeriodDays"),
+        "provider": "hindianime",
+    }
 
 
-@app.get("/proxy/{token}", tags=["Playback"])
-async def proxy_legacy(token: str, request: Request):
-    try:
-        meta = _b64url_decode(token)
-    except Exception:
-        raise HTTPException(400, "bad token")
-    return await _proxy_upstream(
-        meta.get("u") or "",
-        meta.get("c") or "",
-        meta.get("r") or "https://sportslive.wine",
-        meta.get("a") or "Mozilla/5.0",
-        range_header=request.headers.get("range"),
-        rewrite_manifest=True,
-        token_cookie=meta.get("c") or "",
-        token_ref=meta.get("r") or "https://sportslive.wine",
-        token_ua=meta.get("a") or "Mozilla/5.0",
-    )
+@app.get("/anime/top10", tags=["Anime"])
+async def anime_top10():
+    """Top airing as top10 (site /api/top10 often empty)."""
+    data = await _ha_get("/api/home-sections")
+    items = [_ha_card(x) for x in (data.get("topAiring") or data.get("mostPopular") or []) if isinstance(x, dict)]
+    return {"ok": True, "items": items, "provider": "hindianime"}
 
 
-async def _proxy_upstream(
-    url: str,
-    cookie: str,
-    referer: str,
-    ua: str,
-    range_header: Optional[str] = None,
-    rewrite_manifest: bool = False,
-    token_cookie: str = "",
-    token_ref: str = "",
-    token_ua: str = "",
+@app.get("/anime/catalog", tags=["Anime"])
+async def anime_catalog(
+    type: Optional[str] = Query(None, description="series|movie|all"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
 ):
-    if not url.startswith(("https://", "http://")):
-        raise HTTPException(400, "bad upstream url")
-    headers = _auth_headers(cookie, referer, ua)
-    if range_header:
-        headers["Range"] = range_header
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-        try:
-            upstream = await client.get(url, headers=headers)
-        except Exception as e:
-            raise HTTPException(502, f"proxy: {e}")
-
-        if upstream.status_code >= 400:
-            raise HTTPException(upstream.status_code, f"upstream {upstream.status_code}")
-
-        ctype = (upstream.headers.get("content-type") or "").lower()
-        body = upstream.content
-        final_url = str(upstream.url)
-        is_mpd = (
-            rewrite_manifest
-            and (
-                final_url.lower().endswith(".mpd")
-                or "mpd" in ctype
-                or body[:200].lstrip().startswith(b"<?xml")
-            )
-        )
-        is_m3u = rewrite_manifest and (
-            final_url.lower().endswith(".m3u8") or "mpegurl" in ctype or body[:7] == b"#EXTM3U"
-        )
-
-        if is_mpd:
-            text = body.decode("utf-8", errors="ignore")
-            # Directory for relative segments
-            dir_url = final_url.rsplit("/", 1)[0] + "/"
-            host = urlparse(final_url).hostname or ""
-            dir_tok = _b64url_encode({
-                "u": dir_url,
-                "c": token_cookie or cookie,
-                "r": token_ref or referer,
-                "a": token_ua or ua,
-            })
-            proxy_base = f"/proxy/cdn/{dir_tok}/"
-
-            # TUI-style: rewrite absolute CDN host URLs → our proxy base + path
-            https_prefix = f"https://{host}/"
-            http_prefix = f"http://{host}/"
-            text = text.replace(https_prefix, proxy_base).replace(http_prefix, proxy_base)
-
-            # Inject BaseURL for relative SegmentTemplate ($Number$ stays intact)
-            import re as _re
-            if not _re.search(r"<BaseURL>", text, _re.I):
-                if _re.search(r"<Period[^>]*>", text, _re.I):
-                    text = _re.sub(
-                        r"(<Period[^>]*>)",
-                        rf"\1\n    <BaseURL>{proxy_base}</BaseURL>",
-                        text,
-                        count=1,
-                        flags=_re.I,
-                    )
-                else:
-                    text = _re.sub(
-                        r"(<MPD[^>]*>)",
-                        rf"\1\n  <BaseURL>{proxy_base}</BaseURL>",
-                        text,
-                        count=1,
-                        flags=_re.I,
-                    )
-
-            return Response(
-                content=text.encode("utf-8"),
-                status_code=200,
-                media_type="application/dash+xml",
-                headers={
-                    "cache-control": "no-store",
-                    "access-control-allow-origin": "*",
-                    "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges",
-                },
-            )
-
-        if is_m3u:
-            text = body.decode("utf-8", errors="ignore")
-            dir_url = final_url.rsplit("/", 1)[0] + "/"
-            out = []
-            for line in text.splitlines():
-                if line and not line.startswith("#"):
-                    seg = line.strip()
-                    if not seg.startswith("http"):
-                        seg = dir_url + seg
-                    tok = _b64url_encode({
-                        "u": seg,
-                        "c": token_cookie or cookie,
-                        "r": token_ref or referer,
-                        "a": token_ua or ua,
-                    })
-                    out.append(f"/proxy/file/{tok}")
-                else:
-                    out.append(line)
-            return Response(
-                content="\n".join(out).encode("utf-8"),
-                media_type="application/vnd.apple.mpegurl",
-                headers={"cache-control": "no-store", "access-control-allow-origin": "*"},
-            )
-
-        # Binary segment / mp4 — stream with Range support
-        out_headers = {
-            "cache-control": "no-store",
-            "access-control-allow-origin": "*",
-            "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges",
-        }
-        for k in ("content-type", "content-length", "content-range", "accept-ranges"):
-            if k in upstream.headers:
-                out_headers[k] = upstream.headers[k]
-        media_type = (ctype.split(";")[0] if ctype else None) or "application/octet-stream"
-        return Response(
-            content=body,
-            status_code=upstream.status_code,
-            media_type=media_type,
-            headers=out_headers,
-        )
-
-
-
-
-
-async def _clean_title(title: str) -> str:
-    clean = re.sub(r"\[[^\]]*\]", " ", title or "")
-    clean = re.sub(r"\([^)]*\)", " ", clean)
-    clean = re.sub(r"\s+", " ", clean).strip()
-    return clean or (title or "")
-
-
-
-TMDB_KEY = os.environ.get("TMDB_API_KEY", "1f54bd990f1cdfb230adb312546d765d")
-TMDB_BASE = "https://api.themoviedb.org/3"
-TMDB_IMG = "https://image.tmdb.org/t/p"
-
-
-async def _tmdb_get(path: str, params: Optional[dict] = None) -> dict:
-    q = {"api_key": TMDB_KEY, "language": "en-US"}
-    if params:
-        q.update(params)
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(f"{TMDB_BASE}{path}", params=q)
-        if r.status_code != 200:
-            return {}
-        return r.json()
-
-
-def _tmdb_card(item: dict, media_hint: str = None) -> dict:
-    media = media_hint or item.get("media_type")
-    if not media:
-        media = "tv" if item.get("name") and not item.get("title") else "movie"
-    if media == "person":
-        return None
-    tid = item.get("id")
-    title = item.get("title") or item.get("name") or ""
-    date = item.get("release_date") or item.get("first_air_date") or ""
-    poster = item.get("poster_path")
+    data = await _ha_catalog()
+    series = [_ha_card(x) for x in (data.get("series") or []) if isinstance(x, dict)]
+    movies = [_ha_card(x) for x in (data.get("movies") or []) if isinstance(x, dict)]
+    t = (type or "all").lower()
+    if t in ("series", "tv", "anime"):
+        items = series
+    elif t in ("movie", "movies", "film"):
+        items = movies
+    else:
+        items = series + movies
+    start = (page - 1) * limit
+    chunk = items[start:start + limit]
     return {
-        "id": str(tid),
-        "tmdb_id": str(tid),
-        "name": title,
-        "poster": f"{TMDB_IMG}/w500{poster}" if poster else None,
-        "backdrop": f"{TMDB_IMG}/w1280{item.get('backdrop_path')}" if item.get("backdrop_path") else None,
-        "year": date[:4] if date else None,
-        "rating": item.get("vote_average"),
-        "type": "tv" if media == "tv" else "movie",
-        "provider": "tmdb",
-        "overview": item.get("overview") or "",
+        "ok": True,
+        "type": t,
+        "page": page,
+        "limit": limit,
+        "total": len(items),
+        "total_series": data.get("totalSeries") or len(series),
+        "total_movies": data.get("totalMovies") or len(movies),
+        "items": chunk,
+        "provider": "hindianime",
     }
 
 
-async def _tmdb_search_id(title: str, media: str = "movie"):
-    key = os.environ.get("TMDB_API_KEY", "1f54bd990f1cdfb230adb312546d765d")
-    clean = await _clean_title(title)
+@app.get("/anime/genres", tags=["Anime"])
+async def anime_genres():
+    """Genre list from home-sections + browse-index."""
+    genres = []
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(
-                "https://api.themoviedb.org/3/search/" + ("tv" if media == "tv" else "movie"),
-                params={"api_key": key, "query": clean},
-            )
-            if r.status_code == 200:
-                results = (r.json().get("results") or [])
-                if results:
-                    return {"tmdb": str(results[0]["id"]), "imdb": None, "name": results[0].get("title") or results[0].get("name")}
+        data = await _ha_get("/api/home-sections")
+        genres = data.get("genres") or []
     except Exception:
         pass
-    # Cinemeta fallback → IMDB id
-    try:
-        kind = "series" if media == "tv" else "movie"
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(f"https://v3-cinemeta.strem.io/catalog/{kind}/top/search={clean}.json")
-            if r.status_code == 200:
-                metas = r.json().get("metas") or []
-                if metas:
-                    imdb = metas[0].get("imdb_id") or metas[0].get("id")
-                    if imdb and str(imdb).startswith("tt"):
-                        return {"tmdb": None, "imdb": str(imdb), "name": metas[0].get("name")}
-    except Exception:
-        pass
-    return None
+    if not genres:
+        browse = await _ha_browse()
+        gset = set()
+        for v in (browse.get("index") or {}).values():
+            if isinstance(v, dict):
+                for g in (v.get("g") or []):
+                    gset.add(g)
+        genres = sorted(gset)
+    return {"ok": True, "genres": genres, "count": len(genres), "provider": "hindianime"}
 
 
-def _embed_sources_meta(meta: dict, media: str, se: int = 1, ep: int = 1):
-    """KiduyuTv + FilmSnaps embed catalog (TMDB id)."""
-    tmdb = meta.get("tmdb")
-    if not tmdb:
-        return []
-    try:
-        tid = int(tmdb)
-    except Exception:
-        return []
-    se = max(1, int(se or 1))
-    ep = max(1, int(ep or 1))
-    is_tv = media in ("tv", "series", "show")
-    templates = [
-        ("Videasy", "https://player.videasy.net/movie/{id}", "https://player.videasy.net/tv/{id}/{se}/{ep}"),
-        ("Vidrock", "https://vidrock.net/movie/{id}", "https://vidrock.net/tv/{id}/{se}/{ep}"),
-        ("VidLink", "https://vidlink.pro/movie/{id}", "https://vidlink.pro/tv/{id}/{se}/{ep}"),
-        ("VidFast", "https://vidfast.pro/movie/{id}", "https://vidfast.pro/tv/{id}/{se}/{ep}"),
-        ("VidKing", "https://www.vidking.net/embed/movie/{id}", "https://www.vidking.net/embed/tv/{id}/{se}/{ep}"),
-        ("VidNest", "https://vidnest.fun/movie/{id}", "https://vidnest.fun/tv/{id}/{se}/{ep}"),
-        ("VidUp", "https://vidup.to/movie/{id}", "https://vidup.to/tv/{id}/{se}/{ep}"),
-        ("111Movies", "https://111movies.com/movie/{id}", "https://111movies.com/tv/{id}/{se}/{ep}"),
-        ("Flixer", "https://flixer.su/watch/movie/{id}", "https://flixer.su/watch/tv/{id}/{se}/{ep}"),
-        ("VidCore", "https://vidcore.net/movie/{id}", "https://vidcore.net/tv/{id}/{se}/{ep}"),
-        ("MoviesApi", "https://moviesapi.to/movie/{id}", "https://moviesapi.to/tv/{id}-{se}-{ep}"),
-        ("Peachify", "https://peachify.top/embed/movie/{id}", "https://peachify.top/embed/tv/{id}/{se}/{ep}"),
-        ("VidAPI", "https://vaplayer.ru/embed/movie/{id}", "https://vaplayer.ru/embed/tv/{id}/{se}/{ep}"),
-        ("VidPlus", "https://player.vidplus.to/embed/movie/{id}", "https://player.vidplus.to/embed/tv/{id}/{se}/{ep}"),
-        ("CineSrc", "https://cinesrc.st/embed/movie/{id}", "https://cinesrc.st/embed/tv/{id}?s={se}&e={ep}"),
-        ("Vidzen", "https://vidzen.fun/movie/{id}", "https://vidzen.fun/tv/{id}/{se}/{ep}"),
-        ("Cinemaos", "https://cinemaos.tech/player/{id}", "https://cinemaos.tech/player/{id}/{se}/{ep}"),
-        ("Amri", "https://amri.gg/movie/{id}", "https://amri.gg/tv/{id}/{se}/{ep}"),
-        ("ZxcStream", "https://zxcstream.xyz/embed/movie/{id}", "https://zxcstream.xyz/embed/tv/{id}/{se}/{ep}"),
-        ("VidLux", "https://vidlux.xyz/embed/movie/{id}", "https://vidlux.xyz/embed/tv/{id}/{se}/{ep}"),
-        ("VidSrc WTF v4", "https://vidsrc.wtf/api/4/movie/?id={id}", "https://vidsrc.wtf/api/4/tv/?id={id}&s={se}&e={ep}"),
-        ("VidSrc WTF v3", "https://vidsrc.wtf/api/3/movie/?id={id}", "https://vidsrc.wtf/api/3/tv/?id={id}&s={se}&e={ep}"),
-        ("PrimeSrc", "https://primesrc.me/embed/movie?tmdb={id}", "https://primesrc.me/embed/tv?tmdb={id}&season={se}&episode={ep}"),
-        ("VidZee", "https://player.vidzee.wtf/v2/embed/movie/{id}", "https://player.vidzee.wtf/v2/embed/tv/{id}/{se}/{ep}"),
-        ("Lordflix", "https://lordflix.org/watch/movie/{id}", "https://lordflix.org/watch/tv/{id}/{se}/{ep}"),
-        ("VidSrc", "https://vidsrc.to/embed/movie/{id}", "https://vidsrc.to/embed/tv/{id}/{se}/{ep}"),
-        ("VidSrc.cc", "https://vidsrc.cc/v2/embed/movie/{id}", "https://vidsrc.cc/v2/embed/tv/{id}/{se}/{ep}"),
-        ("AutoEmbed", "https://player.autoembed.cc/embed/movie/{id}", "https://player.autoembed.cc/embed/tv/{id}/{se}/{ep}"),
-        ("2Embed", "https://www.2embed.cc/embed/{id}", "https://www.2embed.cc/embedtv/{id}&s={se}&e={ep}"),
-        ("MultiEmbed", "https://multiembed.mov/?video_id={id}&tmdb=1", "https://multiembed.mov/?video_id={id}&tmdb=1&s={se}&e={ep}"),
-        ("EmbedSU", "https://embed.su/embed/movie/{id}", "https://embed.su/embed/tv/{id}/{se}/{ep}"),
-        ("SmashyStream", "https://player.smashy.stream/movie/{id}", "https://player.smashy.stream/tv/{id}?s={se}&e={ep}"),
-        ("Nxsha", "https://web.nxsha.app/embed/movie/{id}", "https://web.nxsha.app/embed/tv/{id}/{se}/{ep}"),
-        ("ScreenScape", "https://screenscape.me/embed/movie/{id}", "https://screenscape.me/embed/tv/{id}/{se}/{ep}"),
-        ("ChillFlix", "https://chillflix.lol/embed/movie/{id}", "https://chillflix.lol/embed/tv/{id}/{se}/{ep}"),
-        ("MegaPlay", "https://megaplay.buzz/embed/movie/{id}", "https://megaplay.buzz/embed/tv/{id}/{se}/{ep}"),
-    ]
-    out = []
-    for name, m_tpl, t_tpl in templates:
-        try:
-            url = (t_tpl if is_tv else m_tpl).format(id=tid, se=se, ep=ep)
-            out.append({
-                "provider": name,
-                "url": url,
-                "play_url": url,
-                "type": "embed",
-                "format": "EMBED",
-                "phone_friendly": True,
-            })
-        except Exception:
+@app.get("/anime/genre/{genre}", tags=["Anime"])
+async def anime_by_genre(genre: str, limit: int = Query(60, ge=1, le=200)):
+    """Filter catalog by genre using browse-index."""
+    genre_l = genre.lower().strip()
+    browse = await _ha_browse()
+    cat = await _ha_catalog()
+    # map link -> card
+    by_link = {}
+    for x in list(cat.get("series") or []) + list(cat.get("movies") or []):
+        if isinstance(x, dict):
+            link = x.get("link") or ""
+            by_link[link] = x
+            by_link[link.rstrip("/")] = x
+    items = []
+    for link, meta in (browse.get("index") or {}).items():
+        if not isinstance(meta, dict):
             continue
-    return out
-
-
-def _embed_sources(tmdb_id: str, media: str, se: int = 1, ep: int = 1):
-    return _embed_sources_meta({"tmdb": tmdb_id, "imdb": None}, media, se, ep)
-
-
-
-@app.get("/mb/search", tags=["MovieBox"])
-async def mb_search(q: str = Query(..., min_length=1, description="Search query"), page: int = 1):
-    """Search MovieBox catalog. Use returned `subject_id` with /mb/stream and /mb/detail."""
-    data = await mb_request(
-        "POST",
-        "/wefeed-mobile-bff/subject-api/search/v2",
-        {"keyword": q, "page": page, "perPage": 20, "subjectType": 0},
-    )
-    items: List[dict] = []
-    raw: List[Any] = []
-    results = data.get("results") or []
-    if results and isinstance(results[0], dict):
-        raw = results[0].get("subjects") or []
-    if not raw:
-        raw = data.get("list") or data.get("items") or data.get("subjects") or []
-    for s in raw:
-        if isinstance(s, dict) and "subject" in s:
-            s = s["subject"]
-        if not isinstance(s, dict):
-            continue
-        sid = s.get("subjectId") or s.get("id")
-        cover = s.get("cover") or {}
-        poster = cover.get("url") if isinstance(cover, dict) else (s.get("coverUrl") or cover)
-        items.append(
-            {
-                "name": s.get("title") or s.get("name"),
-                "subject_id": str(sid) if sid is not None else None,
-                "poster_url": poster,
-                "slug": s.get("detailPath"),
-                "year": (s.get("releaseDate") or "")[:4] or None,
-                "rating": s.get("imdbRatingValue"),
-                "type": "series" if (s.get("subjectType") or s.get("stype")) == 2 else "movie",
-                "provider": "moviebox",
-            }
-        )
-    return {"provider": "moviebox", "query": q, "page": page, "total": data.get("total") or len(items), "items": items}
-
-
-
-def _mb_norm_subject(s: dict) -> dict:
-    """Normalize a MovieBox subject dict into a stable card."""
-    if not isinstance(s, dict):
-        return {}
-    if "subject" in s and isinstance(s["subject"], dict):
-        s = s["subject"]
-    sid = s.get("subjectId") or s.get("id") or s.get("subject_id")
-    cover = s.get("cover") or {}
-    poster = (
-        cover.get("url")
-        if isinstance(cover, dict)
-        else (s.get("coverUrl") or s.get("poster") or s.get("poster_url") or "")
-    )
-    st = s.get("subjectType") or s.get("stype") or s.get("subject_type") or 1
-    try:
-        st = int(st)
-    except Exception:
-        st = 1
-    kind = "series" if st == 2 else ("music" if st == 6 else "movie")
-    return {
-        "subject_id": str(sid) if sid is not None else None,
-        "title": s.get("title") or s.get("name"),
-        "type": kind,
-        "subject_type": st,
-        "year": s.get("releaseDate") or s.get("year") or s.get("release_date"),
-        "rating": s.get("imdbRatingValue") or s.get("imdbRate") or s.get("score") or s.get("rating"),
-        "genre": s.get("genre"),
-        "poster": poster,
-        "country": s.get("countryName") or s.get("country"),
-        "corner": s.get("corner"),
-        "has_resource": s.get("hasResource", True),
-        "play": f"/play?subject_id={sid}" if sid else None,
-        "stream": f"/mb/stream/{sid}" if sid else None,
-    }
-
-
-def _mb_extract_subjects(payload) -> list:
-    out: list = []
-    if isinstance(payload, list):
-        for x in payload:
-            if isinstance(x, dict):
-                out.append(x)
-        return out
-    if not isinstance(payload, dict):
-        return out
-    for key in ("movie", "tv", "list", "items", "subjects", "subjectList"):
-        val = payload.get(key)
-        if isinstance(val, list):
-            for it in val:
-                if isinstance(it, dict):
-                    if isinstance(it.get("subjects"), list):
-                        out.extend([s for s in it["subjects"] if isinstance(s, dict)])
-                    else:
-                        out.append(it)
-    for it in payload.get("items") or []:
-        if isinstance(it, dict):
-            for s in it.get("subjects") or it.get("subjectList") or []:
-                if isinstance(s, dict):
-                    out.append(s)
-    for block in payload.get("results") or []:
-        if isinstance(block, dict):
-            for s in block.get("subjects") or []:
-                if isinstance(s, dict):
-                    out.append(s)
-    return out
-
-
-async def _mb_catalog(kind: str, page: int = 1, per_page: int = 20) -> dict:
-    """kind: movie | series — paginated catalog from rank + tabs + search."""
-    want = 1 if kind == "movie" else 2
-    page = max(1, int(page or 1))
-    per_page = max(1, min(50, int(per_page or 20)))
-    seen = set()
-    items: list = []
-
-    def add_many(raw_list, force_type: bool = False):
-        for s in raw_list or []:
-            if not isinstance(s, dict):
-                continue
-            card = _mb_norm_subject(s)
-            sid = card.get("subject_id")
-            if not sid or sid in seen:
-                continue
-            st = card.get("subject_type")
-            if force_type:
-                card["subject_type"] = want
-                card["type"] = "series" if want == 2 else "movie"
-            else:
-                if st is not None and int(st) != want:
-                    continue
-            seen.add(sid)
+        gs = [str(g).lower() for g in (meta.get("g") or [])]
+        if genre_l in gs or any(genre_l in g for g in gs):
+            src = by_link.get(link) or by_link.get(link.rstrip("/")) or {"title": _ha_slug_from_link(link).replace("-", " ").title(), "link": link, "type": meta.get("t")}
+            card = _ha_card(src)
+            card["genres"] = meta.get("g") or []
+            card["languages"] = meta.get("lang") or []
             items.append(card)
-
-    try:
-        rank = await mb_request(
-            "GET", f"/wefeed-mobile-bff/subject-api/search-rank?page={page}"
-        )
-        bucket = rank.get("movie") if kind == "movie" else rank.get("tv")
-        add_many(bucket if isinstance(bucket, list) else [], force_type=True)
-    except Exception:
-        pass
-
-    tab_id = 2 if kind == "movie" else 5
-    try:
-        tab = await mb_request(
-            "GET",
-            f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tab_id}&version=",
-        )
-        add_many(_mb_extract_subjects(tab))
-    except Exception:
-        pass
-
-    if len(items) < per_page:
-        seeds = ["a", "e", "i", "the", "love", "man", "2024", "2025", "india", "night"]
-        seed = seeds[(page - 1) % len(seeds)]
-        try:
-            data = await mb_request(
-                "POST",
-                "/wefeed-mobile-bff/subject-api/search/v2",
-                {"keyword": seed, "page": page, "perPage": max(per_page, 20), "subjectType": want},
-            )
-            raw = _mb_extract_subjects(data)
-            filtered = []
-            for s in raw:
-                if isinstance(s, dict) and "subject" in s:
-                    s = s["subject"]
-                if not isinstance(s, dict):
-                    continue
-                try:
-                    st = int(s.get("subjectType") or s.get("stype") or 0)
-                except Exception:
-                    st = 0
-                if st == want:
-                    filtered.append(s)
-            add_many(filtered)
-        except Exception:
-            pass
-
-    page_items = items[:per_page]
-    return {
-        "provider": "moviebox",
-        "type": kind,
-        "page": page,
-        "per_page": per_page,
-        "count": len(page_items),
-        "has_more": len(items) > per_page or len(page_items) >= per_page,
-        "next_page": page + 1 if len(page_items) >= per_page else None,
-        "items": page_items,
-    }
-
-
-@app.get("/mb/movies", tags=["MovieBox"])
-async def mb_movies(page: int = 1, per_page: int = Query(20, ge=1, le=50)):
-    """Paginated MovieBox **movies** only."""
-    return await _mb_catalog("movie", page=page, per_page=per_page)
-
-
-@app.get("/mb/series", tags=["MovieBox"])
-async def mb_series(page: int = 1, per_page: int = Query(20, ge=1, le=50)):
-    """Paginated MovieBox **series / TV** only."""
-    return await _mb_catalog("series", page=page, per_page=per_page)
-
-
-@app.get("/moviebox/movies", tags=["MovieBox-PaxShape"])
-async def moviebox_movies(page: int = 1, perPage: int = Query(20, ge=1, le=50)):
-    """Movies list with pager (PaxSenix-style path)."""
-    data = await _mb_catalog("movie", page=page, per_page=perPage)
-    return {
-        "ok": True,
-        "creator": "ElitePlex-direct",
-        "type": "movie",
-        "pager": {
-            "page": str(page),
-            "per_page": perPage,
-            "has_more": data.get("has_more"),
-            "next_page": str(data["next_page"]) if data.get("next_page") else None,
-        },
-        "items": data.get("items") or [],
-        "count": data.get("count"),
-    }
-
-
-@app.get("/moviebox/series", tags=["MovieBox-PaxShape"])
-async def moviebox_series(page: int = 1, perPage: int = Query(20, ge=1, le=50)):
-    """Series list with pager (PaxSenix-style path)."""
-    data = await _mb_catalog("series", page=page, per_page=perPage)
-    return {
-        "ok": True,
-        "creator": "ElitePlex-direct",
-        "type": "series",
-        "pager": {
-            "page": str(page),
-            "per_page": perPage,
-            "has_more": data.get("has_more"),
-            "next_page": str(data["next_page"]) if data.get("next_page") else None,
-        },
-        "items": data.get("items") or [],
-        "count": data.get("count"),
-    }
-
-
-
-
-@app.get("/mb/resource/{subject_id}", tags=["MovieBox"])
-async def mb_resource(
-    subject_id: str,
-    se: int = 0,
-    ep: int = 0,
-    page: int = 1,
-    perPage: int = Query(20, ge=1, le=50),
-    resolution: int = Query(0, description="0=all, or 480/720/1080"),
-):
-    """
-    MovieBox community/server **resource** list (from MovieBox-TUI).
-    Higher bitrate mirrors alongside play-info DASH.
-    """
-    q = f"subjectId={subject_id}&page={page}&perPage={perPage}"
-    if se or ep:
-        q += f"&se={se}&ep={ep}"
-    if resolution:
-        q += f"&resolution={resolution}"
-    path = f"/wefeed-mobile-bff/subject-api/resource?{q}"
-    try:
-        data = await mb_request("GET", path)
-    except HTTPException:
-        # older path without resolution
-        path2 = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&page={page}&perPage={perPage}"
-        if se or ep:
-            path2 += f"&se={se}&ep={ep}"
-        data = await mb_request("GET", path2)
-    items = []
-    raw_list = []
-    if isinstance(data, dict):
-        raw_list = data.get("list") or data.get("items") or data.get("resources") or data.get("resourceList") or []
-        if not raw_list and data.get("data"):
-            d = data["data"]
-            if isinstance(d, dict):
-                raw_list = d.get("list") or d.get("items") or []
-            elif isinstance(d, list):
-                raw_list = d
-    elif isinstance(data, list):
-        raw_list = data
-    for it in raw_list:
-        if not isinstance(it, dict):
-            continue
-        url = it.get("url") or it.get("resourceLink") or it.get("downloadUrl") or ""
-        cookie = it.get("signCookie") or it.get("cookie") or ""
-        dash = _dash_from_sign_cookie(cookie) if cookie else None
-        playable = dash or (url if url and not _is_dummy_url(url) else None)
-        headers = {"User-Agent": _mb_ua, "Referer": globals().get("STREAM_REFERER", "https://sportslive.wine")}
-        if cookie:
-            headers["Cookie"] = "; ".join(p.strip() for p in cookie.strip(";").split(";") if p.strip())
-            if playable and ".mpd" in (playable or ""):
-                try:
-                    _mb_proxy_remember(playable, headers["Cookie"], headers["Referer"])
-                except Exception:
-                    pass
-        items.append({
-            "id": str(it.get("id") or it.get("resourceId") or ""),
-            "title": it.get("title") or it.get("name") or it.get("resolution"),
-            "resolution": it.get("resolution") or it.get("quality"),
-            "size": it.get("size"),
-            "format": it.get("format") or ("DASH" if playable and ".mpd" in (playable or "") else "MP4"),
-            "url": url,
-            "dash_url": playable,
-            "proxy_url": f"/mb/proxy/mpd?u={quote(playable, safe='')}" if playable and ".mpd" in (playable or "") else None,
-            "headers": headers,
-            "se": it.get("se") or se,
-            "ep": it.get("ep") or ep,
-        })
-    return {
-        "provider": "moviebox",
-        "subject_id": subject_id,
-        "se": se,
-        "ep": ep,
-        "page": page,
-        "count": len(items),
-        "items": items,
-        "raw_keys": list(data.keys()) if isinstance(data, dict) else [],
-    }
-
-
-@app.get("/mb/suggest", tags=["MovieBox"])
-async def mb_suggest(q: str = Query(..., min_length=1)):
-    """Autocomplete-style search (first page of search/v2)."""
-    data = await mb_search(q=q, page=1)
-    return {
-        "query": q,
-        "suggestions": [
-            {
-                "subject_id": it.get("subject_id"),
-                "title": it.get("name") or it.get("title"),
-                "type": it.get("type"),
-                "year": it.get("year"),
-                "poster": it.get("poster_url") or it.get("poster"),
-            }
-            for it in (data.get("items") or [])[:12]
-        ],
-    }
-
-
-@app.get("/mb/rank", tags=["MovieBox"])
-async def mb_rank(page: int = 1):
-    """Trending rank: movies + TV (search-rank)."""
-    data = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/search-rank?page={page}")
-    movies = [_mb_norm_subject(x) for x in (data.get("movie") or []) if isinstance(x, dict)]
-    series = [_mb_norm_subject(x) for x in (data.get("tv") or []) if isinstance(x, dict)]
-    for m in movies:
-        m["type"] = "movie"
-        m["subject_type"] = 1
-    for s in series:
-        s["type"] = "series"
-        s["subject_type"] = 2
-    return {
-        "provider": "moviebox",
-        "page": page,
-        "movies": movies,
-        "series": series,
-        "count": len(movies) + len(series),
-    }
-
-
-@app.get("/mb/season/{subject_id}", tags=["MovieBox"])
-async def mb_season(subject_id: str):
-    """Season / episode structure for a series."""
-    data = await mb_request(
-        "GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subject_id}"
-    )
-    return {"provider": "moviebox", "subject_id": subject_id, "data": data}
-
-
-@app.get("/mb/play/{subject_id}", tags=["MovieBox"])
-async def mb_play(
-    subject_id: str,
-    se: int = 0,
-    ep: int = 0,
-):
-    """
-    Unified MovieBox play: play-info DASH (proxied) + resource mirrors.
-    Preferred entry for clients.
-    """
-    stream = await mb_stream(subject_id, se=se, ep=ep)
-    try:
-        res = await mb_resource(subject_id, se=se, ep=ep, page=1)
-        stream["resources"] = res.get("items") or []
-    except Exception as e:
-        stream["resources"] = []
-        stream["resource_error"] = str(e)[:120]
-    return stream
-
-@app.get("/mb/detail/{subject_id}", tags=["MovieBox"])
-async def mb_detail(subject_id: str):
-    """Full metadata for a MovieBox title. Series include season info."""
-    data = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}")
-    subject = data.get("subject") or data
-    if (subject.get("subjectType") or subject.get("stype") or 1) == 2:
-        try:
-            subject["seasons"] = await mb_request(
-                "GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subject_id}"
-            )
-        except Exception:
-            pass
-    return {"provider": "moviebox", "data": subject}
-
-
-
-@app.get("/mb/stream/{subject_id}", tags=["MovieBox"])
-async def mb_stream(subject_id: str, se: int = 0, ep: int = 0):
-    """
-    **One play endpoint for a MovieBox subject_id.**
-
-    - `mp4` — progressive files if any (all phones)
-    - `sources` — DASH/MPD + headers (HEVC; use VLC)
-    - `qualities` — MPD broken into 1080/720/480
-    - `play` — best single URL to open first
-    """
-    if se == 0 and ep == 0:
-        path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}"
-    else:
-        path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={se}&ep={ep}"
-    data: dict = {}
-    try:
-        data = await mb_request("GET", path)
-    except HTTPException:
-        try:
-            data = await mb_request("GET", path.replace("/play-info/v2", "/play-info"))
-        except HTTPException:
-            data = {}
-    if not isinstance(data, dict):
-        data = {}
-
-    sources = _parse_mb_play_info(data, _mb_ua)
-    # H5 play/download fallback (sometimes H.264 when mobile is HEVC-only)
-    try:
-        h5 = await _mb_h5_play(subject_id, se, ep)
-        if h5:
-            h5_sources = _parse_mb_play_info(h5, _mb_ua)
-            for s in h5_sources:
-                s["source"] = s.get("source") or "h5"
-            sources = sources + h5_sources
-    except Exception:
-        pass
-    try:
-        extra = await _mb_resource_links(subject_id, se, ep)
-    except Exception:
-        extra = []
-    seen = {s.get("url") for s in sources}
-    for item in extra:
-        if item.get("url") and item["url"] not in seen and not _is_mb_notice_url(item.get("url") or ""):
-            sources.append(item)
-            seen.add(item["url"])
-    # drop notice / dummy streams
-    sources = [s for s in sources if s.get("url") and not _is_mb_notice_url(s.get("url") or "")]
-
-    referer = globals().get("STREAM_REFERER", "https://sportslive.wine")
-    for s in sources:
-        h = dict(s.get("headers") or {})
-        h.setdefault("User-Agent", _mb_ua)
-        h.setdefault("Referer", referer)
-        s["headers"] = h
-        s["play_url"] = s.get("url")
-
-    # Flag when only HEVC DASH (no progressive MP4)
-    only_hevc = bool(sources) and all(
-        ("hevc" in str(s.get("codec") or "").lower() or "h265" in str(s.get("codec") or "").lower() or ".mpd" in (s.get("url") or ""))
-        for s in sources
-    ) and not any(".mp4" in (s.get("url") or "").lower() for s in sources)
-
-    # Progressive MP4 only (real files)
-    mp4_list = []
-    for s in sources:
-        u = (s.get("url") or "").strip()
-        if not u or _is_dummy_url(u):
-            continue
-        if ".mpd" in u or ".m3u8" in u:
-            continue
-        if any(x in u.lower() for x in (".mp4", ".mkv", ".webm")):
-            mp4_list.append({
-                "label": s.get("resolution") or "MP4",
-                "url": u,
-                "headers": s.get("headers"),
-                "phone_friendly": True,
-            })
-
-    # Expand first MPD into qualities
-    qualities, audio = [], []
-    proxy_mpd = None
-    for s in sources:
-        u = s.get("url") or ""
-        if ".mpd" not in u:
-            continue
-        cookie = (s.get("headers") or {}).get("Cookie") or ""
-        try:
-            parsed = await _mb_expand_mpd(u, cookie, referer)
-            qualities = parsed.get("video") or []
-            audio = parsed.get("audio") or []
-            if cookie:
-                _mb_proxy_remember(u, cookie, referer)
-            proxy_mpd = f"/mb/proxy/mpd?u={quote(u, safe='')}"
-            # HTML parseStreams looks for proxy_url / play_url
-            for src in sources:
-                if (src.get("url") or "") == u or ".mpd" in (src.get("url") or ""):
-                    src["proxy_url"] = proxy_mpd
-                    src["play_url"] = proxy_mpd
-                    src["proxied_url"] = proxy_mpd
-                    src["format"] = "DASH"
-            if sources and proxy_mpd:
-                sources[0]["proxy_url"] = proxy_mpd
-                sources[0]["play_url"] = proxy_mpd
-        except Exception as e:
-            qualities = [{"error": str(e)[:160]}]
-        break
-
-    # Title + optional TMDB id
-    title = data.get("title")
-    try:
-        det = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}")
-        subj = det.get("subject") or det
-        title = title or subj.get("title")
-    except Exception:
-        pass
-    tmdb_id = None
-    if title:
-        try:
-            q = re.sub(r"\[.*?\]", "", title).strip()
-            tr = await _tmdb_get("/search/multi", {"query": q})
-            for res in (tr.get("results") or [])[:5]:
-                if res.get("media_type") not in ("movie", "tv"):
-                    continue
-                tmdb_id = res["id"]
+            if len(items) >= limit:
                 break
-        except Exception:
-            pass
-
-    # Netplay catalog match → real progressive MP4
-    if title:
-        try:
-            for n in await _np_match_mp4(title, se, ep):
-                mp4_list.append(n)
-        except Exception:
-            pass
-
-    play = None
-    # MovieBox native only — no third-party embeds in this response
-    if mp4_list:
-        play = mp4_list[0]["url"]
-    elif proxy_mpd:
-        play = proxy_mpd
-    elif sources:
-        play = sources[0].get("proxy_url") or sources[0].get("url")
-
-    note = "MovieBox native only. DASH/HEVC: use proxy_mpd or VLC with Cookie headers."
-    if only_hevc and not mp4_list:
-        note = (
-            "MovieBox returned HEVC DASH only (app upgrade/paywall). "
-            "Use proxy_mpd with a DASH player or open the MPD in VLC with Cookie. "
-            "Third-party embeds are not included in MovieBox responses."
-        )
-
-    return {
-        "provider": "moviebox",
-        "subject_id": subject_id,
-        "title": title,
-        "se": se,
-        "ep": ep,
-        "tmdb_id": tmdb_id,
-        "mp4": mp4_list,
-        "sources": sources,
-        "qualities": qualities,
-        "audio": audio,
-        "proxy_mpd": proxy_mpd,
-        "play": play,
-        "count": len(sources),
-        "only_hevc": only_hevc,
-        "note": note,
-        "proxy_url": proxy_mpd,
-    }
+    return {"ok": True, "genre": genre, "count": len(items), "items": items, "provider": "hindianime"}
 
 
-@app.get("/mb/home", tags=["MovieBox"])
-async def mb_home(page: int = 1):
-    """Homepage operating tabs from MovieBox."""
-    data = await mb_request("GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId=1&version=")
-    return {"provider": "moviebox", "data": data}
-
-
-@app.get("/mb/captions/{subject_id}", tags=["MovieBox"])
-async def mb_captions(subject_id: str, resource_id: str = "", se: int = 0, ep: int = 0):
-    """Subtitles for a MovieBox stream. Pass resource_id from /mb/stream sources[].id."""
-    if not resource_id:
-        stream_data = await mb_stream(subject_id, se, ep)
-        for src in stream_data.get("sources") or []:
-            if src.get("id"):
-                resource_id = str(src["id"])
-                break
-    if not resource_id:
-        return {"count": 0, "captions": []}
-    data = await mb_request(
-        "GET",
-        f"/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId={subject_id}&resourceId={resource_id}",
-    )
-    captions = data.get("extCaptions") or data.get("captions") or data.get("list") or []
-    return {
-        "provider": "moviebox",
-        "subject_id": subject_id,
-        "resource_id": resource_id,
-        "count": len(captions),
-        "captions": captions,
-    }
-
-
-# ----- 4KHDHub -----
-
-
-@app.get("/fk/search", tags=["4KHDHub"])
-async def fk_search(q: str = Query(..., min_length=1)):
-    """Search 4KHDHub. Use returned `id` (path) with /fk/detail and /fk/stream."""
-    html = await fk_fetch(f"?s={q}")
-    return {"provider": "4khdhub", "query": q, "items": fk_parse_search(html)}
-
-
-@app.get("/fk/detail", tags=["4KHDHub"])
-async def fk_detail(id: str = Query(..., description="Path from search, e.g. /movie-name/")):
-    """Metadata for a 4KHDHub page."""
-    html = await fk_fetch(id)
-    soup = BeautifulSoup(html, "html.parser")
-    h1 = soup.select_one("h1")
-    title = h1.get_text(strip=True) if h1 else id
-    og = soup.select_one('meta[property="og:image"]')
-    desc_el = soup.select_one(".content-section p.mt-4") or soup.select_one('meta[name="description"]')
-    description = None
-    if desc_el:
-        description = desc_el.get_text(strip=True) if desc_el.name == "p" else desc_el.get("content")
-    return {
-        "provider": "4khdhub",
-        "id": id,
-        "title": title,
-        "poster_url": og.get("content") if og else None,
-        "description": description,
-        "type": "series" if "-series-" in id else "movie",
-    }
-
-
-@app.get("/fk/stream", tags=["4KHDHub"])
-async def fk_stream(
-    id: str = Query(..., description="Path from /fk/search"),
-    se: int = 0,
-    ep: int = 0,
-    resolve: bool = Query(True, description="Expand HubCloud/HubDrive to direct stream URLs (default true)"),
-    limit: int = Query(12, ge=1, le=40, description="Max mirrors to resolve"),
-):
-    """
-    4KHDHub releases + **direct streaming links**.
-
-    By default (`resolve=true`) every HubCloud / HubDrive / PixelDrain mirror is
-    expanded into playable CDN URLs. Flat list is in `streams` for the player.
-    """
-    try:
-        limit = int(limit)
-    except Exception:
-        limit = 12
-    resolve = bool(resolve)
-    html = await fk_fetch(id)
-    releases = fk_parse_releases(html, se, ep)
-    streams: List[dict] = []
-    resolved_n = 0
-
-    async def _expand_mirror(mirror: dict) -> List[dict]:
-        url = (mirror.get("url") or "").strip()
-        if not url:
-            return []
-        # already direct?
-        low = url.lower()
-        if any(x in low for x in (".mp4", ".mkv", ".m3u8", "pixeldrain.com/api/file", "cdn.pixeldrain", "workers.dev", "r2.dev")):
-            return [{
-                "url": url if "pixeldrain.com/u/" not in low else (_pixeldrain_api(url) or url),
-                "label": mirror.get("label") or "Direct",
-                "quality": mirror.get("quality") or "",
-                "source": "direct",
-                "playable": True,
-            }]
-        if not resolve and not mirror.get("needs_resolve"):
-            return [{
-                "url": url,
-                "label": mirror.get("label") or "Mirror",
-                "quality": mirror.get("quality") or "",
-                "source": "unresolved",
-                "playable": False,
-            }]
-        try:
-            links = await resolve_any(url)
-        except Exception as e:
-            mirror["resolve_error"] = str(e)[:160]
-            return []
-        out = []
-        for L in links or []:
-            u = L.get("url") if isinstance(L, dict) else str(L)
-            if not u:
-                continue
-            out.append({
-                "url": u,
-                "label": (L.get("label") if isinstance(L, dict) else None) or mirror.get("label") or "CDN",
-                "quality": mirror.get("quality") or (L.get("quality") if isinstance(L, dict) else "") or "",
-                "source": (L.get("source") if isinstance(L, dict) else None) or "hubcloud",
-                "playable": True,
-                "headers": (L.get("headers") if isinstance(L, dict) else None) or {
-                    "User-Agent": "Mozilla/5.0",
-                    "Referer": url,
-                },
-            })
-        return out
-
-    if resolve:
-        n = 0
-        for rel in releases:
-            for mirror in rel.get("mirrors") or []:
-                if n >= limit:
-                    break
-                n += 1
-                try:
-                    direct = await _expand_mirror(mirror)
-                    mirror["direct_links"] = direct
-                    for d in direct:
-                        d["release"] = rel.get("title") or rel.get("name") or ""
-                        streams.append(d)
-                        resolved_n += 1
-                except Exception as e:
-                    mirror["direct_links"] = []
-                    mirror["resolve_error"] = str(e)[:160]
-            if n >= limit:
-                break
-    else:
-        for rel in releases:
-            for mirror in rel.get("mirrors") or []:
-                streams.append({
-                    "url": mirror.get("url"),
-                    "label": mirror.get("label"),
-                    "quality": mirror.get("quality"),
-                    "source": "unresolved",
-                    "playable": False,
-                    "release": rel.get("title") or "",
-                })
-
-    # de-dupe by url
-    seen = set()
-    unique = []
-    for s in streams:
-        u = s.get("url") or ""
-        if not u or u in seen:
-            continue
-        seen.add(u)
-        unique.append(s)
-
-    return {
-        "provider": "4khdhub",
-        "id": id,
-        "se": se,
-        "ep": ep,
-        "resolved": resolve,
-        "count": len(releases),
-        "stream_count": len(unique),
-        "streams": unique,  # direct playable when resolve=true
-        "releases": releases,
-        "hint": "Use streams[].url in VLC/mpv/browser. resolve=false returns raw hubcloud pages only.",
-    }
-
-
-@app.get("/fk/play", tags=["4KHDHub"])
-async def fk_play(
-    id: str = Query(..., description="Path from /fk/search"),
-    se: int = 0,
-    ep: int = 0,
-):
-    """Shortcut: always resolve and return only playable streams."""
-    data = await fk_stream(id=id, se=se, ep=ep, resolve=True)
-    playable = [s for s in (data.get("streams") or []) if s.get("playable")]
-    return {
-        "provider": "4khdhub",
-        "id": id,
-        "se": se,
-        "ep": ep,
-        "count": len(playable),
-        "streams": playable,
-        "best": playable[0] if playable else None,
-    }
-
-
-# ----- Tools -----
-
-
-@app.get("/tools/resolve", tags=["Tools"])
-async def tools_resolve(url: str = Query(..., description="hubcloud.*/drive/... or hubdrive.*/file/...")):
-    """
-    Resolve HubCloud / HubDrive page into direct CDN download URLs
-    (PixelDrain, Cloudflare R2, FSL, Google storage, etc.).
-    """
-    links = await resolve_any(url)
-    return {"input": url, "count": len(links), "direct_links": links}
-
-@app.get("/tools/hubcloud", tags=["Tools"])
-async def tools_hubcloud(url: str = Query(..., description="https://hubcloud.ist/drive/xxx")):
-    """Resolve HubCloud drive page → all direct mirrors (FSL, PixelDrain, 10Gbps, Watch…)."""
-    links = await resolve_hubcloud(url)
-    return {"ok": True, "count": len(links), "links": links, "input": url}
-
-
-@app.get("/tools/hubdrive", tags=["Tools"])
-async def tools_hubdrive(url: str = Query(..., description="https://hubdrive.pics/file/xxx")):
-    """Resolve HubDrive file → HubCloud → direct mirrors."""
-    links = await resolve_hubdrive(url)
-    return {"ok": True, "count": len(links), "links": links, "input": url}
-
-
-@app.get("/tools/resolve/batch", tags=["Tools"])
-async def tools_resolve_batch(urls: str = Query(..., description="Comma-separated HubCloud/HubDrive URLs")):
-    """Resolve many Hub links at once."""
-    parts = [u.strip() for u in urls.split(",") if u.strip()]
-    out = []
-    for u in parts[:15]:
-        try:
-            links = await resolve_any(u)
-            out.append({"input": u, "ok": True, "count": len(links), "links": links})
-        except Exception as e:
-            out.append({"input": u, "ok": False, "error": str(e)})
-    return {"results": out}
-
-
-
-
-# ----- Aggregate -----
-
-
-@app.get("/search", tags=["Aggregate"])
-async def search_all(q: str = Query(..., min_length=1)):
-    """Search MovieBox + 4KHDHub in parallel-ish sequential calls."""
-    moviebox_items: Any = []
-    fourk_items: Any = []
-    errors: Dict[str, str] = {}
-    try:
-        moviebox_items = (await mb_search(q))["items"]
-    except Exception as exc:
-        errors["moviebox"] = str(exc)
-    try:
-        fourk_items = (await fk_search(q))["items"]
-    except Exception as exc:
-        errors["4khdhub"] = str(exc)
-    return {"query": q, "moviebox": moviebox_items, "fourkhdhub": fourk_items, "errors": errors or None}
-
-
-# ----- Legacy -----
-
-
-@app.get("/api/stream/{subject_id}", tags=["Legacy"], include_in_schema=False)
-async def legacy_stream(subject_id: str, se: int = 0, ep: int = 0, detail_path: str = ""):
-    return await mb_stream(subject_id, se, ep)
-
-
-@app.get("/detail/{subject_id}", tags=["Legacy"], include_in_schema=False)
-async def legacy_detail(subject_id: str):
-    return await mb_detail(subject_id)
-
-
-
-
-# =============================================================================
-# CATALOG + PLAY (MovieBox + 4KHDHub only — no TMDB)
-# =============================================================================
-
-def _mb_items_from_search_data(data: dict) -> list:
-    items = []
-    raw = []
-    results = data.get("results") or []
-    if results and isinstance(results[0], dict):
-        raw = results[0].get("subjects") or []
-    if not raw:
-        raw = data.get("list") or data.get("items") or data.get("subjects") or []
-    for s in raw:
-        if isinstance(s, dict) and "subject" in s:
-            s = s["subject"]
-        if not isinstance(s, dict):
-            continue
-        sid = s.get("subjectId") or s.get("id")
-        cover = s.get("cover") or {}
-        poster = cover.get("url") if isinstance(cover, dict) else (s.get("coverUrl") or cover)
-        stype = s.get("subjectType") or s.get("stype") or 1
-        name = s.get("title") or s.get("name") or ""
-        # Strip trailing season labels so series dedupe cleanly (S1/S2 duplicates share id)
-        clean = re.sub(r"\s*S\d+\s*$", "", name, flags=re.I).strip() or name
-        items.append({
-            "id": str(sid) if sid is not None else None,
-            "name": clean,
-            "poster": poster,
-            "year": (s.get("releaseDate") or "")[:4] or None,
-            "rating": s.get("imdbRatingValue") or s.get("score"),
-            "type": "tv" if stype == 2 else "movie",
-            "provider": "moviebox",
-            "slug": s.get("detailPath"),
-        })
-    # Dedupe by id — keep first occurrence
-    seen = set()
-    out = []
-    for x in items:
-        if not x.get("id") or x["id"] in seen:
-            continue
-        seen.add(x["id"])
-        out.append(x)
-    return out
-
-
-def _mb_items_from_ops(data) -> list:
-    """Parse tab-operating / home feed into flat cards."""
+@app.get("/anime/search", tags=["Anime"])
+async def anime_search(q: str = Query(..., min_length=1), limit: int = Query(60, ge=1, le=100)):
+    """Search series + movies by title."""
+    qn = q.strip().lower()
+    data = await _ha_catalog()
     items = []
     seen = set()
-    def walk(node):
-        if isinstance(node, list):
-            for x in node:
-                walk(x)
-            return
-        if not isinstance(node, dict):
-            return
-        # subject-like
-        sid = node.get("subjectId") or node.get("id")
-        title = node.get("title") or node.get("name")
-        if sid and title and str(sid) not in seen:
-            cover = node.get("cover") or {}
-            poster = cover.get("url") if isinstance(cover, dict) else node.get("coverUrl")
-            stype = node.get("subjectType") or node.get("stype") or 1
-            seen.add(str(sid))
-            items.append({
-                "id": str(sid),
-                "name": title,
-                "poster": poster,
-                "year": (node.get("releaseDate") or "")[:4] or None,
-                "type": "tv" if stype == 2 else "movie",
-                "provider": "moviebox",
-            })
-        for v in node.values():
-            if isinstance(v, (dict, list)):
-                walk(v)
-    walk(data)
-    return items
-
-
-
-@app.get("/api/home", tags=["Catalog"])
-async def api_home():
-    """
-    Home feed for the web.
-
-    - TMDB trending/popular rows
-    - `netplay_admin` — optional direct-MP4 list (UUID ids, not MovieBox subject_id)
-    """
-    async def grab(path, media, pages=1):
-        items = []
-        for pg in range(1, pages + 1):
-            try:
-                d = await _tmdb_get(path, {"page": pg})
-            except Exception:
+    for x in list(data.get("series") or []) + list(data.get("movies") or []):
+        if not isinstance(x, dict):
+            continue
+        title = (x.get("title") or "").lower()
+        if qn in title or all(p in title for p in qn.split() if len(p) > 1):
+            card = _ha_card(x)
+            key = card.get("slug") or card.get("title")
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(card)
+            if len(items) >= limit:
                 break
-            for it in d.get("results") or []:
-                it = dict(it)
-                it["media_type"] = media
-                items.append(_tmdb_card(it))
-        return items
-
-    trending = await grab("/trending/all/day", "movie", 1)
-    # fix media types for mixed trending
-    try:
-        d = await _tmdb_get("/trending/all/day", {"page": 1})
-        trending = [_tmdb_card(x) for x in (d.get("results") or []) if x.get("media_type") in ("movie", "tv")]
-    except Exception:
-        trending = []
-    popular_movies = await grab("/movie/popular", "movie", 1)
-    popular_tv = await grab("/tv/popular", "tv", 1)
-    top_movies = await grab("/movie/top_rated", "movie", 1)
-    top_tv = await grab("/tv/top_rated", "tv", 1)
-
-    netplay_admin = []
-    try:
-        _npv = await _np_get("/videos")
-        if isinstance(_npv, list):
-            for v in _npv[:20]:
-                netplay_admin.append({
-                    "id": v.get("id"),
-                    "netplay_id": v.get("id"),
-                    "id_type": "netplay_uuid",
-                    "title": v.get("title"),
-                    "poster": v.get("poster"),
-                    "type": v.get("type"),
-                    "provider": "netplay",
-                    "play": f"/play?netplay_id={v.get('id')}",
-                    "stream": f"/np/stream/{v.get('id')}",
-                })
-    except Exception:
-        pass
-
-    return {
-        "trending": trending,
-        "popular_movies": popular_movies,
-        "popular_tv": popular_tv,
-        "top_movies": top_movies,
-        "top_tv": top_tv,
-        "netplay_admin": netplay_admin,
-        "id_help": {
-            "moviebox": "subject_id from GET /mb/search or /api/search — main catalog",
-            "netplay": "UUID from netplay_admin or GET /np/videos — admin MP4 only",
-            "play_moviebox": "GET /play?subject_id=...  or  GET /mb/stream/{subject_id}",
-            "play_netplay": "GET /play?netplay_id=...  or  GET /np/stream/{id}?se=&ep=",
-        },
-    }
+    return {"ok": True, "query": q, "count": len(items), "items": items, "provider": "hindianime"}
 
 
-@app.get("/api/movies", tags=["Catalog"])
-async def api_movies(page: int = 1):
-    d = await _tmdb_get("/movie/popular", {"page": max(1, page)})
-    items = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "movie"))]
-    return {
-        "items": items,
-        "page": page,
-        "total_pages": d.get("total_pages") or 1,
-        "total_results": d.get("total_results") or len(items),
-        "provider": "tmdb",
-    }
-
-
-
-@app.get("/api/series", tags=["Catalog"])
-async def api_series(page: int = 1):
-    d = await _tmdb_get("/tv/popular", {"page": max(1, page)})
-    items = [c for x in (d.get("results") or []) if (c := _tmdb_card(x, "tv"))]
-    return {
-        "items": items,
-        "page": page,
-        "total_pages": d.get("total_pages") or 1,
-        "total_results": d.get("total_results") or len(items),
-        "provider": "tmdb",
-    }
-
-@app.get("/api/search", tags=["Catalog"])
-async def api_search_catalog(q: str = Query(..., min_length=1)):
-    """
-    Unified search for the web + API clients.
-
-    **IDs**
-    - `subject_id` / `id_type=moviebox_subject` → main catalog (same as Netplay app movies)
-    - `netplay_id` / `id_type=netplay_uuid` → admin MP4 list only (`/np/videos`)
-    - `tmdb_id` → embed helpers
-
-    Play MovieBox: `GET /play?subject_id=...` or `GET /mb/stream/{subject_id}`
-    """
-    items: List[dict] = []
-    errors: Dict[str, str] = {}
-    try:
-        mb = await mb_search(q=q, page=1)
-        for it in mb.get("items") or []:
-            sid = it.get("subject_id")
-            items.append({
-                "id": sid,
-                "subject_id": sid,
-                "id_type": "moviebox_subject",
-                "title": it.get("name") or it.get("title"),
-                "name": it.get("name") or it.get("title"),
-                "poster": it.get("poster_url") or it.get("poster"),
-                "year": it.get("year"),
-                "type": it.get("type") or "movie",
-                "provider": "moviebox",
-                "play": f"/play?subject_id={sid}",
-                "stream": f"/mb/stream/{sid}",
-            })
-    except Exception as e:
-        errors["moviebox"] = str(e)[:160]
-    try:
-        np = await _np_get("/videos")
-        if isinstance(np, list):
-            ql = q.lower()
-            for v in np:
-                title = v.get("title") or ""
-                if ql not in title.lower() and not any(
-                    w in title.lower() for w in ql.split() if len(w) > 2
-                ):
-                    continue
-                nid = v.get("id")
-                items.append({
-                    "id": nid,
-                    "netplay_id": nid,
-                    "id_type": "netplay_uuid",
-                    "title": title,
-                    "name": title,
-                    "poster": v.get("poster"),
-                    "type": v.get("type") or "series",
-                    "provider": "netplay",
-                    "seasons": v.get("seasons"),
-                    "play": f"/play?netplay_id={nid}",
-                    "stream": f"/np/stream/{nid}",
-                })
-    except Exception as e:
-        errors["netplay"] = str(e)[:160]
-    try:
-        d = await _tmdb_get("/search/multi", {"query": q, "page": 1, "include_adult": "false"})
-        for res in (d.get("results") or [])[:10]:
-            if res.get("media_type") not in ("movie", "tv"):
-                continue
-            tid = res.get("id")
-            items.append({
-                "id": tid,
-                "tmdb_id": tid,
-                "id_type": "tmdb",
-                "title": res.get("title") or res.get("name"),
-                "name": res.get("title") or res.get("name"),
-                "poster": (
-                    f"https://image.tmdb.org/t/p/w500{res['poster_path']}"
-                    if res.get("poster_path")
-                    else None
-                ),
-                "type": res.get("media_type"),
-                "provider": "tmdb",
-                "play": f"/api/play?media={res.get('media_type')}&id={tid}",
-            })
-    except Exception as e:
-        errors["tmdb"] = str(e)[:160]
-    return {
-        "query": q,
-        "count": len(items),
-        "items": items,
-        "errors": errors or None,
-        "how_to_play": {
-            "moviebox_subject_id": "GET /play?subject_id=ID  or  GET /mb/stream/ID",
-            "netplay_uuid": "GET /play?netplay_id=UUID  or  GET /np/stream/UUID?se=&ep=",
-            "note": "subject_id and netplay_id are different backends — do not mix them",
-        },
-    }
-
-
-
-    try:
-        d = await _tmdb_get("/search/multi", {"query": q, "page": 1, "include_adult": "false"})
-        for x in d.get("results") or []:
-            c = _tmdb_card(x)
-            if c:
-                items.append(c)
-    except Exception as e:
-        errors["tmdb"] = str(e)
-    try:
-        html = await fk_fetch(f"?s={q}")
-        for it in fk_parse_search(html)[:12]:
-            fk_items.append({
-                "id": it.get("id"),
-                "name": it.get("name"),
-                "poster": it.get("poster_url") or it.get("poster"),
-                "year": it.get("year"),
-                "type": "tv" if it.get("type") == "series" else "movie",
-                "provider": "4khdhub",
-            })
-    except Exception as e:
-        errors["4khdhub"] = str(e)
-    return {
-        "query": q,
-        "items": items,
-        "tmdb": items,
-        "fourkhdhub": fk_items,
-        "moviebox": [],
-        "errors": errors or None,
-    }
-
-
-
-@app.get("/api/detail/{media}/{item_id}", tags=["Catalog"])
-async def api_detail(media: str, item_id: str):
-    """TMDB detail for web. item_id = TMDB id. MovieBox remains on /mb/detail/{id}."""
-    media = "tv" if media in ("tv", "series", "show") else "movie"
-    path = f"/{media}/{item_id}"
-    params = {"append_to_response": "external_ids,credits"}
-    if media == "tv":
-        params["append_to_response"] = "external_ids,credits"
-    d = await _tmdb_get(path, params)
-    if not d or not d.get("id"):
-        raise HTTPException(404, "Not found on TMDB")
-    seasons = []
-    if media == "tv":
-        for s in d.get("seasons") or []:
-            num = s.get("season_number")
-            if num is None or int(num) < 1:
-                continue
-            seasons.append({
-                "season": int(num),
-                "name": s.get("name") or f"Season {num}",
-                "episode_count": s.get("episode_count") or 0,
-                "poster": f"{TMDB_IMG}/w300{s['poster_path']}" if s.get("poster_path") else None,
-            })
-        seasons.sort(key=lambda x: x["season"])
-    poster = d.get("poster_path")
-    backdrop = d.get("backdrop_path")
-    title = d.get("title") or d.get("name") or ""
-    date = d.get("release_date") or d.get("first_air_date") or ""
-    imdb = (d.get("external_ids") or {}).get("imdb_id")
-    return {
-        "id": str(d["id"]),
-        "tmdb_id": str(d["id"]),
-        "imdb_id": imdb,
-        "name": title,
-        "overview": d.get("overview") or "",
-        "poster": f"{TMDB_IMG}/w500{poster}" if poster else None,
-        "backdrop": f"{TMDB_IMG}/w1280{backdrop}" if backdrop else None,
-        "year": date[:4] if date else None,
-        "rating": d.get("vote_average"),
-        "genres": [g.get("name") for g in (d.get("genres") or []) if g.get("name")],
-        "type": media,
-        "provider": "tmdb",
-        "seasons": seasons,
-        "runtime": d.get("runtime") or (d.get("episode_run_time") or [None])[0],
-    }
-
-
-
-@app.get("/api/tv/{item_id}/season/{season}", tags=["Catalog"])
-async def api_season(item_id: str, season: int):
-    """TMDB season episodes (ascending)."""
-    d = await _tmdb_get(f"/tv/{item_id}/season/{season}")
+@app.get("/anime/detail/{slug}", tags=["Anime"])
+async def anime_detail(slug: str):
+    """Full metadata + episode list with videoHash for each ep."""
+    data = await _ha_extracted(slug)
+    eps_raw = data.get("episodes") or []
+    if isinstance(eps_raw, dict):
+        eps_raw = list(eps_raw.values())
     episodes = []
-    for e in d.get("episodes") or []:
-        epn = e.get("episode_number")
-        if epn is None:
+    for ep in eps_raw:
+        if not isinstance(ep, dict):
             continue
-        still = e.get("still_path")
         episodes.append({
-            "episode": int(epn),
-            "name": e.get("name") or f"Episode {epn}",
-            "overview": e.get("overview") or "",
-            "still": f"{TMDB_IMG}/w300{still}" if still else None,
+            "season": ep.get("season") or 1,
+            "episode": ep.get("episode") or ep.get("number"),
+            "title": ep.get("title"),
+            "thumbnail": ep.get("thumbnail") or ep.get("thumb"),
+            "url": ep.get("url"),
+            "hash": ep.get("videoHash") or ep.get("hash"),
+            "videoHash": ep.get("videoHash") or ep.get("hash"),
         })
-    episodes.sort(key=lambda x: x["episode"])
-    return {"season": int(season), "episodes": episodes, "count": len(episodes)}
+    # group by season
+    seasons: Dict[int, list] = {}
+    for ep in episodes:
+        try:
+            s = int(ep.get("season") or 1)
+        except Exception:
+            s = 1
+        seasons.setdefault(s, []).append(ep)
+    return {
+        "ok": True,
+        "slug": slug,
+        "title": data.get("title"),
+        "type": data.get("type"),
+        "overview": data.get("overview") or data.get("description"),
+        "genres": data.get("genres") or [],
+        "languages": data.get("languages") or [],
+        "available_seasons": data.get("availableSeasons") or list(seasons.keys()),
+        "seasons": data.get("seasons") or {str(k): len(v) for k, v in seasons.items()},
+        "episodes": episodes,
+        "episode_count": len(episodes),
+        "provider": "hindianime",
+    }
 
 
+@app.get("/anime/episodes/{slug}", tags=["Anime"])
+async def anime_episodes(
+    slug: str,
+    season: Optional[int] = Query(None),
+):
+    """Episode list only (optional season filter)."""
+    detail = await anime_detail(slug)
+    eps = detail.get("episodes") or []
+    if season is not None:
+        eps = [e for e in eps if int(e.get("season") or 1) == int(season)]
+    return {"ok": True, "slug": slug, "title": detail.get("title"), "season": season, "count": len(eps), "episodes": eps, "provider": "hindianime"}
 
 
+@app.get("/anime/trailer", tags=["Anime"])
+async def anime_trailer(title: str = Query(..., min_length=1)):
+    """YouTube trailer id for a title."""
+    data = await _ha_get("/api/find-trailer", {"title": title})
+    return {
+        "ok": bool(data.get("id") or data.get("video")),
+        "title": title,
+        "youtube_id": data.get("id"),
+        "embed": data.get("video") or (f"https://www.youtube.com/embed/{data['id']}" if data.get("id") else None),
+        "provider": "hindianime",
+    }
 
 
+@app.get("/anime/stream", tags=["Anime"])
+async def anime_stream(
+    hash: Optional[str] = Query(None, description="videoHash"),
+    url: Optional[str] = Query(None, description="master m3u8 url"),
+    slug: Optional[str] = Query(None),
+    title: Optional[str] = Query(None),
+    tmdb_id: Optional[str] = Query(None),
+    type: str = Query("series"),
+    season: int = Query(1, ge=1),
+    episode: int = Query(1, ge=1),
+    request: Request = None,
+):
+    """Playable HLS for anime. Resolves hash from slug/title if needed.
 
+    Returns play_url (proxied via /anime/hls) + direct stream_url + audio/quality list.
+    """
+    video_hash = hash
+    resolved_title = title
+    type_s = type if isinstance(type, str) else "series"
+    is_movie = (type_s or "").lower() in ("movie", "movies", "film")
 
-# =============================================================================
-# Direct stream / download — VixSrc + aggregate (Uniflix/Flix-style TMDB players)
-# Sources inspired by TMDB-Embed-API / VixSrc / multi-embed catalogs
-# =============================================================================
+    if not video_hash and not url:
+        if not slug and title:
+            found = await _ha_find_by_title(title)
+            if found:
+                slug = _ha_slug_from_link(found.get("link") or "")
+                resolved_title = found.get("title") or title
+                is_movie = is_movie or ((found.get("type") or "").lower() == "movie")
+        if slug:
+            try:
+                data = await _ha_extracted(slug)
+                resolved_title = resolved_title or data.get("title")
+                is_movie = is_movie or ((data.get("type") or "").lower() == "movie")
+                pick = _ha_pick_episode(data.get("episodes") or [], season, episode)
+                if pick:
+                    video_hash = pick.get("videoHash") or pick.get("hash")
+            except Exception as e:
+                raise HTTPException(502, f"detail: {e}")
+        if not video_hash and tmdb_id:
+            # fallback to servers/cdn path
+            try:
+                srv = await anime_servers(
+                    title=resolved_title, slug=slug, hash=None, tmdb_id=tmdb_id,
+                    type="movie" if is_movie else "series", season=season, episode=episode, request=request,
+                )
+                if srv.get("hash"):
+                    video_hash = srv["hash"]
+                elif srv.get("cdn_streams"):
+                    s0 = srv["cdn_streams"][0]
+                    return {
+                        "ok": True, "type": "cdn", "title": srv.get("title"),
+                        "url": s0.get("url"), "play_url": s0.get("url"),
+                        "stream_url": s0.get("url"), "servers": srv.get("servers"),
+                        "provider": "vidsrc-cdn",
+                    }
+                elif srv.get("servers"):
+                    return {
+                        "ok": True, "type": "servers", "title": srv.get("title"),
+                        "servers": srv["servers"],
+                        "play_url": srv["servers"][0].get("play_url"),
+                        "provider": "embeds",
+                    }
+            except Exception as e:
+                raise HTTPException(502, f"tmdb resolve: {e}")
+        if not video_hash and not url:
+            raise HTTPException(404, "episode hash not found — try slug= or title=")
 
-_VIXSRC_BASE = "https://vixsrc.to"
-_VIX_HDR = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html, */*",
-}
-
-
-async def _vixsrc_embed_path(tmdb_id: int, media: str = "movie", se: int = 1, ep: int = 1) -> Optional[str]:
-    if media in ("tv", "series"):
-        api = f"{_VIXSRC_BASE}/api/tv/{tmdb_id}/{se}/{ep}"
-    else:
-        api = f"{_VIXSRC_BASE}/api/movie/{tmdb_id}"
     headers = {
-        **_VIX_HDR,
-        "Referer": f"{_VIXSRC_BASE}/",
-        "Origin": _VIXSRC_BASE,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
+        "Referer": HA_BASE + "/",
+        "Origin": HA_BASE,
+        "Accept": "*/*",
+    }
+    stream = url if url and ("m3u8" in url or "proxy" in url) else None
+    master_body = ""
+    host_used = None
+    tunnel_ok = False
+    errors: List[str] = []
+    audio_tracks: List[dict] = []
+    qualities: List[dict] = []
+
+    if video_hash and not stream:
+        for host in [HA_STREAM, HA_BASE]:
+            candidate = f"{host.rstrip('/')}/api/proxy/master.m3u8?hash={video_hash}"
+            try:
+                async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                    r = await client.get(candidate, headers=headers)
+                    body = r.text or ""
+                    if r.status_code == 200 and body.lstrip().startswith("#EXTM3U"):
+                        stream = candidate
+                        master_body = body
+                        host_used = host
+                        # parse audio + quality
+                        lines = body.splitlines()
+                        for i, line in enumerate(lines):
+                            if line.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in line:
+                                name = re.search(r'NAME="([^"]+)"', line)
+                                lang = re.search(r'LANGUAGE="([^"]+)"', line)
+                                uri = re.search(r'URI="([^"]+)"', line)
+                                audio_tracks.append({
+                                    "name": name.group(1) if name else "Audio",
+                                    "language": lang.group(1) if lang else None,
+                                    "uri": uri.group(1) if uri else None,
+                                })
+                            if line.startswith("#EXT-X-STREAM-INF"):
+                                bw = re.search(r"BANDWIDTH=(\d+)", line)
+                                res = re.search(r"RESOLUTION=(\d+x\d+)", line)
+                                uri = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                                qualities.append({
+                                    "bandwidth": int(bw.group(1)) if bw else None,
+                                    "resolution": res.group(1) if res else None,
+                                    "uri": uri,
+                                })
+                        # probe first sub-playlist
+                        for q in qualities[:1]:
+                            u = q.get("uri") or ""
+                            full = host.rstrip("/") + u if u.startswith("/") else u
+                            if full:
+                                try:
+                                    pr = await client.get(full, headers=headers)
+                                    tunnel_ok = pr.status_code == 200 and (pr.text or "").lstrip().startswith("#EXTM3U")
+                                except Exception as e:
+                                    errors.append(str(e)[:80])
+                        break
+                    errors.append(f"{host} HTTP {r.status_code}")
+            except Exception as e:
+                errors.append(f"{host}: {type(e).__name__}")
+
+    if not stream:
+        raise HTTPException(502, {"error": "no playable stream", "hash": video_hash, "errors": errors})
+
+    try:
+        base = str(request.base_url).rstrip("/") if request is not None else ""
+    except Exception:
+        base = ""
+    play_url = f"{base}/anime/hls?u={quote(stream, safe='')}" if base else f"/anime/hls?u={quote(stream, safe='')}"
+
+    return {
+        "ok": True,
+        "hash": video_hash,
+        "title": resolved_title,
+        "slug": slug,
+        "season": season,
+        "episode": episode,
+        "stream_url": stream,
+        "play_url": play_url,
+        "url": stream,
+        "host": host_used,
+        "tunnel_ok": tunnel_ok,
+        "audio_tracks": audio_tracks,
+        "qualities": qualities,
+        "errors": errors or None,
+        "provider": "hindianime",
+        "note": "Play play_url with HLS.js / VLC. tunnel_ok=true means segments reachable.",
+    }
+
+
+@app.get("/anime/servers", tags=["Anime"])
+async def anime_servers(
+    title: Optional[str] = Query(None),
+    slug: Optional[str] = Query(None),
+    hash: Optional[str] = Query(None),
+    tmdb_id: Optional[str] = Query(None),
+    type: str = Query("series"),
+    season: int = Query(1, ge=1),
+    episode: int = Query(1, ge=1),
+    request: Request = None,
+):
+    """Native HLS + embed servers for a title/episode."""
+    is_movie = (type or "").lower() in ("movie", "movies", "film")
+    resolved_title = title
+    video_hash = hash
+    tid = str(tmdb_id).strip() if tmdb_id else None
+
+    if tid and not resolved_title:
+        try:
+            media = "movie" if is_movie else "tv"
+            key = globals().get("TMDB_KEY") or globals().get("TMDB_API_KEY") or "b39176614e7ea6307888211ddd83549a"
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                tr = await client.get(f"https://api.themoviedb.org/3/{media}/{tid}", params={"api_key": key})
+                if tr.status_code == 200:
+                    tj = tr.json()
+                    resolved_title = tj.get("title") or tj.get("name")
+        except Exception:
+            pass
+
+    if resolved_title and not slug and not video_hash:
+        found = await _ha_find_by_title(resolved_title)
+        if found:
+            slug = _ha_slug_from_link(found.get("link") or "")
+            resolved_title = found.get("title") or resolved_title
+
+    if slug and not video_hash:
+        try:
+            data = await _ha_extracted(slug)
+            resolved_title = resolved_title or data.get("title")
+            pick = _ha_pick_episode(data.get("episodes") or [], season, episode)
+            if pick:
+                video_hash = pick.get("videoHash") or pick.get("hash")
+        except Exception:
+            pass
+
+    servers: List[dict] = []
+    tunnel_ok = False
+    play_url = None
+    stream_url = None
+
+    if video_hash:
+        try:
+            st = await anime_stream(
+                hash=video_hash, url=None, slug=None, title=None, tmdb_id=None,
+                type="movie" if is_movie else "series",
+                season=season, episode=episode, request=request,
+            )
+            tunnel_ok = bool(st.get("tunnel_ok"))
+            stream_url = st.get("stream_url")
+            play_url = st.get("play_url")
+            if stream_url:
+                servers.append({
+                    "name": "HindiAnime HLS",
+                    "type": "hls",
+                    "url": stream_url,
+                    "play_url": play_url or stream_url,
+                    "hash": video_hash,
+                    "working": tunnel_ok,
+                    "audio_tracks": st.get("audio_tracks") or [],
+                    "qualities": st.get("qualities") or [],
+                    "provider": "hindianime",
+                })
+                servers.append({
+                    "name": "HLS Proxy",
+                    "type": "hls",
+                    "url": play_url or stream_url,
+                    "play_url": play_url or stream_url,
+                    "working": True,
+                    "provider": "proxy",
+                })
+        except Exception as e:
+            # still expose direct master URL
+            master = f"{HA_STREAM}/api/proxy/master.m3u8?hash={video_hash}"
+            try:
+                base = str(request.base_url).rstrip("/") if request is not None else ""
+            except Exception:
+                base = ""
+            play_url = f"{base}/anime/hls?u={quote(master, safe='')}" if base else f"/anime/hls?u={quote(master, safe='')}"
+            servers.append({
+                "name": "HindiAnime HLS",
+                "type": "hls",
+                "url": master,
+                "play_url": play_url,
+                "hash": video_hash,
+                "working": True,
+                "error": str(e)[:100],
+                "provider": "hindianime",
+            })
+
+    if tid:
+        if is_movie:
+            embeds = [
+                ("VidSrc", f"https://vidsrc.xyz/embed/movie/{tid}"),
+                ("VidSrc.to", f"https://vidsrc.to/embed/movie/{tid}"),
+                ("VidLink", f"https://vidlink.pro/movie/{tid}"),
+                ("2Embed", f"https://www.2embed.cc/embed/{tid}"),
+                ("AutoEmbed", f"https://autoembed.co/movie/tmdb/{tid}"),
+                ("VidKing", f"https://www.vidking.net/embed/movie/{tid}"),
+            ]
+        else:
+            embeds = [
+                ("VidSrc", f"https://vidsrc.xyz/embed/tv/{tid}/{season}/{episode}"),
+                ("VidSrc.to", f"https://vidsrc.to/embed/tv/{tid}/{season}/{episode}"),
+                ("VidLink", f"https://vidlink.pro/tv/{tid}/{season}/{episode}"),
+                ("2Embed", f"https://www.2embed.cc/embedtv/{tid}&s={season}&e={episode}"),
+                ("AutoEmbed", f"https://autoembed.co/tv/tmdb/{tid}-{season}-{episode}"),
+                ("VidKing", f"https://www.vidking.net/embed/tv/{tid}/{season}/{episode}"),
+            ]
+        for name, u in embeds:
+            servers.append({"name": name, "type": "embed", "url": u, "play_url": u, "working": True, "provider": name.lower()})
+
+    cdn_streams = []
+    if tid:
+        try:
+            cdn = await _vidsrc_resolve_cdn(str(tid), media_type="movie" if is_movie else "tv", season=season, episode=episode)
+            for s in (cdn.get("streams") or [])[:6]:
+                if s.get("url"):
+                    cdn_streams.append(s)
+                    servers.append({
+                        "name": s.get("label") or "CDN",
+                        "type": s.get("type") or "hls",
+                        "url": s.get("url"),
+                        "play_url": s.get("url"),
+                        "working": True,
+                        "provider": "vidsrc-cdn",
+                    })
+        except Exception:
+            pass
+
+    return {
+        "ok": bool(servers),
+        "title": resolved_title,
+        "slug": slug,
+        "hash": video_hash,
+        "tmdb_id": tid,
+        "type": "movie" if is_movie else "series",
+        "season": season,
+        "episode": episode,
+        "tunnel_ok": tunnel_ok,
+        "stream_url": stream_url,
+        "play_url": play_url,
+        "servers": servers,
+        "cdn_streams": cdn_streams,
+        "count": len(servers),
+        "provider": "hindianime+embeds",
+    }
+
+
+
+@app.get("/anime/hls", tags=["Anime"])
+async def anime_hls_proxy(request: Request, u: str = Query(..., min_length=8)):
+    """Proxy m3u8 + segments (CORS). Unwraps HindiAnime segment?url= to CDN when needed."""
+    if not (u.startswith("http://") or u.startswith("https://")):
+        raise HTTPException(400, "url must be http(s)")
+
+    def _ha_force_stream_host(url: str) -> str:
+        """www returns SPA HTML for sub/segment; stream.* returns real media."""
+        try:
+            p = urlparse(url)
+            host = (p.hostname or "").lower()
+            if host in ("www.hindianime.site", "hindianime.site") and "/api/proxy/" in (p.path or ""):
+                return "https://stream.hindianime.site" + (p.path or "") + (("?" + p.query) if p.query else "")
+            return url
+        except Exception:
+            return url
+
+    # Do NOT unwrap segment→CDN (zn-grid returns 403 without their edge cookies).
+    # Always fetch via stream.hindianime.site proxy paths.
+    target = _ha_force_stream_host(u)
+    range_header = request.headers.get("range")
+    headers = {
+        "User-Agent": (
+            HA_HEADERS.get("User-Agent")
+            or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.hindianime.site/",
+        "Origin": "https://www.hindianime.site",
+        "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    async with httpx.AsyncClient(timeout=18.0, follow_redirects=True) as client:
-        try:
-            r = await client.get(api, headers=headers)
-        except Exception:
-            return None
-        if r.status_code != 200:
-            return None
-        try:
-            src = (r.json() or {}).get("src") or ""
-        except Exception:
-            return None
-        if not src:
-            return None
-        return src if src.startswith("http") else f"{_VIXSRC_BASE}{src}"
-
-
-async def _vixsrc_resolve_playlist(embed_url: str) -> Optional[dict]:
-    """Parse embed page → signed HLS master playlist + optional downloadUrl."""
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        r = await client.get(embed_url, headers={**_VIX_HDR, "Referer": _VIXSRC_BASE + "/"})
-        if r.status_code != 200:
-            return None
-        text = r.text
-        streams = []
-        m = re.search(r"window\.streams\s*=\s*(\[.*?\]);", text, re.S)
-        if m:
-            try:
-                streams = json.loads(m.group(1))
-            except Exception:
-                streams = []
-        token = expires = None
-        mt = re.search(r"['\"]token['\"]\s*:\s*['\"]([^'\"]+)['\"]", text)
-        me = re.search(r"['\"]expires['\"]\s*:\s*['\"]([^'\"]+)['\"]", text)
-        if mt:
-            token = mt.group(1)
-        if me:
-            expires = me.group(1)
-        pl_base = None
-        mu = re.search(r"window\.masterPlaylist\s*=\s*\{[^}]*url:\s*['\"]([^'\"]+)['\"]", text, re.S)
-        if mu:
-            pl_base = mu.group(1)
-        if not pl_base and streams:
-            pl_base = (streams[0].get("url") or "").split("?")[0]
-        download = None
-        md = re.search(r"window\.downloadUrl\s*=\s*['\"]([^'\"]+)['\"]", text)
-        if md:
-            download = md.group(1)
-
-        out_streams = []
-        if pl_base and token:
-            # try quality variants
-            for extra in ("h=1&lang=en", "lang=en", ""):
-                qs = f"token={token}&expires={expires or ''}"
-                if extra:
-                    qs = f"{qs}&{extra}"
-                u = f"{pl_base}?{qs}" if "?" not in pl_base else f"{pl_base}&{qs}"
-                try:
-                    pr = await client.get(
-                        u,
-                        headers={**_VIX_HDR, "Referer": embed_url, "Accept": "application/vnd.apple.mpegurl,*/*"},
-                    )
-                    if pr.status_code == 200 and "#EXTM3U" in (pr.text or "")[:200]:
-                        out_streams.append({
-                            "url": u,
-                            "format": "HLS",
-                            "label": "VixSrc HLS",
-                            "playable": True,
-                            "headers": {"Referer": embed_url, "User-Agent": _VIX_HDR["User-Agent"]},
-                        })
-                        break
-                except Exception:
-                    continue
-        for s in streams:
-            su = s.get("url")
-            if su and su not in [x["url"] for x in out_streams]:
-                out_streams.append({
-                    "url": su if su.startswith("http") else f"{_VIXSRC_BASE}{su}",
-                    "format": "HLS",
-                    "label": s.get("name") or "VixSrc Server",
-                    "playable": True,
-                    "headers": {"Referer": embed_url, "User-Agent": _VIX_HDR["User-Agent"]},
-                })
-        if not out_streams and not download:
-            return None
-        return {
-            "embed": embed_url,
-            "streams": out_streams,
-            "download_url": download,
-        }
-
-
-@app.get("/vix/stream", tags=["Direct"])
-async def vix_stream(
-    tmdb_id: int = Query(...),
-    media: str = Query("movie"),
-    se: int = Query(1),
-    ep: int = Query(1),
-):
-    """VixSrc direct HLS (TMDB id) — used by modern embed aggregators."""
-    media = "tv" if media in ("tv", "series") else "movie"
-    embed = await _vixsrc_embed_path(tmdb_id, media, se, ep)
-    if not embed:
-        return {
-            "ok": False,
-            "provider": "vixsrc",
-            "tmdb_id": tmdb_id,
-            "media": media,
-            "streams": [],
-            "count": 0,
-            "error": "VixSrc returned no embed (geo/cloud block possible)",
-            "embed": f"https://vixsrc.to/embed/movie/{tmdb_id}" if media == "movie" else f"https://vixsrc.to/embed/tv/{tmdb_id}/{se}/{ep}",
-            "note": "Use /api/play embeds or /direct/stream as fallback",
-        }
-    resolved = await _vixsrc_resolve_playlist(embed)
-    if not resolved:
-        return {
-            "provider": "vixsrc",
-            "tmdb_id": tmdb_id,
-            "media": media,
-            "embed": embed,
-            "streams": [{"url": embed, "format": "EMBED", "label": "VixSrc embed", "playable": True}],
-            "note": "playlist resolve failed — use embed iframe",
-        }
-    return {
-        "provider": "vixsrc",
-        "tmdb_id": tmdb_id,
-        "media": media,
-        "se": se if media == "tv" else 0,
-        "ep": ep if media == "tv" else 0,
-        "embed": resolved.get("embed"),
-        "streams": resolved.get("streams") or [],
-        "download_url": resolved.get("download_url"),
-        "count": len(resolved.get("streams") or []),
-    }
-
-
-@app.get("/direct/stream", tags=["Direct"])
-async def direct_stream(
-    tmdb_id: int = Query(None),
-    title: str = Query(None),
-    media: str = Query("movie"),
-    se: int = 1,
-    ep: int = 1,
-    include_embeds: bool = True,
-    include_vixsrc: bool = True,
-    include_4k: bool = True,
-    include_netmirror: bool = False,
-    include_moviebox: bool = False,
-):
-    """
-    Aggregate **direct** streams + embeds for one title.
-    Order: VixSrc HLS → 4KHDHub direct → embeds → optional NetMirror/MovieBox.
-    """
-    media = "tv" if media in ("tv", "series") else "movie"
-    sources: List[dict] = []
-    errors: Dict[str, str] = {}
-    name = (title or "").strip()
-
-    if not tmdb_id and name:
-        try:
-            meta = await _tmdb_search_id(name, media)
-            if meta and meta.get("tmdb"):
-                tmdb_id = int(meta["tmdb"])
-                name = name or meta.get("name") or ""
-        except Exception as e:
-            errors["tmdb"] = str(e)[:80]
-
-    if include_vixsrc and tmdb_id:
-        try:
-            vx = await vix_stream(tmdb_id=tmdb_id, media=media, se=se, ep=ep)
-            for s in vx.get("streams") or []:
-                sources.append({
-                    "provider": "vixsrc",
-                    "label": s.get("label") or "VixSrc",
-                    "url": s.get("url"),
-                    "format": s.get("format") or "HLS",
-                    "type": "direct" if s.get("format") == "HLS" else "embed",
-                    "playable": True,
-                    "headers": s.get("headers") or {},
-                })
-            if vx.get("download_url"):
-                sources.append({
-                    "provider": "vixsrc",
-                    "label": "VixSrc download",
-                    "url": vx["download_url"],
-                    "format": "FILE",
-                    "type": "download",
-                    "playable": False,
-                })
-        except Exception as e:
-            errors["vixsrc"] = str(e)[:100]
-
-    if include_4k and name:
-        try:
-            html = await fk_fetch(f"?s={name}")
-            items = fk_parse_search(html)
-            if items:
-                fid = items[0].get("id")
-                fk = await fk_stream(
-                    id=fid,
-                    se=se if media == "tv" else 0,
-                    ep=ep if media == "tv" else 0,
-                    resolve=True,
-                    limit=6,
-                )
-                for s in fk.get("streams") or []:
-                    if s.get("url"):
-                        sources.append({
-                            "provider": "4khdhub",
-                            "label": s.get("label") or "4K Hub",
-                            "url": s["url"],
-                            "format": s.get("format") or "FILE",
-                            "type": "direct",
-                            "playable": bool(s.get("playable", True)),
-                            "headers": s.get("headers") or {},
-                        })
-        except Exception as e:
-            errors["4khdhub"] = str(e)[:100]
-
-    if include_netmirror and name:
-        try:
-            nm = await nm_play(q=name, platform="netflix", se=se if media == "tv" else 0, ep=ep if media == "tv" else 0)
-            for s in nm.get("streams") or []:
-                sources.append({
-                    "provider": "netmirror",
-                    "label": "NetMirror",
-                    "url": s.get("url"),
-                    "format": s.get("format") or "HLS",
-                    "type": "direct",
-                    "playable": True,
-                    "headers": s.get("headers") or {},
-                })
-        except Exception as e:
-            errors["netmirror"] = str(e)[:100]
-
-    if include_moviebox and name:
-        try:
-            mb = await mb_search(q=name, page=1)
-            items = mb.get("items") or []
-            if items:
-                sid = items[0].get("subject_id")
-                st = await mb_stream(sid, se=se if media == "tv" else 0, ep=ep if media == "tv" else 0)
-                if st.get("proxy_url") or st.get("proxy_mpd"):
-                    sources.append({
-                        "provider": "moviebox",
-                        "label": "MovieBox DASH",
-                        "url": st.get("proxy_url") or st.get("proxy_mpd"),
-                        "format": "DASH",
-                        "type": "direct",
-                        "playable": True,
-                    })
-        except Exception as e:
-            errors["moviebox"] = str(e)[:100]
-
-    if include_embeds and tmdb_id:
-        for e in _build_embeds(tmdb_id, media, se, ep)[:20]:
-            sources.append({
-                "provider": e.get("provider"),
-                "label": e.get("provider"),
-                "url": e.get("url"),
-                "format": "EMBED",
-                "type": "embed",
-                "playable": True,
-            })
-
-    # dedupe by url
-    seen = set()
-    uniq = []
-    for s in sources:
-        u = s.get("url")
-        if not u or u in seen:
-            continue
-        seen.add(u)
-        uniq.append(s)
-
-    direct = [s for s in uniq if s.get("type") == "direct"]
-    return {
-        "tmdb_id": tmdb_id,
-        "title": name,
-        "media": media,
-        "se": se if media == "tv" else 0,
-        "ep": ep if media == "tv" else 0,
-        "count": len(uniq),
-        "direct_count": len(direct),
-        "sources": uniq,
-        "direct": direct,
-        "errors": errors or None,
-    }
-
-
-@app.get("/direct/download", tags=["Direct"])
-async def direct_download(
-    tmdb_id: int = Query(None),
-    title: str = Query(None),
-    media: str = Query("movie"),
-    se: int = 0,
-    ep: int = 0,
-    url: str = Query(None, description="Optional page/file URL to resolve via yt-dlp / HubCloud"),
-):
-    """
-    Direct download links:
-    - 4KHDHub / HubCloud resolve
-    - optional yt-dlp on any `url`
-    - VixSrc downloadUrl when available
-    """
-    media = "tv" if media in ("tv", "series") else "movie"
-    links: List[dict] = []
-    errors: Dict[str, str] = {}
-    name = (title or "").strip()
-
-    if not tmdb_id and name:
-        try:
-            meta = await _tmdb_search_id(name, media)
-            if meta and meta.get("tmdb"):
-                tmdb_id = int(meta["tmdb"])
-        except Exception:
-            pass
-
-    if name:
-        try:
-            html = await fk_fetch(f"?s={name}")
-            items = fk_parse_search(html)
-            if items:
-                fid = items[0].get("id")
-                fk = await fk_stream(
-                    id=fid,
-                    se=se if media == "tv" else 0,
-                    ep=ep if media == "tv" else 0,
-                    resolve=True,
-                    limit=10,
-                )
-                for s in fk.get("streams") or []:
-                    if s.get("url"):
-                        links.append({
-                            "provider": "4khdhub",
-                            "label": s.get("label") or "Hub download",
-                            "url": s["url"],
-                            "format": s.get("format") or "FILE",
-                            "quality": s.get("quality") or "",
-                        })
-        except Exception as e:
-            errors["4khdhub"] = str(e)[:100]
-
-    if tmdb_id:
-        try:
-            vx = await vix_stream(tmdb_id=tmdb_id, media=media, se=max(1, se), ep=max(1, ep))
-            if vx.get("download_url"):
-                links.append({
-                    "provider": "vixsrc",
-                    "label": "VixSrc download",
-                    "url": vx["download_url"],
-                    "format": "FILE",
-                })
-            for s in vx.get("streams") or []:
-                if s.get("format") == "HLS" and s.get("url"):
-                    links.append({
-                        "provider": "vixsrc",
-                        "label": "VixSrc HLS (save)",
-                        "url": s["url"],
-                        "format": "HLS",
-                        "headers": s.get("headers") or {},
-                    })
-        except Exception as e:
-            errors["vixsrc"] = str(e)[:100]
-
-    if url:
-        try:
-            # reuse tools/resolve or dl/any if present
-            if "tools_resolve" in globals() or hasattr(app, "routes"):
-                pass
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                # HubCloud-style
-                if "hubcloud" in url or "hubdrive" in url:
+    # Players (hls.js, <video>) issue byte-range requests for segments and
+    # fMP4 init sections — pass that through so seeking/buffering works and
+    # we're not always pulling whole files through this proxy.
+    if range_header:
+        headers["Range"] = range_header
+    try:
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+            r = await client.get(target, headers=headers)
+            # If HTML error page, try alternate: original u or unwrapped
+            ctype0 = (r.headers.get("content-type") or "").lower()
+            head0 = (r.content[:80] or b"").lstrip().lower()
+            if (
+                r.status_code >= 400
+                or "text/html" in ctype0
+                or head0.startswith(b"<!doctype")
+                or head0.startswith(b"<html")
+                or (r.status_code == 410)
+            ):
+                alts = []
+                # force stream host
+                forced = _ha_force_stream_host(u)
+                if forced != target:
+                    alts.append(forced)
+                if "www.hindianime.site" in target:
+                    alts.append(target.replace("www.hindianime.site", "stream.hindianime.site"))
+                if target != u:
+                    alts.append(u)
+                for alt in alts:
                     try:
-                        from urllib.parse import quote as _q
-                        # call internal if exists
-                        pass
-                    except Exception:
-                        pass
-                # generic: return url as-is for client download
-                links.append({
-                    "provider": "raw",
-                    "label": "Provided URL",
-                    "url": url,
-                    "format": "FILE",
-                })
-        except Exception as e:
-            errors["url"] = str(e)[:100]
-
-    seen = set()
-    uniq = []
-    for L in links:
-        u = L.get("url")
-        if not u or u in seen:
-            continue
-        seen.add(u)
-        uniq.append(L)
-
-    return {
-        "tmdb_id": tmdb_id,
-        "title": name,
-        "count": len(uniq),
-        "downloads": uniq,
-        "errors": errors or None,
-    }
-
-# =============================================================================
-# NetMirror (NewTV) — Netflix / Prime / Hotstar mirrors via rotating API
-# =============================================================================
-
-_NM_PROBE = [
-    "https://mobiledetects.com",
-    "https://mobiledetect.app",
-    "https://mobidetect.art",
-    "https://mobidetect.cc",
-    "https://mobidetects.cc",
-    "https://mobidetects.pro",
-]
-_NM_HEADERS = {
-    "Cache-Control": "no-cache, no-store, must-revalidate",
-    "Pragma": "no-cache",
-    "Expires": "0",
-    "X-Requested-With": "NetmirrorNewTV v1.0",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) "
-        "Gecko/20100101 Firefox/136.0 /OS.GatuNewTV v1.0"
-    ),
-    "Accept": "application/json, text/plain, */*",
-}
-_NM_PLATFORMS = {
-    "netflix": "nf",
-    "prime": "pv",
-    "hotstar": "hs",
-    "disney": "hs",
-}
-_nm_api_base: Optional[str] = None
-
-
-_nm_api_bases: List[str] = []
-
-
-async def _nm_resolve_bases(force: bool = False) -> List[str]:
-    """Discover all working NewTV API bases (token_hash from probe domains)."""
-    global _nm_api_bases, _nm_api_base
-    if _nm_api_bases and not force:
-        return _nm_api_bases
-    found: List[str] = []
-    # Prefer known API hosts first (probe domains are slow / flaky on serverless)
-    for fb in ("https://tv.imgcdn.kim", "https://tv.imgcdn.cloud", "https://imgcdn.kim"):
-        if fb not in found:
-            found.append(fb)
-    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, limits=httpx.Limits(max_connections=5)) as client:
-        for probe in _NM_PROBE:
-            try:
-                r = await client.get(f"{probe}/checknewtv.php", headers=_NM_HEADERS)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                th = data.get("token_hash")
-                if not th:
-                    continue
-                base = base64.b64decode(th + "=" * (-len(th) % 4)).decode("utf-8").rstrip("/")
-                if base.startswith("http") and base not in found:
-                    found.append(base)
-            except Exception:
-                continue
-    if not found:
-        raise HTTPException(502, "NetMirror API base could not be resolved")
-    _nm_api_bases = found
-    _nm_api_base = found[0]
-    return found
-
-
-async def _nm_resolve_base() -> str:
-    bases = await _nm_resolve_bases()
-    return bases[0]
-
-
-def _nm_headers(ott: str, extra: Optional[dict] = None) -> dict:
-    h = dict(_NM_HEADERS)
-    h["Ott"] = ott
-    if extra:
-        h.update(extra)
-    return h
-
-
-async def _nm_get(path: str, ott: str, params: Optional[dict] = None, extra: Optional[dict] = None) -> dict:
-    """GET with base rotation on 403/5xx (Vercel/cloud IPs often blocked)."""
-    global _nm_api_base, _nm_api_bases
-    bases = await _nm_resolve_bases()
-    last_err = "unknown"
-    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
-        for base in bases:
-            try:
-                r = await client.get(
-                    f"{base}{path}",
-                    params=params or {},
-                    headers=_nm_headers(ott, extra),
-                )
-                if r.status_code in (403, 429, 502, 503):
-                    last_err = f"HTTP {r.status_code} @ {base}"
-                    continue
-                if r.status_code >= 400:
-                    last_err = f"HTTP {r.status_code} @ {base}"
-                    continue
-                try:
-                    data = r.json()
-                except Exception:
-                    last_err = f"non-JSON @ {base}"
-                    continue
-                _nm_api_base = base
-                return data
-            except Exception as e:
-                last_err = str(e)[:120]
-                continue
-    # soft fail — return sentinel for callers
-    raise RuntimeError(f"NetMirror unavailable ({last_err})")
-
-
-@app.get("/nm/search", tags=["NetMirror"])
-async def nm_search(
-    q: str = Query(..., min_length=1),
-    platform: str = Query("netflix", description="netflix|prime|hotstar|disney"),
-):
-    """NetMirror title search (OTT library). Soft-fails with empty items if host blocked."""
-    ott = _NM_PLATFORMS.get(platform.lower(), "nf")
-    try:
-        data = await _nm_get("/newtv/search.php", ott, {"s": q})
-    except Exception as e:
-        return {
-            "ok": False,
-            "provider": "netmirror",
-            "display_name": "NetMirror",
-            "platform": platform,
-            "query": q,
-            "count": 0,
-            "items": [],
-            "error": str(e)[:160],
-            "note": "NetMirror often blocks cloud IPs (Vercel). Works on VPS/home IP.",
-        }
-    items = []
-    for it in data.get("searchResult") or []:
-        if not isinstance(it, dict):
-            continue
-        items.append({
-            "id": str(it.get("id") or ""),
-            "title": it.get("t") or it.get("title") or "",
-            "platform": platform,
-            "ott": ott,
-        })
-    return {
-        "ok": True,
-        "provider": "netmirror",
-        "display_name": "NetMirror",
-        "platform": platform,
-        "query": q,
-        "count": len(items),
-        "items": items,
-        "img_referer": data.get("img_referer"),
-    }
-
-
-@app.get("/nm/detail", tags=["NetMirror"])
-async def nm_detail(
-    id: str = Query(..., description="NetMirror content id from /nm/search"),
-    platform: str = Query("netflix"),
-):
-    """NetMirror post/detail (seasons / episodes metadata)."""
-    ott = _NM_PLATFORMS.get(platform.lower(), "nf")
-    try:
-        data = await _nm_get(
-            "/newtv/post.php",
-            ott,
-            {"id": id},
-            {"Lastep": "", "Usertoken": ""},
-        )
-    except Exception as e:
-        return {"ok": False, "provider": "netmirror", "id": id, "error": str(e)[:160], "data": {}}
-    return {
-        "ok": True,
-        "provider": "netmirror",
-        "display_name": "NetMirror",
-        "id": id,
-        "platform": platform,
-        "data": data,
-    }
-
-
-@app.get("/nm/stream", tags=["NetMirror"])
-async def nm_stream(
-    id: str = Query(..., description="Content or episode id"),
-    platform: str = Query("netflix"),
-    title: str = Query(None, description="Optional title — search then play first match"),
-    se: int = 0,
-    ep: int = 0,
-):
-    """
-    NetMirror direct stream (usually HLS .m3u8).
-    Pass `id` from search, or `title` to search+play in one call.
-    """
-    try:
-        return await _nm_stream_inner(id, platform, title, se, ep)
-    except Exception as e:
-        return {
-            "ok": False,
-            "provider": "netmirror",
-            "display_name": "NetMirror",
-            "error": str(e)[:160],
-            "streams": [],
-            "stream": None,
-            "note": "NetMirror blocks many cloud IPs. Use embeds / VixSrc / 4K instead.",
-        }
-
-
-async def _nm_stream_inner(id, platform, title, se, ep):
-    ott = _NM_PLATFORMS.get(platform.lower(), "nf")
-    content_id = id
-    if title and not id:
-        sr = await _nm_get("/newtv/search.php", ott, {"s": title})
-        results = sr.get("searchResult") or []
-        if not results:
-            return {"ok": False, "provider": "netmirror", "error": "no search results", "streams": [], "stream": None}
-        content_id = str(results[0].get("id"))
-    # detail for series episode mapping
-    if se or ep:
-        try:
-            post = await _nm_get(
-                "/newtv/post.php",
-                ott,
-                {"id": content_id},
-                {"Lastep": "", "Usertoken": ""},
-            )
-            # try match episode list
-            for e in post.get("episodes") or []:
-                if not e:
-                    continue
-                e_ep = e.get("ep") or (e.get("epNum") or "").replace("E", "")
-                try:
-                    e_ep_i = int(e_ep)
-                except Exception:
-                    continue
-                if ep and e_ep_i == ep:
-                    content_id = str(e.get("id") or content_id)
-                    break
-            else:
-                content_id = str(post.get("main_id") or content_id)
-        except Exception:
-            pass
-    else:
-        try:
-            post = await _nm_get(
-                "/newtv/post.php",
-                ott,
-                {"id": content_id},
-                {"Lastep": "", "Usertoken": ""},
-            )
-            content_id = str(post.get("main_id") or content_id)
-        except Exception:
-            pass
-
-    player = await _nm_get(
-        "/newtv/player.php",
-        ott,
-        {"id": content_id},
-        {"Usertoken": ""},
-    )
-    link = player.get("video_link") or player.get("url") or ""
-    if not link:
-        return {"ok": False, "provider": "netmirror", "error": f"no video_link ({player.get('status')})", "streams": [], "stream": None}
-    base = await _nm_resolve_base()
-    return {
-        "provider": "netmirror",
-        "display_name": "NetMirror",
-        "platform": platform,
-        "id": content_id,
-        "title": player.get("title") or title,
-        "status": player.get("status"),
-        "stream": {
-            "url": link,
-            "format": "HLS" if ".m3u8" in link else "FILE",
-            "playable": True,
-            "headers": {
-                "Referer": player.get("referer") or "https://net52.cc",
-                "User-Agent": _NM_HEADERS["User-Agent"],
-            },
-        },
-        "streams": [
-            {
-                "url": link,
-                "label": f"NetMirror ({platform})",
-                "format": "HLS" if ".m3u8" in link else "FILE",
-                "playable": True,
-                "headers": {
-                    "Referer": player.get("referer") or "https://net52.cc",
-                    "User-Agent": _NM_HEADERS["User-Agent"],
-                },
-            }
-        ],
-        "api_base": base,
-    }
-
-
-@app.get("/nm/play", tags=["NetMirror"])
-async def nm_play(
-    q: str = Query(..., description="Title to search"),
-    platform: str = Query("netflix"),
-    se: int = 0,
-    ep: int = 0,
-):
-    """Search + stream in one call (NetMirror)."""
-    return await nm_stream(id="", platform=platform, title=q, se=se, ep=ep)
-
-
-# Named UI sources (as shown in Select Source Server dialog)
-_NAMED_SOURCES = [
-    {
-        "id": "netmirror",
-        "display_name": "NetMirror",
-        "badge": "Beta Experimental",
-        "description": "OTT mirror (Netflix / Prime / Hotstar) — direct HLS",
-        "endpoint": "/nm/play?q={title}&platform=netflix",
-    },
-    {
-        "id": "spacedom",
-        "display_name": "SpaceDom",
-        "badge": "Beta Experimental",
-        "description": "Experimental multi-source embed (Cinemaos + Zxc)",
-        "endpoint": "/providers/embeds?tmdb_id={tmdb_id}&media={media}",
-    },
-    {
-        "id": "source3",
-        "display_name": "Source 3",
-        "badge": "Reliable Multi-lang Always-Work",
-        "description": "MultiEmbed + VidSrc + AutoEmbed (multi language)",
-        "providers": ["MultiEmbed", "VidSrc", "AutoEmbed", "2Embed"],
-    },
-    {
-        "id": "source6",
-        "display_name": "Source 6",
-        "badge": "Multi-lang Sometimes works best",
-        "description": "VidSrc WTF v4 + PrimeSrc + VidZee",
-        "providers": ["VidSrc WTF v4", "PrimeSrc", "VidZee", "VidSrc WTF v3"],
-    },
-]
-
-
-@app.get("/sources", tags=["Providers"])
-async def sources_catalog():
-    """UI source server list (NetMirror, SpaceDom, Source 3, Source 6, …)."""
-    return {
-        "count": len(_NAMED_SOURCES) + len(_KIDUYU_EMBEDS),
-        "named": _NAMED_SOURCES,
-        "embeds": [{"id": n, "display_name": n} for n, _, _ in _KIDUYU_EMBEDS],
-    }
-
-
-@app.get("/sources/play", tags=["Providers"])
-async def sources_play(
-    source: str = Query(..., description="netmirror|spacedom|source3|source6|or embed id"),
-    tmdb_id: int = Query(None),
-    title: str = Query(None),
-    media: str = Query("movie"),
-    se: int = 1,
-    ep: int = 1,
-    platform: str = Query("netflix"),
-):
-    """Play via a named source server."""
-    sid = source.lower().strip()
-    media = "tv" if media in ("tv", "series") else "movie"
-    if sid in ("netmirror", "nm"):
-        if not title:
-            raise HTTPException(400, "title required for NetMirror")
-        return await nm_play(q=title, platform=platform, se=se if media == "tv" else 0, ep=ep if media == "tv" else 0)
-    if sid in ("spacedom", "space"):
-        if not tmdb_id:
-            raise HTTPException(400, "tmdb_id required for SpaceDom")
-        embeds = _build_embeds(tmdb_id, media, se, ep)
-        # prefer experimental hosts
-        prefer = {"cinemaos", "zxcstream", "vidnest", "peachify", "megaplay"}
-        ranked = sorted(embeds, key=lambda e: (0 if e["provider"] in prefer else 1))
-        return {
-            "provider": "spacedom",
-            "display_name": "SpaceDom",
-            "badge": "Beta Experimental",
-            "count": len(ranked),
-            "sources": ranked,
-        }
-    if sid in ("source3", "source_3", "s3"):
-        if not tmdb_id:
-            raise HTTPException(400, "tmdb_id required")
-        want = {"multiembed", "vidsrc", "autoembed", "2embed", "embedsu"}
-        embeds = [e for e in _build_embeds(tmdb_id, media, se, ep) if e["provider"] in want]
-        return {
-            "provider": "source3",
-            "display_name": "Source 3",
-            "badge": "Reliable Multi-lang Always-Work",
-            "count": len(embeds),
-            "sources": embeds,
-        }
-    if sid in ("source6", "source_6", "s6"):
-        if not tmdb_id:
-            raise HTTPException(400, "tmdb_id required")
-        want = {"vidsrc_wtf_v4", "vidsrc_wtf_v3", "primesrc", "vidzee"}
-        embeds = [e for e in _build_embeds(tmdb_id, media, se, ep) if e["provider"] in want]
-        return {
-            "provider": "source6",
-            "display_name": "Source 6",
-            "badge": "Multi-lang Sometimes works best",
-            "count": len(embeds),
-            "sources": embeds,
-        }
-    # fallback: single embed by provider id
-    if tmdb_id:
-        embeds = _build_embeds(tmdb_id, media, se, ep)
-        hit = [e for e in embeds if e["provider"] == sid or e["provider"].lower() == sid]
-        return {"provider": sid, "display_name": sid, "count": len(hit), "sources": hit or embeds[:5]}
-    raise HTTPException(400, "Need title (NetMirror) or tmdb_id (other sources)")
-
-# =============================================================================
-# FilmSnaps + KiduyuTv embed / provider catalog (from their open-source lists)
-# Kiduyu backend (sflatransport) is often CF-challenged; embeds always work.
-# =============================================================================
-
-# KiduyuTv StreamProvider templates (movie / tv with season episode)
-_KIDUYU_EMBEDS = [
-    ("videasy", "https://player.videasy.net/movie/{id}", "https://player.videasy.net/tv/{id}/{se}/{ep}"),
-    ("vidrock", "https://vidrock.net/movie/{id}", "https://vidrock.net/tv/{id}/{se}/{ep}"),
-    ("vidlink", "https://vidlink.pro/movie/{id}", "https://vidlink.pro/tv/{id}/{se}/{ep}"),
-    ("vidfast", "https://vidfast.pro/movie/{id}", "https://vidfast.pro/tv/{id}/{se}/{ep}"),
-    ("vidking", "https://www.vidking.net/embed/movie/{id}", "https://www.vidking.net/embed/tv/{id}/{se}/{ep}"),
-    ("vidnest", "https://vidnest.fun/movie/{id}", "https://vidnest.fun/tv/{id}/{se}/{ep}"),
-    ("vidup", "https://vidup.to/movie/{id}", "https://vidup.to/tv/{id}/{se}/{ep}"),
-    ("111movies", "https://111movies.com/movie/{id}", "https://111movies.com/tv/{id}/{se}/{ep}"),
-    ("flixer", "https://flixer.su/watch/movie/{id}", "https://flixer.su/watch/tv/{id}/{se}/{ep}"),
-    ("vidcore", "https://vidcore.net/movie/{id}", "https://vidcore.net/tv/{id}/{se}/{ep}"),
-    ("moviesapi", "https://moviesapi.to/movie/{id}", "https://moviesapi.to/tv/{id}-{se}-{ep}"),
-    ("peachify", "https://peachify.top/embed/movie/{id}", "https://peachify.top/embed/tv/{id}/{se}/{ep}"),
-    ("vidapi", "https://vaplayer.ru/embed/movie/{id}", "https://vaplayer.ru/embed/tv/{id}/{se}/{ep}"),
-    ("vidplus", "https://player.vidplus.to/embed/movie/{id}", "https://player.vidplus.to/embed/tv/{id}/{se}/{ep}"),
-    ("cinesrc", "https://cinesrc.st/embed/movie/{id}", "https://cinesrc.st/embed/tv/{id}?s={se}&e={ep}"),
-    ("vidzen", "https://vidzen.fun/movie/{id}", "https://vidzen.fun/tv/{id}/{se}/{ep}"),
-    ("cinemaos", "https://cinemaos.tech/player/{id}", "https://cinemaos.tech/player/{id}/{se}/{ep}"),
-    ("amri", "https://amri.gg/movie/{id}", "https://amri.gg/tv/{id}/{se}/{ep}"),
-    ("zxcstream", "https://zxcstream.xyz/embed/movie/{id}", "https://zxcstream.xyz/embed/tv/{id}/{se}/{ep}"),
-    ("vidlux", "https://vidlux.xyz/embed/movie/{id}", "https://vidlux.xyz/embed/tv/{id}/{se}/{ep}"),
-    ("vidsrc_wtf_v4", "https://vidsrc.wtf/api/4/movie/?id={id}", "https://vidsrc.wtf/api/4/tv/?id={id}&s={se}&e={ep}"),
-    ("vidsrc_wtf_v3", "https://vidsrc.wtf/api/3/movie/?id={id}", "https://vidsrc.wtf/api/3/tv/?id={id}&s={se}&e={ep}"),
-    ("primesrc", "https://primesrc.me/embed/movie?tmdb={id}", "https://primesrc.me/embed/tv?tmdb={id}&season={se}&episode={ep}"),
-    ("vidzee", "https://player.vidzee.wtf/v2/embed/movie/{id}", "https://player.vidzee.wtf/v2/embed/tv/{id}/{se}/{ep}"),
-    ("lordflix", "https://lordflix.org/watch/movie/{id}", "https://lordflix.org/watch/tv/{id}/{se}/{ep}"),
-    ("vidsrc", "https://vidsrc.to/embed/movie/{id}", "https://vidsrc.to/embed/tv/{id}/{se}/{ep}"),
-    ("vidsrc_cc", "https://vidsrc.cc/v2/embed/movie/{id}", "https://vidsrc.cc/v2/embed/tv/{id}/{se}/{ep}"),
-    ("autoembed", "https://player.autoembed.cc/embed/movie/{id}", "https://player.autoembed.cc/embed/tv/{id}/{se}/{ep}"),
-    ("2embed", "https://www.2embed.cc/embed/{id}", "https://www.2embed.cc/embedtv/{id}&s={se}&e={ep}"),
-    ("multiembed", "https://multiembed.mov/?video_id={id}&tmdb=1", "https://multiembed.mov/?video_id={id}&tmdb=1&s={se}&e={ep}"),
-    ("embedsu", "https://embed.su/embed/movie/{id}", "https://embed.su/embed/tv/{id}/{se}/{ep}"),
-    ("smashystream", "https://player.smashy.stream/movie/{id}", "https://player.smashy.stream/tv/{id}?s={se}&e={ep}"),
-]
-
-# FilmSnaps providers.json host ids (for documentation / allowlist)
-_FILMSNAPS_HOSTS = [
-    "web.nxsha.app", "nxcdn.app", "peachify.top", "screenscape.me", "nhdapi.com",
-    "zxcstream.xyz", "player.zxcstream.xyz", "cinemaos.live", "chillflix.lol",
-    "vidapi.cloud", "vidnest.fun", "toustream.xyz", "streamguide.cfd",
-    "player.vidzee.wtf", "megaplay.buzz", "player.videasy.net", "www.vidking.net",
-]
-
-
-def _build_embeds(tmdb_id: int, media: str = "movie", se: int = 1, ep: int = 1) -> List[dict]:
-    se = se or 1
-    ep = ep or 1
-    out = []
-    for name, m_tpl, t_tpl in _KIDUYU_EMBEDS:
-        try:
-            if media in ("tv", "series"):
-                url = t_tpl.format(id=tmdb_id, se=se, ep=ep)
-            else:
-                url = m_tpl.format(id=tmdb_id, se=se, ep=ep)
-            out.append({
-                "type": "embed",
-                "provider": name,
-                "url": url,
-                "playable": True,
-                "phone_friendly": True,
-                "source": "kiduyu+filmsnaps",
-            })
-        except Exception:
-            continue
-    return out
-
-
-@app.get("/providers/list", tags=["Providers"])
-async def providers_list():
-    """All embed providers (KiduyuTv + FilmSnaps style) + FilmSnaps CDN hosts."""
-    return {
-        "ok": True,
-        "embed_count": len(_KIDUYU_EMBEDS),
-        "embeds": [{"id": n, "movie": m, "tv": tv} for n, m, tv in _KIDUYU_EMBEDS],
-        "filmsnaps_hosts": _FILMSNAPS_HOSTS,
-        "note": "Use /providers/embeds?tmdb_id=19995&media=movie",
-    }
-
-
-@app.get("/providers/embeds", tags=["Providers"])
-async def providers_embeds(
-    tmdb_id: int = Query(..., description="TMDB id"),
-    media: str = Query("movie", description="movie | tv"),
-    se: int = Query(1, description="season (tv)"),
-    ep: int = Query(1, description="episode (tv)"),
-):
-    """KiduyuTv + FilmSnaps-style embed URLs for a title."""
-    embeds = _build_embeds(tmdb_id, media, se, ep)
-    return {
-        "ok": True,
-        "tmdb_id": tmdb_id,
-        "media": media,
-        "se": se,
-        "ep": ep,
-        "count": len(embeds),
-        "embeds": embeds,
-    }
-
-
-@app.get("/providers/streams", tags=["Providers"])
-async def providers_streams(
-    tmdb_id: int = Query(...),
-    media: str = Query("movie"),
-    se: int = 1,
-    ep: int = 1,
-    include_embeds: bool = True,
-    include_moviebox: bool = False,
-    include_4k: bool = False,
-    title: str = Query(None),
-):
-    """
-    Aggregate play sources:
-    - full embed catalog (Kiduyu + FilmSnaps hosts)
-    - optional MovieBox DASH proxy (if title/subject resolved)
-    - optional 4KHDHub direct streams (if title search hits)
-    """
-    media = "tv" if media in ("tv", "series") else "movie"
-    sources = _build_embeds(tmdb_id, media, se, ep) if include_embeds else []
-    errors = {}
-
-    if include_moviebox and title:
-        try:
-            mb = await mb_search(q=title, page=1)
-            items = mb.get("items") or []
-            if items:
-                sid = items[0].get("subject_id")
-                st = await mb_stream(sid, se=se if media == "tv" else 0, ep=ep if media == "tv" else 0)
-                if st.get("proxy_url") or st.get("proxy_mpd"):
-                    sources.append({
-                        "type": "dash",
-                        "provider": "moviebox",
-                        "url": st.get("proxy_url") or st.get("proxy_mpd"),
-                        "playable": True,
-                        "phone_friendly": False,
-                        "subject_id": sid,
-                    })
-                for b in st.get("browser") or []:
-                    sources.append({"type": "embed", "provider": b.get("provider"), "url": b.get("url"), "playable": True})
-        except Exception as e:
-            errors["moviebox"] = str(e)[:120]
-
-    if include_4k and title:
-        try:
-            html = await fk_fetch(f"?s={title}")
-            items = fk_parse_search(html)
-            if items:
-                fid = items[0].get("id")
-                fk = await fk_stream(id=fid, se=se if media == "tv" else 0, ep=ep if media == "tv" else 0, resolve=True, limit=6)
-                for s in fk.get("streams") or []:
-                    if s.get("playable"):
-                        sources.append({
-                            "type": "direct",
-                            "provider": "4khdhub",
-                            "url": s.get("url"),
-                            "label": s.get("label"),
-                            "playable": True,
-                            "phone_friendly": True,
-                        })
-        except Exception as e:
-            errors["4khdhub"] = str(e)[:120]
-
-    return {
-        "ok": True,
-        "tmdb_id": tmdb_id,
-        "media": media,
-        "se": se,
-        "ep": ep,
-        "count": len(sources),
-        "sources": sources,
-        "errors": errors or None,
-    }
-
-
-@app.get("/providers/subtitles", tags=["Providers"])
-async def providers_subtitles(
-    tmdb_id: int = Query(None),
-    imdb_id: str = Query(None),
-    query: str = Query(None),
-    se: int = 0,
-    ep: int = 0,
-):
-    """Wyzie-style open subtitle lookup (FilmSnaps uses sub.wyzie.io)."""
-    urls = []
-    if imdb_id:
-        urls.append(f"https://sub.wyzie.io/search?id={imdb_id}")
-    if tmdb_id:
-        urls.append(f"https://sub.wyzie.io/search?id={tmdb_id}")
-        if se and ep:
-            urls.append(f"https://sub.wyzie.io/search?id={tmdb_id}&season={se}&episode={ep}")
-    if query:
-        urls.append(f"https://sub.wyzie.io/search?query={quote(query)}")
-    results = []
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        for u in urls[:3]:
-            try:
-                r = await client.get(u, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
-                if r.status_code == 200:
-                    data = r.json()
-                    if isinstance(data, list):
-                        results.extend(data)
-                    elif isinstance(data, dict):
-                        results.extend(data.get("subtitles") or data.get("data") or [])
-            except Exception:
-                continue
-    return {"ok": True, "count": len(results), "subtitles": results[:40]}
-
-
-@app.get("/api/play", tags=["Playback"])
-async def api_play(
-    subject_id: str = Query(None, description="Legacy MovieBox id — ignored on web path"),
-    tmdb_id: str = Query(None, description="TMDB id for web playback"),
-    media: str = Query("movie"),
-    se: int = 0,
-    ep: int = 0,
-    q: str = Query("", description="Title for 4KHDHub match / TMDB lookup"),
-    fast: bool = Query(True, description="Skip slow 4K resolve (embeds only) — set false for hub list"),
-):
-    """Web playback: embeds immediately; optional 4KHDHub when fast=false."""
-    sources = []
-    errors = {}
-    media = "tv" if media in ("tv", "series", "show") else "movie"
-    title = (q or "").strip()
-    tid = (tmdb_id or "").strip() or None
-    if not tid and subject_id and str(subject_id).isdigit() and len(str(subject_id)) < 12:
-        tid = str(subject_id)
-
-    meta = None
-    if tid:
-        det = await _tmdb_get(f"/{media}/{tid}")
-        if det.get("id"):
-            title = title or det.get("title") or det.get("name") or ""
-            meta = {"tmdb": str(det["id"]), "imdb": (det.get("external_ids") or {}).get("imdb_id"), "name": title}
-            if not meta.get("imdb"):
-                try:
-                    ext = await _tmdb_get(f"/{media}/{tid}/external_ids")
-                    meta["imdb"] = ext.get("imdb_id")
-                except Exception:
-                    pass
-    if not meta and title:
-        meta = await _tmdb_search_id(title, media)
-        if meta and meta.get("tmdb"):
-            tid = str(meta["tmdb"])
-            title = title or meta.get("name") or ""
-
-    se_use = se if media == "tv" else 0
-    ep_use = ep if media == "tv" else 0
-    if media == "tv":
-        se_use = max(1, se_use or 1)
-        ep_use = max(1, ep_use or 1)
-
-    if meta:
-        sources.extend(_embed_sources_meta(meta, media, se_use or 1, ep_use or 1))
-    else:
-        errors["embed"] = "no TMDB match"
-
-    hub_links: List[dict] = []
-    if not fast and title:
-        try:
-            hub_links = await asyncio.wait_for(
-                collect_4k_mirrors(title, se_use if media == "tv" else 0, ep_use if media == "tv" else 0, limit=6),
-                timeout=12.0,
-            )
-        except Exception as e:
-            errors["4khdhub"] = str(e)
-
-    hub_src = [{
-        "provider": "4khdhub",
-        "label": h.get("label") or "Hub",
-        "url": h["url"],
-        "play_url": h.get("play_url") or h["url"],
-        "format": h.get("format") or "FILE",
-        "type": "direct",
-        "headers": h.get("headers") or {},
-    } for h in hub_links if h.get("url")]
-
-    uniq = []
-    seen = set()
-    for s in sources + hub_src:
-        u = s.get("url")
-        if not u or u in seen:
-            continue
-        seen.add(u)
-        uniq.append(s)
-
-    downloads = []
-    for h in hub_links:
-        u = h.get("url") or ""
-        if u:
-            downloads.append({
-                "label": h.get("label") or "Download",
-                "url": u,
-                "format": h.get("format") or "FILE",
-                "quality": h.get("quality") or "",
-                "filename": h.get("filename") or "",
-            })
-
-    return {
-        "tmdb_id": tid,
-        "media": media,
-        "se": se_use,
-        "ep": ep_use,
-        "title": title,
-        "count": len(uniq),
-        "sources": uniq,
-        "hub_links": hub_links,
-        "downloads": downloads,
-        "errors": errors or None,
-        "strategy": "embeds-first (fast=true) · 4k optional",
-        "note": None,
-    }
-
-
-
-# ═══════════════════════════════════════════════════════════
-# MUSIC helpers — JioSaavn + YT Music (vivi-music style)
-# ═══════════════════════════════════════════════════════════
-
-YT_MUSIC_KEY = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30"
-YT_MUSIC_CTX = {
-    "client": {
-        "clientName": "WEB_REMIX",
-        "clientVersion": "1.20240403.01.00",
-        "hl": "en",
-        "gl": "US",
-    }
-}
-YT_MUSIC_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Content-Type": "application/json",
-    "Origin": "https://music.youtube.com",
-    "Referer": "https://music.youtube.com/",
-}
-SAAVN_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-}
-
-
-async def _ytm_post(path: str, body: dict) -> dict:
-    url = f"https://music.youtube.com/youtubei/v1/{path}?key={YT_MUSIC_KEY}&prettyPrint=false"
-    payload = {"context": YT_MUSIC_CTX, **body}
-    async with httpx.AsyncClient(timeout=25.0) as client:
-        r = await client.post(url, json=payload, headers=YT_MUSIC_HEADERS)
-        if r.status_code >= 400:
-            return {}
-        try:
-            return r.json()
-        except Exception:
-            return {}
-
-
-def _ytm_walk(obj, key: str, out: list):
-    if isinstance(obj, dict):
-        if key in obj:
-            out.append(obj[key])
-        for v in obj.values():
-            _ytm_walk(v, key, out)
-    elif isinstance(obj, list):
-        for i in obj:
-            _ytm_walk(i, key, out)
-
-
-def _ytm_parse_item(it: dict) -> Optional[dict]:
-    s = json.dumps(it)
-    vid_m = re.search(r'"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"', s)
-    if not vid_m:
-        return None
-    vid = vid_m.group(1)
-    texts = re.findall(r'"text"\s*:\s*"([^"\\]{1,120})"', s)
-    noise = {"Video", "Song", "Album", "Playlist", "Start mix", "Play next", "Shuffle", "Subscribe", "Share", "Episode"}
-    clean = [x for x in texts if x not in noise and not x.startswith("\\u") and len(x) > 1]
-    title = clean[0] if clean else vid
-    artist = ""
-    for c in clean[1:]:
-        if c not in title and not re.match(r"^\d", c) and "views" not in c.lower() and "play" not in c.lower():
-            artist = c
-            break
-    thumbs = re.findall(r'https://i\.ytimg\.com/[^"\\]+', s)
-    thumb = thumbs[0].replace("\\u0026", "&") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
-    return {
-        "id": vid,
-        "video_id": vid,
-        "title": title,
-        "artist": artist,
-        "thumb": thumb,
-        "type": "song",
-        "provider": "ytmusic",
-        "source": "ytmusic",
-    }
-
-
-async def _saavn_get(params: dict) -> Any:
-    q = {"_format": "json", "_marker": "0", "api_version": "4", "ctx": "web6dot0"}
-    q.update(params)
-    async with httpx.AsyncClient(timeout=20.0, headers=SAAVN_HEADERS) as client:
-        r = await client.get("https://www.jiosaavn.com/api.php", params=q)
-        if r.status_code != 200:
-            return {}
-        try:
-            return r.json()
-        except Exception:
-            m = re.search(r"(\{.*\}|\[.*\])", r.text, re.S)
-            if m:
-                try:
-                    return json.loads(m.group(1))
-                except Exception:
-                    return {}
-            return {}
-
-
-def _saavn_card(song: dict) -> Optional[dict]:
-    if not isinstance(song, dict):
-        return None
-    sid = song.get("id")
-    title = song.get("title") or song.get("song") or ""
-    if not sid or not title:
-        return None
-    mi = song.get("more_info") if isinstance(song.get("more_info"), dict) else {}
-    artists = song.get("primary_artists") or mi.get("music") or song.get("subtitle") or song.get("singers") or ""
-    if isinstance(artists, list):
-        artists = ", ".join(str(a) for a in artists)
-    image = song.get("image") or ""
-    image = image.replace("-50x50", "-500x500").replace("-150x150", "-500x500")
-    enc = mi.get("encrypted_media_url") or song.get("encrypted_media_url") or ""
-    dur = mi.get("duration") or song.get("duration")
-    try:
-        dur = int(dur) if dur else None
-    except Exception:
-        dur = None
-    return {
-        "id": f"saavn:{sid}",
-        "saavn_id": sid,
-        "video_id": None,
-        "title": title,
-        "artist": artists,
-        "thumb": image,
-        "duration": dur,
-        "encrypted_media_url": enc,
-        "type": "song",
-        "provider": "jiosaavn",
-        "source": "jiosaavn",
-        "perma_url": song.get("perma_url"),
-    }
-
-
-async def _saavn_search(q: str, n: int = 20) -> List[dict]:
-    data = await _saavn_get({"__call": "search.getResults", "p": "1", "q": q, "n": str(n)})
-    results = data.get("results") or []
-    out = []
-    for s in results:
-        c = _saavn_card(s)
-        if c:
-            out.append(c)
-    return out
-
-
-async def _saavn_auth_url(encrypted: str, bitrate: int = 320) -> Optional[str]:
-    if not encrypted:
-        return None
-    data = await _saavn_get({
-        "__call": "song.generateAuthToken",
-        "url": encrypted,
-        "bitrate": str(bitrate),
-    })
-    url = data.get("auth_url") if isinstance(data, dict) else None
-    if url and url.startswith("http"):
-        return url
-    return None
-
-
-async def _saavn_stream_by_id(sid: str) -> Optional[dict]:
-    data = await _saavn_get({"__call": "song.getDetails", "cc": "in", "pids": sid})
-    song = None
-    if isinstance(data, dict):
-        if sid in data and isinstance(data[sid], dict):
-            song = data[sid]
-        elif isinstance(data.get("songs"), list) and data["songs"]:
-            for s in data["songs"]:
-                if isinstance(s, dict) and (s.get("id") == sid or not song):
-                    song = s
-                    if s.get("id") == sid:
-                        break
-        else:
-            for v in data.values():
-                if isinstance(v, dict) and (v.get("id") == sid or v.get("song") or v.get("title")):
-                    song = v
-                    break
-                if isinstance(v, list):
-                    for s in v:
-                        if isinstance(s, dict) and s.get("id") == sid:
-                            song = s
+                        r2 = await client.get(alt, headers=headers)
+                        c2 = (r2.headers.get("content-type") or "").lower()
+                        h2 = (r2.content[:40] or b"").lstrip().lower()
+                        if r2.status_code < 400 and "text/html" not in c2 and not h2.startswith(b"<!doctype"):
+                            r = r2
+                            target = alt
                             break
-    if not isinstance(song, dict):
-        return None
-    card = _saavn_card(song)
-    if not card:
-        card = {
-            "id": f"saavn:{sid}",
-            "saavn_id": sid,
-            "title": song.get("song") or song.get("title") or sid,
-            "artist": song.get("primary_artists") or song.get("singers") or "",
-            "thumb": (song.get("image") or "").replace("-150x150", "-500x500").replace("-50x50", "-500x500"),
-            "provider": "jiosaavn",
-            "source": "jiosaavn",
-        }
-    enc = (
-        song.get("encrypted_media_url")
-        or (song.get("more_info") or {}).get("encrypted_media_url")
-        or card.get("encrypted_media_url")
-        or ""
+                    except Exception:
+                        continue
+    except Exception as e:
+        raise HTTPException(502, f"hls fetch: {e}")
+
+    if r.status_code >= 400:
+        detail = f"upstream {r.status_code}"
+        if r.status_code in (530, 1033, 502, 503):
+            detail += " — HindiAnime stream tunnel may be offline (Cloudflare 1033). Retry later."
+        raise HTTPException(502, detail)
+
+    ctype = (r.headers.get("content-type") or "").lower()
+    body = r.content
+    head = body[:80].lstrip().lower() if body else b""
+    is_playlist = (
+        "mpegurl" in ctype
+        or "m3u8" in ctype
+        or target.split("?")[0].endswith(".m3u8")
+        or u.split("?")[0].endswith(".m3u8")
+        or head.startswith(b"#extm3u")
     )
-    if not enc:
-        return card
-    for br in (320, 160, 96):
-        audio = await _saavn_auth_url(enc, br)
-        if audio:
-            card["audio_url"] = audio
-            card["audio_format"] = "mp4"
-            card["bitrate"] = br
-            break
-    return card
+    # Reject HTML masquerading as media
+    if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+        raise HTTPException(502, "upstream returned HTML (segment blocked)")
 
-
-async def _saavn_match(title: str, artist: str = "") -> Optional[dict]:
-    q = f"{title} {artist}".strip()
-    if not q:
-        return None
-    hits = await _saavn_search(q, 8)
-    if not hits:
-        return None
-    tlow = re.sub(r"\s*\(.*?\)\s*", " ", title).lower().strip()
-    alow = (artist or "").lower()
-    def score(h):
-        ht = (h.get("title") or "").lower()
-        ha = (h.get("artist") or "").lower()
-        s = 0
-        if ht == tlow or tlow in ht or ht in tlow:
-            s += 5
-        if alow and alow.split(",")[0].strip() in ha:
-            s += 3
-        return s
-    hits = sorted(hits, key=score, reverse=True)
-    return await _saavn_stream_by_id(hits[0]["saavn_id"])
-
-
-async def _ytdlp_audio(video_id: str) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[str]]:
-    def _extract():
-        try:
-            import yt_dlp  # type: ignore
-        except ImportError:
-            return None, None, None, "yt-dlp not installed"
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        clients = ["android,web", "android_music,android", "ios,web", "tv_embedded", "web"]
-        last_err = None
-        for client in clients:
-            opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "skip_download": True,
-                "format": "bestaudio[ext=m4a]/bestaudio/best",
-                "noplaylist": True,
-                "extractor_args": {"youtube": {"player_client": client.split(",")}},
-            }
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                if not info:
-                    continue
-                formats = info.get("formats") or []
-                audio_fmts = [
-                    f for f in formats
-                    if f.get("url") and f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
-                ]
-                if not audio_fmts and info.get("url"):
-                    return info.get("url"), info.get("ext"), info.get("duration"), None
-                if not audio_fmts:
-                    continue
-                def score(f):
-                    ext = (f.get("ext") or "")
-                    br = f.get("abr") or f.get("tbr") or 0
-                    pref = 3 if ext == "m4a" else 2 if ext in ("mp4", "webm") else 1
-                    return (pref, br)
-                audio_fmts.sort(key=score, reverse=True)
-                best = audio_fmts[0]
-                return best.get("url"), best.get("ext") or "m4a", info.get("duration"), None
-            except Exception as e:
-                last_err = str(e)
+    if is_playlist:
+        text = body.decode("utf-8", errors="ignore")
+        base = target.rsplit("/", 1)[0] + "/"
+        lines = []
+        for line in text.splitlines():
+            raw = line.strip()
+            if not raw:
+                lines.append(line)
                 continue
-        return None, None, None, last_err or "all clients failed"
-    return await asyncio.to_thread(_extract)
+            if raw.startswith("#"):
+                if 'URI="' in line:
+                    def _rew(m, _base=base):
+                        uri = m.group(1)
+                        if uri.startswith("http://") or uri.startswith("https://"):
+                            full_u = uri
+                        elif uri.startswith("/"):
+                            full_u = "https://stream.hindianime.site" + uri
+                        else:
+                            full_u = urljoin(_base, uri)
+                        full_u = _ha_force_stream_host(full_u)
+                        return 'URI="/anime/hls?u=' + quote(full_u, safe="") + '"'
+                    line = re.sub(r'URI="([^"]+)"', _rew, line)
+                lines.append(line)
+                continue
+            if raw.startswith("http://") or raw.startswith("https://"):
+                full_u = raw
+            elif raw.startswith("/"):
+                full_u = "https://stream.hindianime.site" + raw
+            else:
+                full_u = urljoin(base, raw)
+            full_u = _ha_force_stream_host(full_u)
+            lines.append("/anime/hls?u=" + quote(full_u, safe=""))
+        out = "\n".join(lines) + "\n"
+        return Response(
+            content=out,
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Cache-Control": "no-cache",
+            },
+        )
 
-
-
-
-
-@app.get("/movie/search", tags=["Movies"])
-async def movie_search(q: str = Query(..., min_length=1), page: int = 1):
-    """Unified movie search: TMDB + MovieBox + 4KHDHub (parallel)."""
-    import asyncio as _aio
-
-    async def tmdb():
-        try:
-            d = await _tmdb_get("/search/multi", {"query": q, "page": page})
-            out = []
-            for r in d.get("results") or []:
-                if r.get("media_type") not in ("movie", "tv"):
-                    continue
-                out.append({
-                    "provider": "tmdb",
-                    "id": r["id"],
-                    "media": r["media_type"],
-                    "title": r.get("title") or r.get("name"),
-                    "year": (r.get("release_date") or r.get("first_air_date") or "")[:4],
-                    "poster": f"https://image.tmdb.org/t/p/w500{r['poster_path']}" if r.get("poster_path") else None,
-                    "rating": r.get("vote_average"),
-                })
-            return out
-        except Exception:
-            return []
-
-    async def mb():
-        try:
-            d = await mb_search(q=q, page=page)
-            return [
-                {
-                    "provider": "moviebox",
-                    "id": it.get("subject_id"),
-                    "media": it.get("type") or "movie",
-                    "title": it.get("name") or it.get("title"),
-                    "year": it.get("year"),
-                    "poster": it.get("poster_url") or it.get("poster"),
-                    "rating": it.get("rating"),
-                }
-                for it in (d.get("items") or [])
-            ]
-        except Exception:
-            return []
-
-    async def fk():
-        try:
-            html = await fk_fetch(f"?s={q}")
-            return [
-                {
-                    "provider": "4khdhub",
-                    "id": it.get("id"),
-                    "media": "movie",
-                    "title": it.get("name") or it.get("title"),
-                    "year": it.get("year"),
-                    "poster": it.get("poster"),
-                }
-                for it in fk_parse_search(html)[:15]
-            ]
-        except Exception:
-            return []
-
-    tmdb_i, mb_i, fk_i = await _aio.gather(tmdb(), mb(), fk())
-    return {
-        "query": q,
-        "page": page,
-        "tmdb": tmdb_i,
-        "moviebox": mb_i,
-        "fourkhdhub": fk_i,
-        "count": len(tmdb_i) + len(mb_i) + len(fk_i),
+    out_headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "*",
+        "Cache-Control": "public, max-age=60",
+        "Content-Length": str(len(body)),
+        "Accept-Ranges": "bytes",
     }
+    if r.status_code == 206 and r.headers.get("content-range"):
+        out_headers["Content-Range"] = r.headers["content-range"]
+        return Response(content=body, media_type=ctype or "application/octet-stream", status_code=206, headers=out_headers)
+    return Response(
+        content=body,
+        media_type=ctype or "application/octet-stream",
+        headers=out_headers,
+    )
 
 
-@app.get("/movie/play", tags=["Movies"])
-async def movie_play(
-    title: str = Query(None, description="Title to match"),
-    tmdb_id: int = Query(None),
-    media: str = Query("movie", description="movie|tv"),
-    subject_id: str = Query(None, description="MovieBox subject id"),
-    fk_id: str = Query(None, description="4KHDHub path id"),
-    se: int = 0,
-    ep: int = 0,
+
+@app.get("/anime/cdn", tags=["Anime"])
+async def anime_cdn(
+    tmdb_id: Optional[str] = Query(None),
+    title: Optional[str] = Query(None),
+    type: str = Query("series", description="series|movie"),
+    season: int = Query(1, ge=1),
+    episode: int = Query(1, ge=1),
 ):
+    """Direct CDN m3u8 links (VidSrc data API + WASM decrypt + host token).
+
+    Prefer this over iframe embeds when you need real playable HLS URLs for VLC / native players.
     """
-    Aggregate play sources: embed servers + MovieBox DASH proxy + 4K direct streams.
-    """
-    sources = []
-    errors = {}
-    # embeds via TMDB
+    is_movie = (type or "").lower() in ("movie", "movies", "film")
     tid = tmdb_id
     if not tid and title:
-        try:
-            tr = await _tmdb_get("/search/multi", {"query": title})
-            for r in tr.get("results") or []:
-                if r.get("media_type") in ("movie", "tv"):
-                    tid = r["id"]
-                    media = r["media_type"]
-                    break
-        except Exception as e:
-            errors["tmdb"] = str(e)[:100]
-    if tid:
-        path = f"{media}/{tid}"
-        if media == "tv":
-            path = f"tv/{tid}/{se or 1}/{ep or 1}"
-        embeds = [
-            ("vidsrc", f"https://vidsrc.to/embed/{path if media=='movie' else f'tv/{tid}/{se or 1}/{ep or 1}'}"),
-            ("vidlink", f"https://vidlink.pro/{media}/{tid}" + (f"/{se or 1}/{ep or 1}" if media == "tv" else "")),
-            ("videasy", f"https://player.videasy.net/{media}/{tid}" + (f"/{se or 1}/{ep or 1}" if media == "tv" else "")),
-            ("vidking", f"https://www.vidking.net/embed/{media}/{tid}" + (f"/{se or 1}/{ep or 1}" if media == "tv" else "")),
-            ("autoembed", f"https://player.autoembed.cc/embed/{media}/{tid}" + (f"/{se or 1}/{ep or 1}" if media == "tv" else "")),
-        ]
-        for name, url in embeds:
-            sources.append({"type": "embed", "provider": name, "url": url, "playable": True, "phone_friendly": True})
-    # MovieBox
-    if subject_id:
-        try:
-            mb = await mb_stream(subject_id, se=se, ep=ep)
-            if mb.get("proxy_mpd") or mb.get("proxy_url"):
-                sources.append({
-                    "type": "dash",
-                    "provider": "moviebox",
-                    "url": mb.get("proxy_url") or mb.get("proxy_mpd"),
-                    "playable": True,
-                    "phone_friendly": False,
-                    "note": "HEVC DASH via cookie proxy",
-                })
-            for b in mb.get("browser") or []:
-                sources.append({"type": "embed", "provider": b.get("provider"), "url": b.get("url"), "playable": True, "phone_friendly": True})
-        except Exception as e:
-            errors["moviebox"] = str(e)[:120]
-    # 4K direct
-    if fk_id:
-        try:
-            fk = await fk_stream(id=fk_id, se=se, ep=ep, resolve=True, limit=8)
-            for s in fk.get("streams") or []:
-                if s.get("playable"):
-                    sources.append({
-                        "type": "direct",
-                        "provider": "4khdhub",
-                        "url": s.get("url"),
-                        "label": s.get("label"),
-                        "quality": s.get("quality"),
-                        "playable": True,
-                        "phone_friendly": True,
-                        "headers": s.get("headers"),
-                    })
-        except Exception as e:
-            errors["4khdhub"] = str(e)[:120]
-    return {
-        "title": title,
-        "tmdb_id": tid,
-        "media": media,
-        "subject_id": subject_id,
-        "fk_id": fk_id,
-        "se": se,
-        "ep": ep,
-        "count": len(sources),
-        "sources": sources,
-        "errors": errors or None,
-    }
+        tid = await _ha_tmdb_id(title, is_movie=is_movie)
+    if not tid:
+        raise HTTPException(400, "tmdb_id or title required")
+    result = await _vidsrc_resolve_cdn(
+        str(tid),
+        media_type="movie" if is_movie else "tv",
+        season=season,
+        episode=episode,
+    )
+    result["creator"] = "ElitePlex"
+    return result
+
+
+@app.get("/play/cdn", tags=["Play"])
+async def play_cdn(
+    tmdb_id: Optional[str] = Query(None),
+    title: Optional[str] = Query(None),
+    type: str = Query("movie"),
+    season: int = Query(1, ge=1),
+    episode: int = Query(1, ge=1),
+):
+    """Alias of /anime/cdn for movies & series (same resolver)."""
+    return await anime_cdn(tmdb_id=tmdb_id, title=title, type=type, season=season, episode=episode)
 
 @app.get("/music/search", tags=["Music"])
 async def music_search(q: str = Query(..., min_length=1)):
@@ -5736,48 +2248,117 @@ def _extract_youtube_id(url: str) -> Optional[str]:
 
 
 async def _tikwm_extract(url: str) -> dict:
-    """TikTok via tikwm.com — direct CDN (no watermark HD when available)."""
+    """TikTok multi-source: TikWM → iosint → yt-dlp fallback. Unlimited, no API key."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Referer": "https://www.tikwm.com/",
         "Accept": "application/json",
     }
-    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, headers=headers) as client:
-        r = await client.get("https://www.tikwm.com/api/", params={"url": url, "hd": 1})
-        if r.status_code != 200:
-            return {"ok": False, "error": f"tikwm HTTP {r.status_code}"}
-        j = r.json()
-        if j.get("code") != 0:
-            return {"ok": False, "error": j.get("msg") or "tikwm failed"}
-        d = j.get("data") or {}
-        formats = []
-        if d.get("hdplay"):
-            formats.append({"id": "hd", "label": "HD · no watermark", "ext": "mp4", "kind": "video+audio", "muxed": True, "url": d["hdplay"]})
-        if d.get("play"):
-            formats.append({"id": "play", "label": "Standard · no watermark", "ext": "mp4", "kind": "video+audio", "muxed": True, "url": d["play"]})
-        if d.get("wmplay"):
-            formats.append({"id": "wm", "label": "With watermark", "ext": "mp4", "kind": "video+audio", "muxed": True, "url": d["wmplay"]})
-        if d.get("music"):
-            formats.append({"id": "music", "label": "Audio", "ext": "mp3", "kind": "audio", "url": d["music"]})
-        if not formats:
-            return {"ok": False, "error": "tikwm: no media urls"}
-        best = formats[0]
+    formats = []
+    meta: Dict[str, Any] = {}
+    errors = []
+
+    # resolve short links
+    resolved = url
+    try:
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=headers) as client:
+            r = await client.head(url)
+            resolved = str(r.url)
+    except Exception:
+        try:
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=headers) as client:
+                r = await client.get(url)
+                resolved = str(r.url)
+        except Exception:
+            pass
+
+    # 1) TikWM
+    for api_url, params in [
+        ("https://www.tikwm.com/api/", {"url": resolved, "hd": 1}),
+        ("https://tikwm.com/api/", {"url": resolved, "hd": 1}),
+        ("https://www.tikwm.com/api/", {"url": url, "hd": 1}),
+    ]:
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                r = await client.get(
+                    api_url,
+                    params=params,
+                    headers={**headers, "Referer": "https://www.tikwm.com/"},
+                )
+                if r.status_code != 200:
+                    continue
+                j = r.json()
+                if j.get("code") != 0:
+                    errors.append(j.get("msg") or "tikwm")
+                    continue
+                d = j.get("data") or {}
+                meta = {
+                    "title": d.get("title"),
+                    "author": (d.get("author") or {}).get("nickname") if isinstance(d.get("author"), dict) else d.get("author"),
+                    "thumbnail": d.get("cover") or d.get("origin_cover"),
+                    "duration": d.get("duration"),
+                }
+                if d.get("hdplay"):
+                    formats.append({"id": "hd", "label": "HD · no watermark", "ext": "mp4", "kind": "video+audio", "muxed": True, "url": d["hdplay"]})
+                if d.get("play"):
+                    formats.append({"id": "play", "label": "Standard · no watermark", "ext": "mp4", "kind": "video+audio", "muxed": True, "url": d["play"]})
+                if d.get("wmplay"):
+                    formats.append({"id": "wm", "label": "With watermark", "ext": "mp4", "kind": "video+audio", "muxed": True, "url": d["wmplay"]})
+                if d.get("music"):
+                    formats.append({"id": "music", "label": "Audio", "ext": "mp3", "kind": "audio", "muxed": False, "url": d["music"]})
+                if formats:
+                    break
+        except Exception as e:
+            errors.append(f"tikwm:{type(e).__name__}")
+
+    # 2) tiktok oembed + third party mirror
+    if not formats:
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=headers) as client:
+                r = await client.get("https://www.tiktok.com/oembed", params={"url": resolved})
+                if r.status_code == 200:
+                    oj = r.json()
+                    meta.setdefault("title", oj.get("title"))
+                    meta.setdefault("author", oj.get("author_name"))
+                    meta.setdefault("thumbnail", oj.get("thumbnail_url"))
+        except Exception:
+            pass
+        # try public downloader API mirrors
+        for mirror in [
+            f"https://api.tikmate.app/api/lookup?url={resolved}",
+            f"https://api.tikdown.org/api/?url={resolved}",
+        ]:
+            try:
+                async with httpx.AsyncClient(timeout=12.0, verify=False) as client:
+                    r = await client.get(mirror, headers=headers)
+                    if r.status_code != 200:
+                        continue
+                    j = r.json()
+                    for key in ("nwm_video_url", "video", "download", "play", "url", "hdplay"):
+                        val = j.get(key) or (j.get("data") or {}).get(key)
+                        if isinstance(val, str) and val.startswith("http"):
+                            formats.append({"id": key, "label": key, "ext": "mp4", "kind": "video+audio", "muxed": True, "url": val})
+                    if formats:
+                        break
+            except Exception as e:
+                errors.append(str(e)[:40])
+
+    if formats:
+        best = formats[0]["url"]
         return {
             "ok": True,
-            "title": d.get("title") or "TikTok",
-            "id": str(d.get("id") or ""),
-            "extractor": "tikwm",
-            "duration": d.get("duration"),
-            "thumbnail": d.get("cover") or d.get("origin_cover"),
-            "webpage_url": url,
+            "provider": "tiktok",
+            "title": meta.get("title"),
+            "thumbnail": meta.get("thumbnail"),
+            "duration": meta.get("duration"),
             "formats": formats,
-            "format_count": len(formats),
-            "best": best,
-            "best_muxed": best,
-            "best_audio": next((f for f in formats if f["kind"] == "audio"), None),
-            "download_url": best["url"],
-            "note": "Direct TikTok CDN via tikwm",
+            "url": best,
+            "directUrl": best,
+            "download_url": best,
+            "webpage_url": resolved,
+            "extractor": "tikwm-multi",
         }
+    return {"ok": False, "error": "; ".join(errors) or "tiktok extract failed", "extractor": "tikwm-multi"}
+
 
 
 async def _piped_yt_streams(video_id: str) -> dict:
@@ -5874,6 +2455,67 @@ def _ytdlp_has_cdn(formats: list) -> bool:
     return False
 
 
+
+def _resolve_ytdlp_cookies() -> Optional[str]:
+    """Return path to a Netscape cookies.txt usable by yt-dlp, or None.
+
+    Search order:
+      1. env YTDLP_COOKIES / YTDLP_COOKIES_FILE (file path)
+      2. env YTDLP_COOKIES_B64 (base64 of cookies.txt contents) → temp file
+      3. ./cookies.txt (cwd)
+      4. next to this api.py
+      5. /app/cookies.txt / /var/task/cookies.txt (Vercel/serverless common)
+    """
+    import tempfile
+    candidates = []
+    for key in ("YTDLP_COOKIES", "YTDLP_COOKIES_FILE"):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            candidates.append(v)
+    # relative + absolute common locations
+    here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd()
+    candidates.extend([
+        os.path.join(os.getcwd(), "cookies.txt"),
+        os.path.join(here, "cookies.txt"),
+        "/app/cookies.txt",
+        "/var/task/cookies.txt",
+        "/home/workdir/artifacts/cookies.txt",
+    ])
+    for path in candidates:
+        try:
+            if path and os.path.isfile(path) and os.path.getsize(path) > 50:
+                # skip pure template (no real session cookies)
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    body = f.read()
+                if "# TEMPLATE" in body or "REPLACE_ME" in body:
+                    continue
+                real = 0
+                for line in body.splitlines():
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    parts = s.split("	")
+                    if len(parts) >= 7 and "youtube" in parts[0].lower():
+                        if parts[5] in ("LOGIN_INFO", "SID", "__Secure-1PSID", "__Secure-3PSID", "SAPISID", "APISID", "HSID", "SSID"):
+                            real += 1
+                if real >= 1:
+                    return path
+        except Exception:
+            continue
+    b64 = (os.environ.get("YTDLP_COOKIES_B64") or "").strip()
+    if b64:
+        try:
+            raw = base64.b64decode(b64)
+            if len(raw) > 50:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", prefix="ytcookies_")
+                tmp.write(raw)
+                tmp.close()
+                return tmp.name
+        except Exception:
+            pass
+    return None
+
+
 def _ytdlp_info(url: str) -> dict:
     """Extract media + direct CDN URLs. YouTube: android_creator / mediaconnect first."""
     try:
@@ -5899,21 +2541,11 @@ def _ytdlp_info(url: str) -> dict:
         "retries": 2,
         "fragment_retries": 3,
     }
-    # Optional cookies for Vercel / datacenter IPs (export from browser)
-    cookie_file = os.environ.get("YTDLP_COOKIES") or os.environ.get("YTDLP_COOKIES_FILE")
-    if cookie_file and os.path.isfile(cookie_file):
+    # Cookies (bot-check bypass on Vercel/datacenter IPs)
+    # Priority: YTDLP_COOKIES path → YTDLP_COOKIES_FILE → YTDLP_COOKIES_B64 → ./cookies.txt → /app/cookies.txt
+    cookie_file = _resolve_ytdlp_cookies()
+    if cookie_file:
         base_opts["cookiefile"] = cookie_file
-    cookie_b64 = os.environ.get("YTDLP_COOKIES_B64")
-    if cookie_b64 and "cookiefile" not in base_opts:
-        try:
-            import tempfile
-            raw = base64.b64decode(cookie_b64)
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-            tmp.write(raw)
-            tmp.close()
-            base_opts["cookiefile"] = tmp.name
-        except Exception:
-            pass
 
     info = None
     last_err = None
@@ -6662,6 +3294,28 @@ async def dl_snapany(url: str = Query(..., min_length=8)):
 # Platform downloaders (PaxSenix-complete set) — all unlimited via yt-dlp / native
 # =============================================================================
 
+
+async def _paxsenix_proxy(path: str, params: dict) -> Optional[dict]:
+    """Optional fallback if PAXSENIX_KEY env is set — native extractors always tried first."""
+    key = (os.environ.get("PAXSENIX_KEY") or "").strip()
+    if not key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.get(
+                f"https://api.paxsenix.org{path}",
+                params=params,
+                headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+            )
+            if r.status_code == 200:
+                j = r.json()
+                if j.get("ok") or j.get("status") == "done":
+                    return j
+    except Exception:
+        pass
+    return None
+
+
 async def _dl_platform(url: str, provider: str, prefer: str = "auto") -> dict:
     """Shared extractor — prefer audio/video, return PaxSenix-like shape."""
     url = (url or "").strip()
@@ -7229,8 +3883,13 @@ async def dl_merged(
 
 INVIDIOUS_HOSTS = [
     "https://inv.nadeko.net",
-    "https://invidious.nerdvpn.de",
     "https://yewtu.be",
+    "https://invidious.nerdvpn.de",
+    "https://invidious.privacyredirect.com",
+    "https://inv.tux.pizza",
+    "https://invidious.flokinet.to",
+    "https://iv.ggtyler.dev",
+    "https://invidious.protokolos.eu",
     "https://invidious.fdn.fr",
     "https://vid.puffyan.us",
 ]
@@ -7270,6 +3929,309 @@ def _yt_thumb(video_id: str, thumbs: Any = None) -> str:
 # YouTube Music + YouTube (PaxSenix-style paths, native)
 # =============================================================================
 
+
+# =============================================================================
+# YouTube Music helpers (SimpMusic-style InnerTube WEB_REMIX / ANDROID_MUSIC)
+# Cookie optional via YT_MUSIC_COOKIE or cookies.txt (music.youtube.com)
+# =============================================================================
+
+YTM_API = "https://music.youtube.com/youtubei/v1"
+YTM_KEY = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30"  # WEB_REMIX
+YTM_CLIENT = {
+    "clientName": "WEB_REMIX",
+    "clientVersion": "1.20250317.01.00",
+    "hl": "en",
+    "gl": "US",
+}
+YTM_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _ytm_load_cookie() -> Optional[str]:
+    """Load optional YouTube Music cookies (env YT_MUSIC_COOKIE / YTDLP_COOKIES / cookies.txt)."""
+    import os
+    for env in ("YT_MUSIC_COOKIE", "YOUTUBE_COOKIE", "YTDLP_COOKIES"):
+        v = os.environ.get(env)
+        if v and len(v) > 20:
+            # if path to file
+            if os.path.isfile(v):
+                try:
+                    return open(v, "r", encoding="utf-8", errors="ignore").read().strip()
+                except Exception:
+                    pass
+            return v.strip()
+    for path in ("cookies.txt", "/home/workdir/artifacts/cookies.txt", "/app/cookies.txt"):
+        try:
+            if os.path.isfile(path):
+                raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+                # Netscape cookie file → Cookie header for music.youtube.com
+                parts = []
+                for line in raw.splitlines():
+                    if not line or line.startswith("#"):
+                        continue
+                    cols = line.split("\t")
+                    if len(cols) >= 7 and ("youtube" in cols[0] or "google" in cols[0]):
+                        parts.append(f"{cols[5]}={cols[6]}")
+                if parts:
+                    return "; ".join(parts)
+                if "SAPISID=" in raw or "SID=" in raw:
+                    return raw.strip()
+        except Exception:
+            continue
+    return None
+
+
+def _ytm_headers() -> dict:
+    h = {
+        "User-Agent": YTM_UA,
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Origin": "https://music.youtube.com",
+        "Referer": "https://music.youtube.com/",
+        "X-YouTube-Client-Name": "67",
+        "X-YouTube-Client-Version": YTM_CLIENT["clientVersion"],
+    }
+    cookie = _ytm_load_cookie()
+    if cookie:
+        # Netscape multi-line → already joined; plain cookie string OK
+        if "\t" in cookie and "\n" in cookie:
+            parts = []
+            for line in cookie.splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                cols = line.split("\t")
+                if len(cols) >= 7:
+                    parts.append(f"{cols[5]}={cols[6]}")
+            if parts:
+                h["Cookie"] = "; ".join(parts)
+        else:
+            h["Cookie"] = cookie
+    return h
+
+
+async def _ytm_post(endpoint: str, payload: Optional[dict] = None) -> dict:
+    """POST to music.youtube.com/youtubei/v1/{endpoint}."""
+    body = {
+        "context": {
+            "client": dict(YTM_CLIENT),
+            "user": {},
+            "request": {"useSsl": True},
+        }
+    }
+    if payload:
+        body.update(payload)
+    url = f"{YTM_API}/{endpoint.lstrip('/')}?prettyPrint=false&alt=json&key={YTM_KEY}"
+    headers = _ytm_headers()
+    async with httpx.AsyncClient(timeout=28.0, follow_redirects=True) as client:
+        r = await client.post(url, json=body, headers=headers)
+        if r.status_code >= 400:
+            # fallback without key
+            url2 = f"{YTM_API}/{endpoint.lstrip('/')}?prettyPrint=false"
+            r = await client.post(url2, json=body, headers=headers)
+        if r.status_code >= 400:
+            raise HTTPException(502, f"YT Music {endpoint} HTTP {r.status_code}: {r.text[:120]}")
+        try:
+            return r.json()
+        except Exception:
+            raise HTTPException(502, f"YT Music {endpoint} non-JSON")
+
+
+def _ytm_walk(node: Any, key: str, out: list) -> None:
+    """Recursively collect renderers named `key`."""
+    if isinstance(node, dict):
+        if key in node:
+            out.append(node[key])
+        for v in node.values():
+            _ytm_walk(v, key, out)
+    elif isinstance(node, list):
+        for v in node:
+            _ytm_walk(v, key, out)
+
+
+def _ytm_text(runs_or_text) -> str:
+    if runs_or_text is None:
+        return ""
+    if isinstance(runs_or_text, str):
+        return runs_or_text
+    if isinstance(runs_or_text, dict):
+        if "simpleText" in runs_or_text:
+            return str(runs_or_text.get("simpleText") or "")
+        runs = runs_or_text.get("runs") or []
+        return "".join(str(r.get("text") or "") for r in runs if isinstance(r, dict))
+    return str(runs_or_text)
+
+
+def _ytm_parse_item(it: dict) -> Optional[dict]:
+    """Parse musicResponsiveListItemRenderer / musicTwoRowItemRenderer into song card."""
+    if not isinstance(it, dict):
+        return None
+    video_id = None
+    # flexColumns / playlistItemData / navigationEndpoint
+    pid = it.get("playlistItemData") or {}
+    video_id = pid.get("videoId")
+    if not video_id:
+        for nav in (
+            ((it.get("overlay") or {}).get("musicItemThumbnailOverlayRenderer") or {})
+            .get("content")
+            or {}
+        ).values() if False else []:
+            pass
+        # deep search videoId
+        found = []
+        def find_vid(n):
+            if isinstance(n, dict):
+                if "videoId" in n and isinstance(n["videoId"], str) and len(n["videoId"]) >= 6:
+                    found.append(n["videoId"])
+                for v in n.values():
+                    find_vid(v)
+            elif isinstance(n, list):
+                for v in n:
+                    find_vid(v)
+        find_vid(it)
+        video_id = found[0] if found else None
+    if not video_id:
+        return None
+
+    title = ""
+    artist = ""
+    # responsive list item columns
+    flex = it.get("flexColumns") or []
+    texts = []
+    for col in flex:
+        r = (col.get("musicResponsiveListItemFlexColumnRenderer") or {}).get("text") or {}
+        texts.append(_ytm_text(r))
+    if texts:
+        title = texts[0]
+        artist = texts[1] if len(texts) > 1 else ""
+    if not title:
+        title = _ytm_text(it.get("title") or it.get("flexColumnDisplayText"))
+    # two-row
+    if not title:
+        title = _ytm_text((it.get("title") or {}))
+    if not artist:
+        artist = _ytm_text(it.get("subtitle") or {})
+
+    thumb = None
+    thumbs = (
+        ((it.get("thumbnail") or {}).get("musicThumbnailRenderer") or {})
+        .get("thumbnail")
+        or {}
+    ).get("thumbnails") or []
+    if not thumbs:
+        thumbs = (it.get("thumbnailRenderer") or {}).get("musicThumbnailRenderer", {}).get("thumbnail", {}).get("thumbnails") or []
+    if thumbs:
+        thumb = thumbs[-1].get("url")
+    if not thumb:
+        thumb = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+    return {
+        "video_id": video_id,
+        "title": title or video_id,
+        "artist": artist,
+        "thumb": thumb,
+        "thumbnail": thumb,
+        "play_url": f"/yt-music/play/{video_id}",
+        "watch_url": f"https://music.youtube.com/watch?v={video_id}",
+        "provider": "ytmusic",
+    }
+
+
+async def _ytm_search_songs(q: str, limit: int = 20) -> List[dict]:
+    data = await _ytm_post("search", {"query": q})
+    items: list = []
+    _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+    _ytm_walk(data, "musicTwoRowItemRenderer", items)
+    songs, seen = [], set()
+    for it in items:
+        e = _ytm_parse_item(it)
+        if e and e["video_id"] not in seen:
+            seen.add(e["video_id"])
+            songs.append(e)
+        if len(songs) >= limit:
+            break
+    return songs
+
+
+async def _ytm_next_songs(video_id: str, limit: int = 20) -> List[dict]:
+    """Radio / next tracks for a video id (RDAMVM mix like SimpMusic)."""
+    data = await _ytm_post(
+        "next",
+        {
+            "videoId": video_id,
+            "playlistId": f"RDAMVM{video_id}",
+            "isAudioOnly": True,
+            "enablePersistentPlaylistPanel": True,
+            "params": "wAEB",
+        },
+    )
+    items: list = []
+    _ytm_walk(data, "playlistPanelVideoRenderer", items)
+    _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+    songs, seen = [], set()
+    for it in items:
+        # playlistPanelVideoRenderer shape
+        if isinstance(it, dict) and it.get("videoId"):
+            vid = it.get("videoId")
+            if vid in seen:
+                continue
+            seen.add(vid)
+            title = _ytm_text(it.get("title"))
+            artist = _ytm_text(it.get("shortBylineText") or it.get("longBylineText"))
+            thumb = None
+            ths = (it.get("thumbnail") or {}).get("thumbnails") or []
+            if ths:
+                thumb = ths[-1].get("url")
+            songs.append({
+                "video_id": vid,
+                "title": title or vid,
+                "artist": artist,
+                "thumb": thumb or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+                "thumbnail": thumb or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+                "play_url": f"/yt-music/play/{vid}",
+                "watch_url": f"https://music.youtube.com/watch?v={vid}",
+                "provider": "ytmusic",
+            })
+        else:
+            e = _ytm_parse_item(it)
+            if e and e["video_id"] not in seen:
+                seen.add(e["video_id"])
+                songs.append(e)
+        if len(songs) >= limit:
+            break
+    return songs
+
+
+async def _ytm_home_sections() -> List[dict]:
+    """Browse music home / charts via search seeds + explore."""
+    sections = []
+    # try browse home
+    try:
+        data = await _ytm_post("browse", {"browseId": "FEmusic_home"})
+        items = []
+        _ytm_walk(data, "musicResponsiveListItemRenderer", items)
+        songs, seen = [], set()
+        for it in items:
+            e = _ytm_parse_item(it)
+            if e and e["video_id"] not in seen:
+                seen.add(e["video_id"])
+                songs.append(e)
+        if songs:
+            sections.append({"title": "Home", "items": songs[:16]})
+    except Exception:
+        pass
+    seeds = ["Top songs this week", "Trending music", "New music", "Pop hits", "Hip hop songs"]
+    for q in seeds:
+        try:
+            songs = await _ytm_search_songs(q, limit=12)
+            if songs:
+                sections.append({"title": q, "items": songs})
+        except Exception:
+            continue
+    return sections
+
+
 @app.get("/yt-music/search", tags=["YouTube Music"])
 async def ytmusic_search(q: str = Query(..., min_length=1), filter: str = Query("songs", description="songs|videos|albums|artists|playlists")):
     """YouTube Music search (inner API)."""
@@ -7288,25 +4250,19 @@ async def ytmusic_search(q: str = Query(..., min_length=1), filter: str = Query(
 
 @app.get("/yt-music/home", tags=["YouTube Music"])
 async def ytmusic_home():
-    """YT Music home / explore rows (via search seeds)."""
-    seeds = ["Top songs", "Trending music", "New releases", "Pop hits", "Hip hop"]
-    sections = []
-    for q in seeds:
-        try:
-            data = await _ytm_post("search", {"query": q})
-            items = []
-            _ytm_walk(data, "musicResponsiveListItemRenderer", items)
-            songs, seen = [], set()
-            for it in items:
-                e = _ytm_parse_item(it)
-                if e and e["video_id"] not in seen:
-                    seen.add(e["video_id"])
-                    songs.append(e)
-            if songs:
-                sections.append({"title": q, "items": songs[:12]})
-        except Exception:
-            continue
-    return {"ok": True, "sections": sections, "provider": "ytmusic"}
+    """YT Music home / charts (browse + search seeds)."""
+    try:
+        sections = await _ytm_home_sections()
+    except Exception as e:
+        sections = []
+        return {"ok": False, "error": str(e)[:120], "sections": [], "provider": "ytmusic"}
+    return {
+        "ok": bool(sections),
+        "sections": sections,
+        "count": sum(len(s.get("items") or []) for s in sections),
+        "provider": "ytmusic",
+        "cookie": bool(_ytm_load_cookie()),
+    }
 
 
 @app.get("/yt-music/info", tags=["YouTube Music"])
@@ -7343,14 +4299,17 @@ async def ytmusic_info(video_id: str = Query(..., min_length=6)):
 
 
 @app.get("/yt-music/next", tags=["YouTube Music"])
-async def ytmusic_next(video_id: str = Query(..., min_length=6)):
-    """Next / radio queue for a track."""
-    info = await ytmusic_info(video_id=video_id)
+async def ytmusic_next(
+    video_id: str = Query(..., min_length=6),
+    limit: int = Query(20, ge=1, le=50),
+):
+    """Next / radio queue for a track (InnerTube next)."""
+    songs = await _ytm_next_songs(video_id, limit=limit)
     return {
-        "ok": True,
+        "ok": bool(songs),
         "video_id": video_id,
-        "items": info.get("related") or [],
-        "count": len(info.get("related") or []),
+        "items": songs,
+        "count": len(songs),
         "provider": "ytmusic",
     }
 
@@ -7519,6 +4478,24 @@ async def yt_ytaudio(url: str = Query(..., description="YouTube URL or video id"
     return await dl_ytmp3(url=url)
 
 
+
+@app.get("/yt/savetube", tags=["YouTube"])
+async def yt_savetube(
+    url: str = Query(..., min_length=8),
+    quality: str = Query("720", description="144|240|360|480|720|1080|mp3"),
+):
+    """YouTube download (native, unlimited) — PaxSenix /yt/savetube compatible shape."""
+    q = (quality or "720").lower().strip()
+    if q == "mp3":
+        res = await _dl_platform(url, "ytmp3", prefer="audio")
+        res["format"] = "mp3"
+    else:
+        res = await _dl_platform(url, "ytmp4", prefer="video")
+        res["requested_quality"] = q
+    res["provider"] = "savetube-native"
+    return res
+
+
 @app.get("/yt/download", tags=["YouTube"])
 async def yt_download(
     url: str = Query(..., min_length=6),
@@ -7540,207 +4517,474 @@ async def ytmusic_play(video_id: str):
 
 @app.get("/music/yt/search", tags=["Music"])
 async def music_yt_search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
-    """YouTube / YT Music search via Invidious (videos)."""
-    data = await _invidious_get("/api/v1/search", {"q": q, "type": "video", "page": page})
-    if not isinstance(data, list):
-        data = []
+    """YouTube / YT Music search — Invidious when up, else YT Music inner API."""
     items = []
-    for it in data:
-        if not isinstance(it, dict) or it.get("type") not in (None, "video"):
-            if it.get("type") and it.get("type") != "video":
-                continue
-        vid = it.get("videoId")
-        if not vid:
-            continue
-        items.append({
-            "id": f"yt:{vid}",
-            "video_id": vid,
-            "title": it.get("title"),
-            "artist": it.get("author") or it.get("authorId"),
-            "thumb": _yt_thumb(vid, it.get("videoThumbnails")),
-            "duration": it.get("lengthSeconds"),
-            "views": it.get("viewCount"),
-            "provider": "youtube",
-        })
-    return {"query": q, "items": items, "provider": "invidious", "page": page}
-
-
-@app.get("/music/yt/trending", tags=["Music"])
-async def music_yt_trending(region: str = Query("US")):
-    """Trending videos (music-friendly) via Invidious."""
-    data = await _invidious_get("/api/v1/trending", {"type": "music", "region": region})
-    if not isinstance(data, list):
-        # fallback general trending
+    provider = None
+    # 1) Invidious
+    try:
+        data = await _invidious_get("/api/v1/search", {"q": q, "type": "video", "page": page})
+        if isinstance(data, list):
+            for it in data:
+                if not isinstance(it, dict):
+                    continue
+                if it.get("type") and it.get("type") != "video":
+                    continue
+                vid = it.get("videoId")
+                if not vid:
+                    continue
+                items.append({
+                    "id": f"yt:{vid}",
+                    "video_id": vid,
+                    "title": it.get("title"),
+                    "artist": it.get("author") or it.get("authorId"),
+                    "thumb": _yt_thumb(vid, it.get("videoThumbnails")),
+                    "duration": it.get("lengthSeconds"),
+                    "views": it.get("viewCount"),
+                    "provider": "youtube",
+                })
+            if items:
+                provider = "invidious"
+    except Exception:
+        pass
+    # 2) YT Music
+    if not items:
         try:
-            data = await _invidious_get("/api/v1/trending", {"region": region})
+            data = await _ytm_post("search", {"query": q})
+            raw = []
+            _ytm_walk(data, "musicResponsiveListItemRenderer", raw)
+            seen = set()
+            for it in raw:
+                e = _ytm_parse_item(it)
+                if e and e.get("video_id") and e["video_id"] not in seen:
+                    seen.add(e["video_id"])
+                    items.append({
+                        "id": f"yt:{e['video_id']}",
+                        "video_id": e["video_id"],
+                        "title": e.get("title"),
+                        "artist": e.get("artist"),
+                        "thumb": e.get("thumb"),
+                        "duration": e.get("duration"),
+                        "provider": "ytmusic",
+                    })
+            provider = "ytmusic"
         except Exception:
-            data = []
-    if not isinstance(data, list):
-        data = []
-    items = []
-    for it in data[:40]:
-        if not isinstance(it, dict):
-            continue
-        vid = it.get("videoId")
-        if not vid:
-            continue
-        items.append({
-            "id": f"yt:{vid}",
-            "video_id": vid,
-            "title": it.get("title"),
-            "artist": it.get("author"),
-            "thumb": _yt_thumb(vid, it.get("videoThumbnails")),
-            "duration": it.get("lengthSeconds"),
-            "provider": "youtube",
-        })
-    return {"items": items, "provider": "invidious", "region": region}
+            pass
+    return {"ok": True, "query": q, "count": len(items), "items": items, "provider": provider or "none"}
 
 
-@app.get("/music/yt/play/{video_id}", tags=["Music"])
+
+@app.get("/music/yt/trending", tags=["YouTube Music"])
+@app.get("/yt-music/trending", tags=["YouTube Music"])
+async def music_yt_trending(limit: int = Query(20, ge=1, le=40)):
+    """Trending / charts songs from YT Music."""
+    songs = await _ytm_search_songs("Top songs this week", limit=limit)
+    if not songs:
+        songs = await _ytm_search_songs("Trending music", limit=limit)
+    return {
+        "ok": bool(songs),
+        "count": len(songs),
+        "items": songs,
+        "provider": "ytmusic",
+    }
+
+
+async def _loader_to_youtube(url_or_id: str, fmt: str = "mp3") -> dict:
+    """Public loader.to → savenow.to CDN (works when InnerTube blocked on datacenter IPs)."""
+    vid = _extract_youtube_id(url_or_id) or (url_or_id if re.match(r"^[\w-]{6,20}$", (url_or_id or "").strip()) else None)
+    if not vid:
+        return {"ok": False, "error": "invalid youtube"}
+    watch = f"https://www.youtube.com/watch?v={vid}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": "https://loader.to/",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+            r = await client.get(
+                "https://loader.to/ajax/download.php",
+                params={"format": fmt, "url": watch},
+                headers=headers,
+            )
+            if r.status_code != 200:
+                return {"ok": False, "error": f"loader start HTTP {r.status_code}"}
+            j = r.json()
+            prog = j.get("progress_url")
+            title = (j.get("info") or {}).get("title") or j.get("title")
+            thumb = (j.get("info") or {}).get("image") or j.get("thumbnail_url")
+            if not prog:
+                return {"ok": False, "error": "no progress_url", "raw": str(j)[:200]}
+            download_url = None
+            for _ in range(12):
+                await asyncio.sleep(1.2)
+                r2 = await client.get(prog, headers=headers)
+                if r2.status_code != 200:
+                    continue
+                j2 = r2.json()
+                download_url = j2.get("download_url") or j2.get("url")
+                if download_url:
+                    break
+                # progress 1000 = done on some mirrors
+                if int(j2.get("progress") or 0) >= 1000 and j2.get("text"):
+                    # sometimes URL in text
+                    m = re.search(r"https://[^\s\"']+", str(j2.get("text")))
+                    if m:
+                        download_url = m.group(0)
+                        break
+            if not download_url:
+                return {"ok": False, "error": "loader timeout", "title": title}
+            return {
+                "ok": True,
+                "video_id": vid,
+                "title": title,
+                "thumb": thumb or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+                "url": download_url,
+                "directUrl": download_url,
+                "audio_url": download_url if fmt in ("mp3", "m4a", "audio") else None,
+                "provider": "loader.to/savenow",
+                "format": fmt,
+            }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}:{e}"}
+
+
+async def _innertube_player(video_id: str) -> dict:
+    """Native YouTube InnerTube player (ANDROID/IOS) — direct googlevideo CDN, no yt-dlp.
+
+    Returns {ok, title, thumb, duration, audio_streams, video_streams, formats, provider}
+    """
+    video_id = (video_id or "").strip()
+    if not re.match(r"^[\w-]{6,20}$", video_id):
+        return {"ok": False, "error": "invalid video id"}
+
+    clients = [
+        {
+            "name": "ANDROID",
+            "clientName": "ANDROID",
+            "clientVersion": "20.10.38",
+            "api_key": "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
+            "ua": "com.google.android.youtube/20.10.38 (Linux; U; Android 14)",
+            "client_name_hdr": "3",
+        },
+        {
+            "name": "ANDROID_MUSIC",
+            "clientName": "ANDROID_MUSIC",
+            "clientVersion": "7.27.52",
+            "api_key": "AIzaSyAOghZGza2MQSZkY_zfZ370N-PUd0UOSpe",
+            "ua": "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 14) gzip",
+            "client_name_hdr": "21",
+        },
+        {
+            "name": "IOS",
+            "clientName": "IOS",
+            "clientVersion": "20.10.4",
+            "api_key": "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc",
+            "ua": "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 17_5 like Mac OS X)",
+            "client_name_hdr": "5",
+        },
+        {
+            "name": "TVHTML5",
+            "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            "clientVersion": "2.0",
+            "api_key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+            "ua": "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+            "client_name_hdr": "85",
+        },
+    ]
+
+    last_err = None
+    async with httpx.AsyncClient(timeout=28.0, follow_redirects=True) as client:
+        for c in clients:
+            body = {
+                "context": {
+                    "client": {
+                        "clientName": c["clientName"],
+                        "clientVersion": c["clientVersion"],
+                        "hl": "en",
+                        "gl": "US",
+                        "androidSdkVersion": 34,
+                    }
+                },
+                "videoId": video_id,
+                "contentCheckOk": True,
+                "racyCheckOk": True,
+            }
+            url = f"https://www.youtube.com/youtubei/v1/player?key={c['api_key']}"
+            headers = {
+                "Content-Type": "application/json",
+                "User-Agent": c["ua"],
+                "X-YouTube-Client-Name": c["client_name_hdr"],
+                "X-YouTube-Client-Version": c["clientVersion"],
+                "Origin": "https://www.youtube.com",
+                "Referer": f"https://www.youtube.com/watch?v={video_id}",
+            }
+            try:
+                r = await client.post(url, json=body, headers=headers)
+                if r.status_code != 200:
+                    last_err = f"{c['name']} HTTP {r.status_code}"
+                    continue
+                j = r.json()
+                status = ((j.get("playabilityStatus") or {}).get("status") or "").upper()
+                if status not in ("OK", "LIVE_STREAM"):
+                    last_err = f"{c['name']} playability={status}"
+                    continue
+                sd = j.get("streamingData") or {}
+                raw = list(sd.get("formats") or []) + list(sd.get("adaptiveFormats") or [])
+                if not raw:
+                    last_err = f"{c['name']} no formats"
+                    continue
+                details = j.get("videoDetails") or {}
+                title = details.get("title")
+                thumb = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+                try:
+                    thumbs = (details.get("thumbnail") or {}).get("thumbnails") or []
+                    if thumbs:
+                        thumb = thumbs[-1].get("url") or thumb
+                except Exception:
+                    pass
+                duration = None
+                try:
+                    duration = int(details.get("lengthSeconds") or 0) or None
+                except Exception:
+                    pass
+
+                audio_streams = []
+                video_streams = []
+                formats = []
+                for f in raw:
+                    u = f.get("url")
+                    if not u:
+                        # signatureCipher needs decipher — skip for pure-URL clients
+                        continue
+                    mime = (f.get("mimeType") or "").split(";")[0].strip()
+                    itag = f.get("itag")
+                    br = f.get("bitrate") or f.get("averageBitrate")
+                    entry = {
+                        "itag": itag,
+                        "label": f.get("qualityLabel") or (f"{br}bps" if br else str(itag)),
+                        "url": u,
+                        "mime": mime,
+                        "bitrate": br,
+                        "height": f.get("height"),
+                        "width": f.get("width"),
+                        "fps": f.get("fps"),
+                        "contentLength": f.get("contentLength"),
+                    }
+                    formats.append(entry)
+                    if mime.startswith("audio/"):
+                        audio_streams.append({
+                            **entry,
+                            "format": "AUDIO",
+                            "type": mime,
+                        })
+                    elif mime.startswith("video/") or "video" in mime:
+                        # progressive (audio+video) vs adaptive
+                        codecs = (f.get("mimeType") or "")
+                        has_audio = "mp4a" in codecs or "opus" in codecs or "vorbis" in codecs
+                        video_streams.append({
+                            **entry,
+                            "format": "MP4" if has_audio and f.get("height") else "VIDEO",
+                            "type": mime,
+                            "progressive": bool(has_audio and f.get("height")),
+                        })
+
+                if not audio_streams and not video_streams:
+                    last_err = f"{c['name']} urls empty (cipher only)"
+                    continue
+
+                audio_streams.sort(key=lambda x: int(x.get("bitrate") or 0), reverse=True)
+                video_streams.sort(key=lambda x: int(x.get("height") or 0), reverse=True)
+                return {
+                    "ok": True,
+                    "video_id": video_id,
+                    "title": title,
+                    "thumb": thumb,
+                    "thumbnail": thumb,
+                    "duration": duration,
+                    "audio_streams": audio_streams,
+                    "video_streams": video_streams,
+                    "formats": formats,
+                    "provider": f"innertube/{c['name'].lower()}",
+                    "audio_url": audio_streams[0]["url"] if audio_streams else None,
+                    "video_url": next((v["url"] for v in video_streams if v.get("progressive")), None)
+                    or (video_streams[0]["url"] if video_streams else None),
+                }
+            except Exception as e:
+                last_err = f"{c['name']}:{type(e).__name__}:{e}"
+                continue
+    return {"ok": False, "error": last_err or "innertube failed", "video_id": video_id}
+
+
+@app.get("/yt-music/play/{video_id}", tags=["YouTube Music"])
+@app.get("/music/yt/play/{video_id}", tags=["YouTube Music"])
+@app.get("/yt/play/{video_id}", tags=["YouTube"])
 async def music_yt_play(video_id: str):
-    """Stream info for a YouTube video — prefer audio formats (SimpMusic-style)."""
-    video_id = video_id.replace("yt:", "").strip()
+    """Stream info for YouTube / YT Music — InnerTube CDN first (no yt-dlp)."""
+    video_id = (video_id or "").replace("yt:", "").strip()
     if not re.match(r"^[\w-]{6,20}$", video_id):
         raise HTTPException(400, "invalid video id")
-    data = await _invidious_get(f"/api/v1/videos/{video_id}")
-    adaptive = data.get("adaptiveFormats") or []
-    formats = data.get("formatStreams") or []
-    audio_streams = []
-    video_streams = []
-    for f in adaptive:
-        if not isinstance(f, dict) or not f.get("url"):
-            continue
-        t = (f.get("type") or "").lower()
-        if t.startswith("audio/") or "audio" in t:
-            audio_streams.append({
-                "label": f.get("bitrate") or f.get("quality") or "audio",
-                "bitrate": f.get("bitrate"),
-                "url": f.get("url"),
-                "type": f.get("type"),
-                "format": "AUDIO",
-            })
-        elif t.startswith("video/"):
-            video_streams.append({
-                "label": f.get("qualityLabel") or f.get("quality") or "video",
-                "url": f.get("url"),
-                "type": f.get("type"),
-                "format": "VIDEO",
-            })
-    for f in formats:
-        if not isinstance(f, dict) or not f.get("url"):
-            continue
-        video_streams.append({
-            "label": f.get("qualityLabel") or f.get("quality") or "mp4",
-            "url": f.get("url"),
-            "type": f.get("type"),
-            "format": "MP4",
-        })
-    # sort audio by bitrate desc
-    def _br(x):
-        try:
-            return int(re.sub(r"\D", "", str(x.get("bitrate") or "0")) or 0)
-        except Exception:
-            return 0
-    audio_streams.sort(key=_br, reverse=True)
-    best_audio = audio_streams[0]["url"] if audio_streams else None
-    # embed fallback
-    sources = []
-    if best_audio:
-        sources.append({"type": "audio", "provider": "invidious", "label": "Best audio", "url": best_audio, "play_url": best_audio, "format": "AUDIO"})
-    for a in audio_streams[:5]:
-        sources.append({"type": "audio", "provider": "invidious", "label": str(a.get("label")), "url": a["url"], "play_url": a["url"], "format": "AUDIO"})
-    sources.append({
-        "type": "embed",
-        "provider": "youtube",
-        "label": "YouTube embed",
-        "url": f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0",
-        "play_url": f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0",
-        "format": "EMBED",
-    })
-    return {
-        "video_id": video_id,
-        "title": data.get("title"),
-        "artist": data.get("author"),
-        "thumb": _yt_thumb(video_id, data.get("videoThumbnails")),
-        "duration": data.get("lengthSeconds"),
-        "description": (data.get("description") or "")[:400],
-        "audio_url": best_audio,
-        "sources": sources,
-        "recommended": [
-            {
-                "id": f"yt:{v.get('videoId')}",
-                "video_id": v.get("videoId"),
-                "title": v.get("title"),
-                "artist": v.get("author"),
-                "thumb": _yt_thumb(v.get("videoId") or "", v.get("videoThumbnails")),
-                "provider": "youtube",
+    watch = f"https://www.youtube.com/watch?v={video_id}"
+    errors: List[str] = []
+
+    # 1) Native InnerTube (ANDROID/IOS) — direct googlevideo
+    data = await _innertube_player(video_id)
+    if data.get("ok"):
+        audio_streams = data.get("audio_streams") or []
+        video_streams = data.get("video_streams") or []
+        best_audio = data.get("audio_url")
+        best_video = data.get("video_url")
+        sources = []
+        if best_audio:
+            sources.append({"type": "audio", "provider": data["provider"], "label": "Best audio", "url": best_audio, "play_url": best_audio, "format": "AUDIO"})
+        if best_video:
+            sources.append({"type": "video", "provider": data["provider"], "label": "Best video", "url": best_video, "play_url": best_video, "format": "VIDEO"})
+        return {
+            "ok": True,
+            "video_id": video_id,
+            "title": data.get("title"),
+            "thumb": data.get("thumb"),
+            "thumbnail": data.get("thumb"),
+            "duration": data.get("duration"),
+            "audio_url": best_audio,
+            "video_url": best_video,
+            "url": best_audio or best_video,
+            "directUrl": best_audio or best_video,
+            "audio_streams": audio_streams[:12],
+            "video_streams": video_streams[:12],
+            "sources": sources,
+            "watch_url": watch,
+            "download_url": watch,
+            "provider": data.get("provider"),
+            "note": "Direct googlevideo CDN via InnerTube. Tokens expire ~6h — re-fetch when needed.",
+        }
+    errors.append(str(data.get("error") or "innertube"))
+
+    # 2) loader.to → savenow CDN (works on many datacenter IPs)
+    try:
+        ld = await _loader_to_youtube(video_id, fmt="mp3")
+        if ld.get("ok") and ld.get("url"):
+            return {
+                "ok": True,
+                "video_id": video_id,
+                "title": ld.get("title"),
+                "thumb": ld.get("thumb"),
+                "thumbnail": ld.get("thumb"),
+                "duration": None,
+                "audio_url": ld.get("url"),
+                "video_url": None,
+                "url": ld.get("url"),
+                "directUrl": ld.get("url"),
+                "audio_streams": [{"label": "mp3", "url": ld["url"], "format": "AUDIO", "type": "audio/mpeg"}],
+                "video_streams": [],
+                "sources": [{"type": "audio", "provider": ld.get("provider"), "label": "MP3 CDN", "url": ld["url"], "play_url": ld["url"], "format": "AUDIO"}],
+                "watch_url": watch,
+                "download_url": ld.get("url"),
+                "provider": ld.get("provider"),
+                "errors": errors or None,
+                "note": "CDN via loader.to/savenow",
             }
-            for v in (data.get("recommendedVideos") or [])[:12]
-            if isinstance(v, dict) and v.get("videoId")
-        ],
-        "provider": "invidious",
-        "watch_url": f"https://music.youtube.com/watch?v={video_id}",
+        errors.append(str(ld.get("error") or "loader"))
+    except Exception as e:
+        errors.append(f"loader:{type(e).__name__}")
+
+    # 3) Optional yt-dlp only if installed (not required)
+    try:
+        yd = await asyncio.to_thread(_ytdlp_info, watch)
+        if yd.get("ok") and (yd.get("url") or yd.get("formats")):
+            formats = yd.get("formats") or []
+            audio_streams = [f for f in formats if "audio" in (f.get("kind") or "").lower() and f.get("url")]
+            best = yd.get("url") or (audio_streams[0]["url"] if audio_streams else None)
+            if best:
+                return {
+                    "ok": True,
+                    "video_id": video_id,
+                    "title": yd.get("title"),
+                    "thumb": yd.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                    "audio_url": best,
+                    "url": best,
+                    "directUrl": best,
+                    "audio_streams": audio_streams[:8],
+                    "video_streams": [],
+                    "sources": [{"type": "audio", "provider": "yt-dlp", "label": "Best", "url": best, "play_url": best}],
+                    "provider": yd.get("extractor") or "yt-dlp",
+                    "errors": errors or None,
+                }
+    except Exception as e:
+        errors.append(f"ytdlp:{type(e).__name__}")
+
+    # 3) embed last resort
+    embed = f"https://www.youtube.com/embed/{video_id}?autoplay=1&rel=0"
+    return {
+        "ok": False,
+        "video_id": video_id,
+        "title": None,
+        "thumb": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        "audio_url": None,
+        "video_url": embed,
+        "url": embed,
+        "directUrl": embed,
+        "audio_streams": [],
+        "video_streams": [],
+        "sources": [{"type": "embed", "provider": "youtube", "label": "YouTube Embed", "url": embed, "play_url": embed, "format": "EMBED"}],
+        "watch_url": watch,
+        "provider": "embed",
+        "errors": errors,
+        "note": "CDN blocked on this IP. Embed works in browser; set residential IP or cookies for direct.",
     }
 
 
 
 
 
-# =============================================================================
-# HINDIANIME (hindianime.site) — Hindi-dub catalog + HLS resolve
-# =============================================================================
-
-HA_BASE = "https://www.hindianime.site"
-HA_STREAM = "https://stream.hindianime.site"
-HA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Referer": "https://www.hindianime.site/",
-    "Origin": "https://www.hindianime.site",
-    "Accept": "application/json, text/plain, */*",
-}
+# (HA_BASE moved to top)
 
 
-def _ha_slug_from_link(link: str) -> str:
-    if not link:
-        return ""
-    path = urlparse(link).path.strip("/")
-    # series/solo-leveling/ or movies/foo/
-    parts = [p for p in path.split("/") if p]
-    if len(parts) >= 2 and parts[0] in ("series", "movies", "anime", "episode"):
-        return parts[1]
-    return parts[-1] if parts else ""
 
-
-def _ha_card(it: dict) -> dict:
-    link = it.get("link") or ""
-    slug = _ha_slug_from_link(link) or (it.get("id") or "")
+def _ha_card(x: dict) -> dict:
+    """Normalize HindiAnime list item for frontend cards."""
+    if not isinstance(x, dict):
+        return {}
+    link = x.get("link") or x.get("url") or ""
+    title = x.get("title") or x.get("name") or ""
+    poster = x.get("poster") or x.get("image") or x.get("thumb") or ""
     return {
-        "id": it.get("id") or slug,
-        "slug": slug,
-        "title": it.get("title") or slug,
-        "poster": it.get("poster"),
-        "backdrop": it.get("backdrop"),
-        "year": it.get("year"),
-        "type": it.get("type") or "series",
+        "id": x.get("id") or link or title,
+        "title": title,
         "link": link,
-        "rank": it.get("rank"),
+        "url": link,
+        "poster": poster,
+        "thumb": poster,
+        "type": x.get("type"),
+        "episodes": x.get("episodes") or x.get("episode"),
+        "episode": x.get("episode"),
+        "duration": x.get("duration"),
+        "rating": x.get("rating"),
+        "status": x.get("status"),
+        "overview": x.get("overview") or x.get("description"),
+        "views": x.get("viewsFormatted") or x.get("rawViews"),
+        "rank": x.get("rank"),
+        "time_ago": x.get("timeAgo"),
         "provider": "hindianime",
+        "raw": x,
     }
 
 
 async def _ha_get(path: str, params: Optional[dict] = None) -> Any:
-    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
-        r = await client.get(HA_BASE + path, params=params or {}, headers=HA_HEADERS)
+    base = globals().get("HA_BASE") or "https://www.hindianime.site"
+    headers = globals().get("HA_HEADERS") or {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.hindianime.site/",
+        "Origin": "https://www.hindianime.site",
+    }
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        r = await client.get(base.rstrip("/") + path, params=params or {}, headers=headers)
         if r.status_code >= 400:
             raise HTTPException(502, f"HindiAnime {path} HTTP {r.status_code}")
-        ctype = (r.headers.get("content-type") or "").lower()
-        if "json" not in ctype:
-            # sometimes HTML error
-            try:
-                return r.json()
-            except Exception:
-                raise HTTPException(502, f"HindiAnime {path} non-JSON")
-        return r.json()
+        try:
+            return r.json()
+        except Exception:
+            raise HTTPException(502, f"HindiAnime {path} non-JSON ({r.status_code})")
 
 
 
@@ -7807,6 +5051,7 @@ async def anime_home():
     def map_list(key):
         return [_ha_card(x) for x in (data.get(key) or []) if isinstance(x, dict)]
     return {
+        "ok": True,
         "top_airing": map_list("topAiring"),
         "most_popular": map_list("mostPopular"),
         "completed": map_list("completedSeries"),
@@ -7869,17 +5114,29 @@ async def anime_catalog(type: str = Query("all")):
 
 @app.get("/anime/search", tags=["Anime"])
 async def anime_search(q: str = Query(..., min_length=1)):
-    """Search HindiAnime catalog by title."""
-    qn = q.strip().lower()
-    data = await _ha_get("/api/catalog", {"t": str(int(time.time()))[:6]})
+    """Search HindiAnime catalog by title (series + movies)."""
+    qn = (q or "").strip().lower()
+    if not qn:
+        raise HTTPException(400, "q required")
+    try:
+        data = await _ha_get("/api/catalog")
+    except Exception as e:
+        raise HTTPException(502, f"catalog: {e}")
     items = []
-    for x in (data.get("series") or []) + (data.get("movies") or []):
+    seen = set()
+    for x in list(data.get("series") or []) + list(data.get("movies") or []):
         if not isinstance(x, dict):
             continue
-        title = (x.get("title") or "").lower()
-        if qn in title:
-            items.append(_ha_card(x))
-    return {"query": q, "items": items[:60], "provider": "hindianime"}
+        title = (x.get("title") or x.get("name") or "").lower()
+        if qn in title or any(part and part in title for part in qn.split()):
+            card = _ha_card(x)
+            key = card.get("id") or card.get("title")
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(card)
+    return {"ok": True, "query": q, "count": len(items), "items": items[:80], "provider": "hindianime"}
+
 
 
 @app.get("/anime/detail/{slug}", tags=["Anime"])
@@ -8224,40 +5481,85 @@ async def anime_servers(
     title: Optional[str] = Query(None, description="Anime/movie title"),
     slug: Optional[str] = Query(None, description="hindianime slug"),
     hash: Optional[str] = Query(None, description="videoHash for native HLS"),
+    tmdb_id: Optional[str] = Query(None, description="TMDB id"),
     type: str = Query("series", description="series|movie"),
     season: int = Query(1, ge=1),
     episode: int = Query(1, ge=1),
     request: Request = None,
 ):
-    """All playback servers like hindianime.site watch page (HLS + 13 embeds).
-
-    When stream tunnel is up: Server 1–3 are native multi-audio HLS.
-    Always: Server 4–16 are embed iframes (VidLink, VidSrc, 2Embed, …) via TMDB id.
-    """
+    """Playback servers: native HindiAnime HLS + embed fallbacks (VidSrc etc.)."""
     is_movie = (type or "").lower() in ("movie", "movies", "film")
     resolved_title = title
     video_hash = hash
+    tid = str(tmdb_id).strip() if tmdb_id else None
+
+    # Resolve title from TMDB if needed
+    if tid and not resolved_title:
+        try:
+            media = "movie" if is_movie else "tv"
+            key = globals().get("TMDB_KEY") or globals().get("TMDB_API_KEY") or "b39176614e7ea6307888211ddd83549a"
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                tr = await client.get(
+                    f"https://api.themoviedb.org/3/{media}/{tid}",
+                    params={"api_key": key},
+                )
+                if tr.status_code == 200:
+                    tj = tr.json()
+                    resolved_title = tj.get("title") or tj.get("name")
+        except Exception:
+            pass
+
+    # Resolve slug from title via catalog search
+    if resolved_title and not slug and not video_hash:
+        try:
+            cat = await _ha_get("/api/catalog")
+            qn = resolved_title.lower().strip()
+            best = None
+            for x in list(cat.get("series") or []) + list(cat.get("movies") or []):
+                if not isinstance(x, dict):
+                    continue
+                xt = (x.get("title") or "").lower()
+                if qn == xt or qn in xt or xt in qn:
+                    best = x
+                    if qn == xt:
+                        break
+            if best:
+                link = best.get("link") or best.get("url") or ""
+                slug = link.rstrip("/").split("/")[-1] if link else slug
+                resolved_title = resolved_title or best.get("title")
+                if (best.get("type") or "").lower() == "movie":
+                    is_movie = True
+        except Exception:
+            pass
 
     if slug and not video_hash:
         try:
             data = await _ha_get(f"/extracted/{slug.strip().strip('/')}.json")
             resolved_title = resolved_title or data.get("title")
-            is_movie = is_movie or (data.get("type") == "movie")
+            is_movie = is_movie or ((data.get("type") or "").lower() == "movie")
             eps = data.get("episodes") or []
-            # pick matching season/episode
+            if isinstance(eps, dict):
+                eps = list(eps.values())
             pick = None
             for ep in eps:
-                if int(ep.get("season") or 1) == season and int(ep.get("episode") or 1) == episode:
+                if not isinstance(ep, dict):
+                    continue
+                if int(ep.get("season") or 1) == int(season) and int(ep.get("episode") or ep.get("number") or 1) == int(episode):
                     pick = ep
                     break
             if not pick and eps:
-                pick = eps[0]
+                # first episode fallback
+                for ep in eps:
+                    if isinstance(ep, dict):
+                        pick = ep
+                        break
             if pick:
-                video_hash = pick.get("videoHash") or video_hash
-                if pick.get("season"):
+                video_hash = pick.get("videoHash") or pick.get("hash") or video_hash
+                try:
                     season = int(pick.get("season") or season)
-                if pick.get("episode"):
-                    episode = int(pick.get("episode") or episode)
+                    episode = int(pick.get("episode") or pick.get("number") or episode)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -8265,27 +5567,28 @@ async def anime_servers(
     tunnel_ok = False
     play_url = None
     stream_url = None
+    host = globals().get("HA_STREAM") or "https://stream.hindianime.site"
 
-    # Native HLS servers (1-3) when hash present
     if video_hash:
-        host = "https://stream.hindianime.site"
         master = f"{host}/api/proxy/master.m3u8?hash={video_hash}"
-        # probe tunnel
         try:
-            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=14.0, follow_redirects=True) as client:
                 r = await client.get(
                     master,
                     headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.hindianime.site/", "Accept": "*/*"},
                 )
                 if r.status_code == 200 and (r.text or "").lstrip().startswith("#EXTM3U"):
-                    # probe sub
+                    tunnel_ok = True
                     lines = (r.text or "").splitlines()
                     for i, line in enumerate(lines):
                         if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
                             u = lines[i + 1].strip()
                             full = host + u if u.startswith("/") else u
-                            pr = await client.get(full, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.hindianime.site/"})
-                            tunnel_ok = pr.status_code == 200 and (pr.text or "").lstrip().startswith("#EXTM3U")
+                            try:
+                                pr = await client.get(full, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.hindianime.site/"})
+                                tunnel_ok = pr.status_code == 200 and (pr.text or "").lstrip().startswith("#EXTM3U")
+                            except Exception:
+                                tunnel_ok = False
                             break
         except Exception:
             tunnel_ok = False
@@ -8297,94 +5600,184 @@ async def anime_servers(
             base = ""
         play_url = f"{base}/anime/hls?u={quote(master, safe='')}" if base else f"/anime/hls?u={quote(master, safe='')}"
 
-        if tunnel_ok:
-            servers.append({"name": "Server 1 (Multi-Audio HD)", "type": "hls", "url": play_url, "direct": stream_url, "hash": video_hash})
-            servers.append({
-                "name": "Server 2 (Zephyrix Fast)", "type": "hls",
-                "url": f"{play_url}&cdn=fast" if "?" in play_url else play_url,
-                "direct": f"{master}&cdn=fast", "hash": video_hash, "isMirror": True,
-            })
-            servers.append({
-                "name": "Server 3 (AniPlayz Backup)", "type": "hls",
-                "url": f"{play_url}&cdn=backup" if "?" in play_url else play_url,
-                "direct": f"{master}&cdn=backup", "hash": video_hash, "isBackup": True,
-            })
+        servers.append({
+            "name": "Server 1 (HindiAnime HLS)",
+            "type": "hls",
+            "url": master,
+            "play_url": play_url,
+            "hash": video_hash,
+            "working": tunnel_ok,
+            "provider": "hindianime",
+        })
+        servers.append({
+            "name": "Server 2 (HLS via proxy)",
+            "type": "hls",
+            "url": play_url,
+            "play_url": play_url,
+            "hash": video_hash,
+            "working": True,
+            "provider": "proxy",
+        })
+
+    # Embed servers via TMDB
+    if tid:
+        media = "movie" if is_movie else "tv"
+        embeds = []
+        if is_movie:
+            embeds = [
+                ("VidSrc", f"https://vidsrc.xyz/embed/movie/{tid}"),
+                ("VidSrc.to", f"https://vidsrc.to/embed/movie/{tid}"),
+                ("VidLink", f"https://vidlink.pro/movie/{tid}"),
+                ("2Embed", f"https://www.2embed.cc/embed/{tid}"),
+                ("AutoEmbed", f"https://autoembed.co/movie/tmdb/{tid}"),
+                ("VidKing", f"https://www.vidking.net/embed/movie/{tid}"),
+            ]
         else:
-            # still list native with note — client can retry
+            embeds = [
+                ("VidSrc", f"https://vidsrc.xyz/embed/tv/{tid}/{season}/{episode}"),
+                ("VidSrc.to", f"https://vidsrc.to/embed/tv/{tid}/{season}/{episode}"),
+                ("VidLink", f"https://vidlink.pro/tv/{tid}/{season}/{episode}"),
+                ("2Embed", f"https://www.2embed.cc/embedtv/{tid}&s={season}&e={episode}"),
+                ("AutoEmbed", f"https://autoembed.co/tv/tmdb/{tid}-{season}-{episode}"),
+                ("VidKing", f"https://www.vidking.net/embed/tv/{tid}/{season}/{episode}"),
+            ]
+        for name, url in embeds:
             servers.append({
-                "name": "Server 1 (Multi-Audio HD)", "type": "hls", "url": play_url, "direct": stream_url,
-                "hash": video_hash, "available": False, "note": "stream tunnel offline",
+                "name": name,
+                "type": "embed",
+                "url": url,
+                "play_url": url,
+                "working": True,
+                "provider": name.lower().replace(" ", ""),
             })
 
-    # Embed servers 4-16 via TMDB
-    tmdb_id = await _ha_tmdb_id(resolved_title or slug or "", is_movie=is_movie)
-    embeds = _ha_embed_servers(tmdb_id, is_movie=is_movie, season=season, episode=episode) if tmdb_id else []
-    servers.extend(embeds)
-
-    # default playable: first available hls else first embed
-    default = next((s for s in servers if s.get("type") == "hls" and s.get("available", True)), None)
-    if not default:
-        default = next((s for s in servers if s.get("type") == "iframe"), None)
+    # CDN streams via vidsrc resolver
+    cdn_streams = []
+    if tid:
+        try:
+            cdn = await _vidsrc_resolve_cdn(
+                str(tid),
+                media_type="movie" if is_movie else "tv",
+                season=season,
+                episode=episode,
+            )
+            for s in (cdn.get("streams") or [])[:6]:
+                if s.get("url"):
+                    cdn_streams.append(s)
+                    servers.append({
+                        "name": s.get("label") or "CDN",
+                        "type": s.get("type") or "hls",
+                        "url": s.get("url"),
+                        "play_url": s.get("url"),
+                        "working": True,
+                        "provider": "vidsrc-cdn",
+                    })
+        except Exception:
+            pass
 
     return {
         "ok": bool(servers),
         "title": resolved_title,
         "slug": slug,
         "hash": video_hash,
-        "tmdb_id": tmdb_id,
+        "tmdb_id": tid,
         "type": "movie" if is_movie else "series",
         "season": season,
         "episode": episode,
         "tunnel_ok": tunnel_ok,
-        "server_count": len(servers),
+        "stream_url": stream_url,
+        "play_url": play_url,
         "servers": servers,
-        "default": default,
-        "play_url": (default or {}).get("url"),
-        "provider": "hindianime",
-        "note": (
-            "Use servers[].url — type=hls via our proxy, type=iframe embed in player. "
-            + ("Native HLS up." if tunnel_ok else "Native HLS tunnel down — use embed servers 4–16.")
-        ),
+        "cdn_streams": cdn_streams,
+        "count": len(servers),
+        "provider": "hindianime+embeds",
     }
+
 
 
 @app.get("/anime/stream", tags=["Anime"])
 async def anime_stream(
     hash: Optional[str] = Query(None, description="videoHash from episode"),
-    url: Optional[str] = Query(None, description="episode page url fallback"),
+    url: Optional[str] = Query(None, description="master m3u8 or episode page url"),
+    slug: Optional[str] = Query(None),
+    tmdb_id: Optional[str] = Query(None),
+    title: Optional[str] = Query(None),
+    type: str = Query("series"),
+    season: int = Query(1, ge=1),
+    episode: int = Query(1, ge=1),
     request: Request = None,
 ):
-    """Resolve HindiAnime HLS.
+    """Resolve playable HLS for anime/series/movie.
 
-    HindiAnime serves master on both hosts, but **sub-playlists + segments only work
-    when stream.hindianime.site Cloudflare Tunnel origin is up**. We always return
-    `play_url` through our `/anime/hls` proxy so the browser never hits their tunnel
-    directly — only our server does.
+    Accepts hash, direct master url, slug, or tmdb_id (auto-resolves hash via catalog).
+    Always returns play_url through /anime/hls proxy when possible.
     """
-    if not hash and not url:
-        raise HTTPException(400, "hash or url required")
+    video_hash = hash
+    is_movie = (type or "").lower() in ("movie", "movies", "film")
+
+    # Resolve via servers helper when no hash/url
+    if not video_hash and not url:
+        if slug or tmdb_id or title:
+            try:
+                srv = await anime_servers(
+                    title=title, slug=slug, hash=None, tmdb_id=tmdb_id,
+                    type=type, season=season, episode=episode, request=request,
+                )
+                video_hash = srv.get("hash")
+                if not video_hash and srv.get("cdn_streams"):
+                    # return first CDN stream
+                    s0 = srv["cdn_streams"][0]
+                    return {
+                        "ok": True,
+                        "type": "cdn",
+                        "url": s0.get("url"),
+                        "play_url": s0.get("url"),
+                        "stream_url": s0.get("url"),
+                        "servers": srv.get("servers") or [],
+                        "tmdb_id": tmdb_id,
+                        "title": srv.get("title"),
+                        "provider": "vidsrc-cdn",
+                    }
+                if not video_hash and srv.get("servers"):
+                    # return embed list
+                    return {
+                        "ok": bool(srv.get("servers")),
+                        "type": "servers",
+                        "hash": None,
+                        "servers": srv.get("servers"),
+                        "play_url": (srv.get("servers") or [{}])[0].get("play_url"),
+                        "title": srv.get("title"),
+                        "tmdb_id": tmdb_id,
+                        "provider": "embeds",
+                        "note": "No native hash — use embed/CDN servers",
+                    }
+            except Exception as e:
+                raise HTTPException(502, f"resolve failed: {e}")
+        else:
+            raise HTTPException(400, "hash, url, slug, tmdb_id or title required")
 
     headers = {
-        "User-Agent": HA_HEADERS.get("User-Agent", "Mozilla/5.0"),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
         "Referer": "https://www.hindianime.site/",
         "Origin": "https://www.hindianime.site",
         "Accept": "*/*",
     }
+    host_list = [
+        globals().get("HA_STREAM") or "https://stream.hindianime.site",
+        globals().get("HA_BASE") or "https://www.hindianime.site",
+    ]
     stream = None
     master_body = ""
     host_used = None
     tunnel_ok = False
     errors: List[str] = []
 
-    host_list = [
-        "https://stream.hindianime.site",
-        "https://www.hindianime.site",
-    ]
-
-    if hash:
+    if url and (url.endswith(".m3u8") or "master.m3u8" in url or "proxy" in url):
+        stream = url
+    elif video_hash:
         async with httpx.AsyncClient(timeout=22.0, follow_redirects=True) as client:
             for host in host_list:
-                candidate = f"{host}/api/proxy/master.m3u8?hash={hash}"
+                candidate = f"{host.rstrip('/')}/api/proxy/master.m3u8?hash={video_hash}"
                 try:
                     r = await client.get(candidate, headers=headers)
                     body = r.text or ""
@@ -8392,84 +5785,27 @@ async def anime_stream(
                         stream = candidate
                         master_body = body
                         host_used = host
-                        # Probe one sub-playlist to know if tunnel/origin is alive
+                        # probe sub
                         lines = body.splitlines()
-                        probe_uri = None
                         for i, line in enumerate(lines):
                             if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
                                 probe_uri = lines[i + 1].strip()
+                                probe_url = host + probe_uri if probe_uri.startswith("/") else probe_uri
+                                try:
+                                    pr = await client.get(probe_url, headers=headers)
+                                    tunnel_ok = pr.status_code == 200 and (pr.text or "").lstrip().startswith("#EXTM3U")
+                                except Exception as e:
+                                    errors.append(str(e)[:80])
                                 break
-                        if probe_uri:
-                            if probe_uri.startswith("/"):
-                                probe_url = host + probe_uri
-                            else:
-                                probe_url = probe_uri.replace("www.hindianime.site", "stream.hindianime.site")
-                                if not probe_url.startswith("http"):
-                                    probe_url = "https://stream.hindianime.site" + (probe_uri if probe_uri.startswith("/") else "/" + probe_uri)
-                            try:
-                                pr = await client.get(probe_url, headers=headers)
-                                if pr.status_code == 200 and (pr.text or "").lstrip().startswith("#EXTM3U"):
-                                    tunnel_ok = True
-                                    stream = stream.replace("www.hindianime.site", "stream.hindianime.site")
-                                    host_used = "https://stream.hindianime.site"
-                                    break
-                                else:
-                                    errors.append(f"sub@{host.split('//')[1]}:{pr.status_code}")
-                            except Exception as e:
-                                errors.append(f"sub@{host.split('//')[1]}:{type(e).__name__}")
-                        if tunnel_ok:
-                            break
-                    else:
-                        errors.append(f"master@{host.split('//')[1]}:{r.status_code}")
+                        break
+                    errors.append(f"{host} HTTP {r.status_code}")
                 except Exception as e:
-                    errors.append(f"master@{host.split('//')[1]}:{type(e).__name__}")
-
-    if not stream and hash:
-        stream = f"https://stream.hindianime.site/api/proxy/master.m3u8?hash={hash}"
+                    errors.append(f"{host}: {type(e).__name__}")
+    elif url:
+        stream = url
 
     if not stream:
-        raise HTTPException(502, "Could not resolve stream")
-
-    # Normalize to stream host when tunnel works; keep whichever served master otherwise
-    if tunnel_ok:
-        stream = stream.replace("www.hindianime.site", "stream.hindianime.site")
-
-    qualities: List[dict] = []
-    audio_tracks: List[dict] = []
-    abs_host = "https://stream.hindianime.site" if tunnel_ok else (host_used or "https://www.hindianime.site")
-    lines = (master_body or "").splitlines()
-    for i, line in enumerate(lines):
-        if line.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in line:
-            lang = re.search(r'LANGUAGE="([^"]*)"', line)
-            name = re.search(r'NAME="([^"]*)"', line)
-            uri_m = re.search(r'URI="([^"]*)"', line)
-            if uri_m:
-                u = uri_m.group(1)
-                if u.startswith("/"):
-                    u = abs_host + u
-                elif "www.hindianime.site" in u and tunnel_ok:
-                    u = u.replace("www.hindianime.site", "stream.hindianime.site")
-                audio_tracks.append({
-                    "language": lang.group(1) if lang else "",
-                    "name": name.group(1) if name else "Audio",
-                    "url": u,
-                })
-        if line.startswith("#EXT-X-STREAM-INF"):
-            bw = re.search(r"BANDWIDTH=(\d+)", line)
-            res = re.search(r"RESOLUTION=([\dx]+)", line)
-            name = re.search(r'NAME="([^"]*)"', line)
-            if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
-                u = lines[i + 1].strip()
-                if u.startswith("/"):
-                    u = abs_host + u
-                elif "www.hindianime.site" in u and tunnel_ok:
-                    u = u.replace("www.hindianime.site", "stream.hindianime.site")
-                qualities.append({
-                    "label": (name.group(1) if name else None) or (res.group(1) if res else "auto"),
-                    "bandwidth": int(bw.group(1)) if bw else None,
-                    "resolution": res.group(1) if res else None,
-                    "url": u,
-                })
+        raise HTTPException(502, {"error": "no playable stream", "errors": errors, "hash": video_hash})
 
     try:
         base = str(request.base_url).rstrip("/") if request is not None else ""
@@ -8477,32 +5813,39 @@ async def anime_stream(
         base = ""
     play_url = f"{base}/anime/hls?u={quote(stream, safe='')}" if base else f"/anime/hls?u={quote(stream, safe='')}"
 
-    note = (
-        "Use play_url in web player (our CORS proxy). stream_url is absolute master.m3u8."
-        if tunnel_ok
-        else (
-            "HindiAnime stream tunnel (stream.hindianime.site) is DOWN — Cloudflare Error 1033. "
-            "Master playlist was found but quality sub-playlists/segments are unreachable until "
-            "their origin comes back. Retry later."
-        )
-    )
+    # parse qualities from master
+    qualities = []
+    if master_body:
+        lines = master_body.splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF"):
+                bw = re.search(r"BANDWIDTH=(\d+)", line)
+                res = re.search(r"RESOLUTION=(\d+x\d+)", line)
+                uri = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                qualities.append({
+                    "bandwidth": int(bw.group(1)) if bw else None,
+                    "resolution": res.group(1) if res else None,
+                    "uri": uri,
+                })
 
     return {
-        "success": True,
-        "ok": tunnel_ok,
+        "ok": True,
+        "hash": video_hash,
         "stream_url": stream,
-        "direct_url": stream,
         "play_url": play_url,
-        "hash": hash,
-        "qualities": qualities,
-        "audio_tracks": audio_tracks,
-        "type": "hls",
-        "tunnel_ok": tunnel_ok,
+        "url": stream,
         "host": host_used,
-        "provider": "hindianime",
-        "note": note,
+        "tunnel_ok": tunnel_ok,
+        "qualities": qualities,
+        "tmdb_id": tmdb_id,
+        "title": title,
+        "season": season,
+        "episode": episode,
         "errors": errors or None,
+        "provider": "hindianime",
+        "note": "Use play_url in HLS.js / VLC. Native segments need tunnel_ok=true.",
     }
+
 
 
 @app.get("/anime/hls", tags=["Anime"])
@@ -9413,6 +6756,1717 @@ async def np_stream(video_id: str, se: int = 0, ep: int = 0):
 
 
 # =============================================================================
+
+# =============================================================================
+# MovieBox (aoneroom / inmoviebox) — full client from MovieBox-TUI
+# HMAC-MD5 signed requests · visitor session · play-info DASH CDN
+# =============================================================================
+
+MB_HOSTS = [
+    "https://api6.aoneroom.com",
+    "https://api5.aoneroom.com",
+    "https://api4.aoneroom.com",
+    "https://api4sg.aoneroom.com",
+    "https://api3.aoneroom.com",
+    "https://api6sg.aoneroom.com",
+    "https://api.inmoviebox.com",
+]
+# secret from MovieBox-TUI crypto.rs DEFAULT_SECRET_BYTES
+MB_SECRET = bytes([
+    0xEF, 0xA8, 0x91, 0x97, 0x4E, 0xEC, 0xD3, 0x14,
+    0x8D, 0xF6, 0x3A, 0xA6, 0x11, 0x60, 0x2D, 0xEF,
+    0xD1, 0x01, 0x25, 0x9B, 0xA5, 0x21, 0x02, 0x2C,
+    0x57, 0xAE, 0x05, 0x66, 0xBD, 0x8E,
+])
+STREAM_REFERER = "https://sportslive.wine"
+_mb_ua = "com.community.oneroom/50020119 (Linux; U; Android 13; en_US; 23078RKD5C; Build/TQ2A.230405.003; Cronet/135.0.7012.3)"
+_mb_device_id: Optional[str] = None
+_mb_session_token: Optional[str] = None
+_mb_session_lock = asyncio.Lock() if False else None  # set below after asyncio known
+_mb_proxy_cookies: Dict[str, dict] = {}
+
+
+def _mb_md5_hex(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+def _mb_client_token(ts_ms: int) -> str:
+    rev = str(ts_ms)[::-1]
+    return f"{ts_ms},{_mb_md5_hex(rev.encode())}"
+
+
+def _mb_sorted_query(url: str) -> str:
+    from urllib.parse import urlparse, parse_qsl
+    q = parse_qsl(urlparse(url).query, keep_blank_values=True)
+    if not q:
+        return ""
+    # stable sort by key then value
+    q = sorted(q, key=lambda kv: (kv[0], kv[1]))
+    return "&".join(f"{k}={v}" for k, v in q)
+
+
+def _mb_canonical(method: str, url: str, body: Optional[str], ts_ms: int) -> str:
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    qs = _mb_sorted_query(url)
+    canonical_url = f"{path}?{qs}" if qs else path
+    accept = "application/json"
+    content_type = "application/json"
+    if body:
+        b = body.encode("utf-8")
+        trunc = b[:102400]
+        body_hash = _mb_md5_hex(trunc)
+        body_length = str(len(b))
+    else:
+        body_hash = ""
+        body_length = ""
+    return "\n".join([
+        method.upper(),
+        accept,
+        content_type,
+        body_length,
+        str(ts_ms),
+        body_hash,
+        canonical_url,
+    ])
+
+
+def _mb_signature(method: str, url: str, body: Optional[str], ts_ms: int) -> str:
+    canonical = _mb_canonical(method, url, body, ts_ms)
+    sig = hmac.new(MB_SECRET, canonical.encode("utf-8"), hashlib.md5).digest()
+    sig_b64 = base64.b64encode(sig).decode("ascii")
+    return f"{ts_ms}|2|{sig_b64}"
+
+
+def _mb_random_hex(n: int) -> str:
+    return "".join(random.choice("0123456789abcdef") for _ in range(n))
+
+
+def _mb_get_device_id() -> str:
+    global _mb_device_id
+    if not _mb_device_id:
+        _mb_device_id = _mb_random_hex(32)
+    return _mb_device_id
+
+
+def _mb_client_info() -> str:
+    did = _mb_get_device_id()
+    return json.dumps({
+        "package_name": "com.community.oneroom",
+        "version_name": "4.0.01.0813.03",
+        "version_code": 50020119,
+        "os": "android",
+        "os_version": "13",
+        "install_ch": "ps",
+        "device_id": did,
+        "install_store": "ps",
+        "gaid": str(__import__("uuid").uuid4()),
+        "brand": "Redmi",
+        "model": "23078RKD5C",
+        "system_language": "en",
+        "net": "NETWORK_WIFI",
+        "region": "US",
+        "timezone": "Asia/Kolkata",
+        "sp_code": "40401",
+        "X-Play-Mode": "2",
+    }, separators=(",", ":"))
+
+
+def _mb_spoof_ip() -> str:
+    prefixes = ["103.241", "49.36", "117.195", "106.198", "122.162", "157.32", "182.70"]
+    p = random.choice(prefixes)
+    return f"{p}.{random.randint(1,253)}.{random.randint(1,253)}"
+
+
+def _mb_headers(method: str, full_url: str, body: Optional[str], token: Optional[str]) -> dict:
+    ts = int(time.time() * 1000)
+    h = {
+        "User-Agent": _mb_ua,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+        "x-client-token": _mb_client_token(ts),
+        "x-tr-signature": _mb_signature(method, full_url, body, ts),
+        "x-client-info": _mb_client_info(),
+        "x-client-status": "0",
+        "x-forwarded-for": _mb_spoof_ip(),
+    }
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
+async def _mb_ensure_session() -> str:
+    global _mb_session_token
+    if _mb_session_token:
+        return _mb_session_token
+    device_id = _mb_get_device_id()
+    body = json.dumps({"deviceId": device_id}, separators=(",", ":"))
+    last_err = None
+    async with httpx.AsyncClient(timeout=18.0, follow_redirects=True) as client:
+        for host in MB_HOSTS:
+            path = "/wefeed-mobile-bff/user-api/visitor-login"
+            url = host.rstrip("/") + path
+            try:
+                hdrs = _mb_headers("POST", url, body, None)
+                hdrs["x-device-id"] = device_id
+                r = await client.post(url, content=body, headers=hdrs)
+                if r.status_code != 200:
+                    last_err = f"{host} HTTP {r.status_code} {r.text[:60]}"
+                    continue
+                j = r.json()
+                data = j.get("data") if isinstance(j.get("data"), dict) else j
+                token = (data or {}).get("token") or j.get("token")
+                if token:
+                    _mb_session_token = token
+                    return token
+                last_err = f"no token: {str(j)[:80]}"
+            except Exception as e:
+                last_err = str(e)
+                continue
+    raise HTTPException(502, f"MovieBox session failed: {last_err}")
+
+
+async def mb_request(method: str, path: str, body: Optional[dict] = None) -> Any:
+    """Signed request to MovieBox BFF across host pool."""
+    token = await _mb_ensure_session()
+    body_str = json.dumps(body, separators=(",", ":")) if body is not None else None
+    last_err = None
+    async with httpx.AsyncClient(timeout=22.0, follow_redirects=True) as client:
+        for host in MB_HOSTS:
+            url = host.rstrip("/") + path
+            headers = _mb_headers(method.upper(), url, body_str, token)
+            try:
+                if method.upper() == "GET":
+                    r = await client.get(url, headers=headers)
+                else:
+                    r = await client.post(url, content=body_str or "{}", headers=headers)
+                if r.status_code in (401, 403):
+                    # refresh session once
+                    global _mb_session_token
+                    _mb_session_token = None
+                    token = await _mb_ensure_session()
+                    headers = _mb_headers(method.upper(), url, body_str, token)
+                    if method.upper() == "GET":
+                        r = await client.get(url, headers=headers)
+                    else:
+                        r = await client.post(url, content=body_str or "{}", headers=headers)
+                if r.status_code >= 400:
+                    last_err = f"{host} HTTP {r.status_code} {r.text[:80]}"
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        continue
+                    continue
+                j = r.json()
+                if isinstance(j, dict) and "data" in j and j.get("data") is not None:
+                    return j["data"]
+                return j
+            except Exception as e:
+                last_err = f"{host}: {type(e).__name__}: {e}"
+                continue
+    raise HTTPException(502, f"MovieBox request failed: {last_err}")
+
+
+def _dash_from_sign_cookie(cookie: str) -> Optional[str]:
+    """Extract DASH MPD URL from MovieBox signCookie (Edge-Cache-Cookie urlprefix=b64)."""
+    if not cookie:
+        return None
+    # direct mpd in cookie text
+    m = re.search(r"(https?://\S+?\.mpd\S*)", cookie)
+    if m:
+        return m.group(1).rstrip(";',\"")
+    # base64 urlprefix (MovieBox app / TUI)
+    m = re.search(r"urlprefix=([A-Za-z0-9+/=_-]+)", cookie)
+    if m:
+        try:
+            raw = m.group(1).replace("-", "+").replace("_", "/")
+            pad = "=" * ((4 - len(raw) % 4) % 4)
+            prefix = base64.b64decode(raw + pad).decode("utf-8", errors="ignore")
+            if prefix.startswith("http"):
+                if not prefix.endswith("/"):
+                    prefix += "/"
+                return prefix + "index.mpd"
+        except Exception:
+            pass
+    return None
+
+
+def _mb_stream_headers(cookie: str) -> dict:
+    h = {
+        "User-Agent": globals().get("_mb_ua") or "com.community.oneroom/50020119",
+        "Referer": globals().get("STREAM_REFERER") or "https://sportslive.wine",
+    }
+    if cookie:
+        h["Cookie"] = "; ".join(p.strip() for p in cookie.strip(";").split(";") if p.strip())
+    return h
+
+
+def _mb_extract_streams_from_play(data: dict) -> List[dict]:
+    """Parse play-info payload into list of playable CDN streams (DASH preferred)."""
+    out: List[dict] = []
+    if not isinstance(data, dict):
+        return out
+    raw = data.get("streams") or data.get("streamList") or data.get("list") or []
+    if isinstance(data.get("data"), dict):
+        d2 = data["data"]
+        raw = raw or d2.get("streams") or d2.get("streamList") or []
+    if not isinstance(raw, list):
+        return out
+    seen = set()
+    ua = globals().get("_mb_ua") or "com.community.oneroom/50020119"
+    for st in raw:
+        if not isinstance(st, dict):
+            continue
+        cookie = st.get("signCookie") or st.get("sign_cookie") or st.get("cookie") or ""
+        raw_url = st.get("url") or st.get("playUrl") or st.get("play_url") or ""
+        dash = _dash_from_sign_cookie(cookie) if cookie else None
+        playable = dash
+        if not playable and raw_url and not _is_dummy_url(raw_url):
+            playable = raw_url
+        if not playable:
+            continue
+        key = playable.split("?")[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        headers = _mb_stream_headers(cookie)
+        if cookie and ".mpd" in playable:
+            try:
+                _mb_proxy_remember(playable, headers.get("Cookie") or "", headers.get("Referer") or STREAM_REFERER)
+            except Exception:
+                pass
+        fmt = "DASH" if ".mpd" in playable else ("HLS" if ".m3u8" in playable else "MP4")
+        out.append({
+            "id": st.get("id"),
+            "url": playable,
+            "cdn_url": playable,
+            "format": fmt,
+            "resolution": st.get("resolutions") or st.get("resolution") or data.get("displayResolutions"),
+            "size": st.get("size"),
+            "duration": st.get("duration"),
+            "codec": st.get("codecName") or st.get("codec") or "hevc",
+            "sign_cookie": cookie,
+            "headers": headers,
+            "upstream_url": None if _is_dummy_url(raw_url) else raw_url,
+        })
+    return out
+
+
+
+def _is_dummy_url(url: str) -> bool:
+    if not url:
+        return True
+    u = url.lower()
+    return any(x in u for x in (
+        "macdn.aoneroom.com/other/",
+        "upgrade", "notice", "dummy", "placeholder",
+        "aa348f2541d13ffe",
+    ))
+
+
+def _mb_proxy_remember(mpd_url: str, cookie: str, referer: str):
+    _mb_proxy_cookies[mpd_url] = {"cookie": cookie, "referer": referer, "ts": time.time()}
+
+
+def _parse_mb_play_info(data: dict, ua: str) -> List[dict]:
+    streams = _mb_extract_streams_from_play(data if isinstance(data, dict) else {})
+    # normalize keys for older callers
+    out = []
+    for s in streams:
+        out.append({
+            "id": s.get("id"),
+            "url": s.get("url"),
+            "format": s.get("format"),
+            "resolution": s.get("resolution"),
+            "size": s.get("size"),
+            "duration": s.get("duration"),
+            "codec": s.get("codec"),
+            "headers": s.get("headers") or {"User-Agent": ua, "Referer": STREAM_REFERER},
+        })
+    return out
+
+
+
+async def mb_search(q: str, page: int = 1) -> dict:
+    payload = {"keyword": q, "page": page, "perPage": 20}
+    # try common body shapes
+    try:
+        data = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", payload)
+    except Exception:
+        data = await mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", {"query": q, "page": page})
+    items = []
+    subjects = []
+    if isinstance(data, dict):
+        # MovieBox-TUI shape: results[].subjects[]
+        for block in data.get("results") or []:
+            if isinstance(block, dict):
+                for s in block.get("subjects") or []:
+                    if isinstance(s, dict):
+                        subjects.append(s)
+        subjects = subjects or data.get("items") or data.get("list") or data.get("subjects") or data.get("records") or []
+        if not subjects and isinstance(data.get("data"), dict):
+            d2 = data["data"]
+            for block in d2.get("results") or []:
+                if isinstance(block, dict):
+                    subjects.extend([s for s in (block.get("subjects") or []) if isinstance(s, dict)])
+            subjects = subjects or d2.get("items") or d2.get("list") or []
+    elif isinstance(data, list):
+        subjects = data
+    for it in subjects or []:
+        if not isinstance(it, dict):
+            continue
+        sid = it.get("subjectId") or it.get("subject_id") or it.get("id")
+        title = it.get("title") or it.get("name")
+        stype = it.get("subjectType") or it.get("stype") or it.get("type")
+        type_str = "series" if str(stype) in ("2", "tv", "series") else "movie"
+        cover = it.get("cover") or it.get("poster") or {}
+        if isinstance(cover, dict):
+            poster = cover.get("url") or cover.get("thumbnail")
+        else:
+            poster = cover
+        items.append({
+            "subject_id": str(sid) if sid is not None else None,
+            "title": title,
+            "name": title,
+            "type": type_str,
+            "year": it.get("releaseDate") or it.get("year") or it.get("release_date"),
+            "rating": it.get("imdbRatingValue") or it.get("score") or it.get("rating"),
+            "poster": poster,
+            "poster_url": poster,
+            "description": it.get("description") or it.get("desc") or "",
+            "genre": it.get("genre"),
+            "has_resource": it.get("hasResource"),
+        })
+    return {"ok": True, "query": q, "page": page, "count": len(items), "items": items, "provider": "moviebox"}
+
+
+async def mb_stream(subject_id: str, season: int = 0, episode: int = 0) -> dict:
+    """Play-info → real DASH CDN. Tries v2 then v1; merges resource metadata."""
+    paths = []
+    if season or episode:
+        paths.append(f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={season}&ep={episode}")
+        paths.append(f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}")
+    paths.append(f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}")
+    paths.append(f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}")
+
+    data: dict = {}
+    last_err = None
+    for path in paths:
+        try:
+            data = await mb_request("GET", path)
+            if isinstance(data, dict) and (data.get("streams") or data.get("streamList")):
+                break
+        except Exception as e:
+            last_err = str(e)
+            continue
+    if not isinstance(data, dict):
+        data = {}
+
+    streams = _mb_extract_streams_from_play(data)
+    if not streams:
+        # fallback: older parser
+        streams = _parse_mb_play_info(data, _mb_ua)
+        for s in streams:
+            s.setdefault("cdn_url", s.get("url"))
+            s.setdefault("headers", s.get("headers") or {})
+
+    # attach resource list (qualities / episode map) when possible
+    resources = []
+    try:
+        if season or episode:
+            rpath = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&se={season}&ep={episode}&page=1&perPage=30"
+        else:
+            rpath = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&page=1&perPage=30"
+        rdata = await mb_request("GET", rpath)
+        if isinstance(rdata, dict):
+            for it in rdata.get("list") or []:
+                if not isinstance(it, dict):
+                    continue
+                resources.append({
+                    "resource_id": it.get("resourceId"),
+                    "title": it.get("title"),
+                    "se": it.get("se"),
+                    "ep": it.get("ep"),
+                    "resolution": it.get("resolution"),
+                    "codec": it.get("codecName"),
+                    "size": it.get("size"),
+                    "duration": it.get("duration"),
+                })
+    except Exception:
+        pass
+
+    return {
+        "ok": bool(streams),
+        "subject_id": subject_id,
+        "season": season,
+        "episode": episode,
+        "title": data.get("title") if isinstance(data, dict) else None,
+        "display_resolutions": data.get("displayResolutions") if isinstance(data, dict) else None,
+        "streams": streams,
+        "resources": resources,
+        "count": len(streams),
+        "error": last_err if not streams else None,
+        "provider": "moviebox",
+    }
+
+
+
+@app.get("/mb/search", tags=["MovieBox"])
+async def mb_search_route(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
+    return await mb_search(q, page)
+
+
+@app.get("/mb/detail", tags=["MovieBox"])
+@app.get("/mb/info", tags=["MovieBox"])
+async def mb_detail_route(subjectId: str = Query(..., description="subject id")):
+    data = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subjectId}")
+    if not isinstance(data, dict):
+        data = {}
+    stype = data.get("subjectType") or data.get("stype") or 1
+    seasons = None
+    if int(stype or 1) == 2:
+        try:
+            seasons = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subjectId}")
+        except Exception:
+            seasons = None
+    return {
+        "ok": True,
+        "subject_id": subjectId,
+        "title": data.get("title") or data.get("name"),
+        "type": "series" if int(stype or 1) == 2 else "movie",
+        "description": data.get("description") or data.get("desc"),
+        "poster": data.get("cover") or data.get("poster"),
+        "rating": data.get("imdbRatingValue") or data.get("score"),
+        "year": data.get("releaseDate") or data.get("year"),
+        "seasons": seasons,
+        "raw": data,
+        "provider": "moviebox",
+    }
+
+
+@app.get("/mb/stream", tags=["MovieBox"])
+@app.get("/mb/play", tags=["MovieBox"])
+async def mb_stream_route(
+    subjectId: str = Query(...),
+    season: int = Query(0),
+    episode: int = Query(0),
+    se: Optional[int] = Query(None),
+    ep: Optional[int] = Query(None),
+):
+    s = se if se is not None else season
+    e = ep if ep is not None else episode
+    return await mb_stream(subjectId, s, e)
+
+
+@app.get("/mb/home", tags=["MovieBox"])
+async def mb_home_route(
+    tabId: str = Query("0", description="tab id"),
+    page: int = Query(1, ge=1),
+):
+    data = await mb_request("GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tabId}&version=")
+    return {"ok": True, "tabId": tabId, "page": page, "data": data, "provider": "moviebox"}
+
+
+@app.get("/mb/resources", tags=["MovieBox"])
+async def mb_resources_route(
+    subjectId: str = Query(...),
+    season: int = Query(0),
+    episode: int = Query(0),
+    page: int = Query(1, ge=1),
+    perPage: int = Query(20, ge=1, le=50),
+    resolution: Optional[str] = Query(None),
+):
+    res = f"&resolution={resolution}" if resolution else ""
+    if season == 0 and episode == 0:
+        path = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subjectId}&page={page}&perPage={perPage}{res}"
+    else:
+        path = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subjectId}&se={season}&ep={episode}&page={page}&perPage={perPage}{res}"
+    data = await mb_request("GET", path)
+    return {"ok": True, "subject_id": subjectId, "data": data, "provider": "moviebox"}
+
+
+@app.get("/mb/captions", tags=["MovieBox"])
+async def mb_captions_route(
+    subjectId: str = Query(...),
+    resourceId: str = Query(...),
+):
+    data = await mb_request(
+        "GET",
+        f"/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId={subjectId}&resourceId={resourceId}",
+    )
+    return {"ok": True, "subject_id": subjectId, "captions": data, "provider": "moviebox"}
+
+
+@app.get("/mb/trending", tags=["MovieBox"])
+async def mb_trending_route(page: int = Query(1, ge=1)):
+    return await mb_home_route(tabId="1", page=page)
+
+
+
+
+# =============================================================================
+# MovieBox New — movieboxhd.net H5 catalog + Mobile BFF real CDN streams
+# Tags: ["MovieBox New"]
+# Catalog: h5-api.aoneroom.com (no key)
+# Stream:  mobile play-info → DASH index.mpd CDN (same as MovieBox-TUI)
+# =============================================================================
+
+H5_API = "https://h5-api.aoneroom.com"
+H5_HOST = "movieboxhd.net"
+H5_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Origin": "https://movieboxhd.net",
+    "Referer": "https://movieboxhd.net/",
+}
+
+
+def _mbn_poster(cover) -> Optional[str]:
+    if isinstance(cover, dict):
+        return cover.get("url") or cover.get("thumbnail")
+    if isinstance(cover, str):
+        return cover
+    return None
+
+
+def _mbn_card(x: dict) -> dict:
+    if not isinstance(x, dict):
+        return {}
+    st = x.get("subjectType") or x.get("stype") or x.get("type")
+    type_str = "series" if str(st) in ("2", "tv", "series") else "movie"
+    if str(st) == "6":
+        type_str = "music_video"
+    sid = x.get("subjectId") or x.get("subject_id") or x.get("id")
+    return {
+        "subject_id": str(sid) if sid is not None else None,
+        "title": x.get("title") or x.get("name"),
+        "type": type_str,
+        "subject_type": st,
+        "year": x.get("releaseDate") or x.get("year"),
+        "genre": x.get("genre"),
+        "rating": x.get("imdbRatingValue") or x.get("score"),
+        "poster": _mbn_poster(x.get("cover") or x.get("poster")),
+        "detail_path": x.get("detailPath") or x.get("detail_path"),
+        "description": x.get("description") or "",
+        "has_resource": x.get("hasResource"),
+        "duration": x.get("duration"),
+        "country": x.get("countryName"),
+        "provider": "moviebox-new",
+    }
+
+
+async def _h5_get(path: str, params: Optional[dict] = None) -> Any:
+    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+        r = await client.get(H5_API.rstrip("/") + path, params=params or {}, headers=H5_HEADERS)
+        if r.status_code >= 400:
+            raise HTTPException(502, f"H5 {path} HTTP {r.status_code}: {r.text[:120]}")
+        try:
+            j = r.json()
+        except Exception:
+            raise HTTPException(502, f"H5 {path} non-JSON")
+        if isinstance(j, dict) and j.get("code") not in (0, None, "0") and j.get("data") is None:
+            raise HTTPException(502, f"H5 error: {j.get('message') or j.get('reason') or j}")
+        return j.get("data") if isinstance(j, dict) and "data" in j else j
+
+
+async def _h5_post(path: str, body: dict) -> Any:
+    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+        r = await client.post(H5_API.rstrip("/") + path, json=body, headers=H5_HEADERS)
+        if r.status_code >= 400:
+            raise HTTPException(502, f"H5 POST {path} HTTP {r.status_code}: {r.text[:120]}")
+        try:
+            j = r.json()
+        except Exception:
+            raise HTTPException(502, f"H5 POST {path} non-JSON")
+        if isinstance(j, dict) and j.get("code") not in (0, None, "0") and j.get("data") is None:
+            # search may need token — fall back to mobile
+            raise HTTPException(502, f"H5 error: {j.get('message') or j.get('reason') or j}")
+        return j.get("data") if isinstance(j, dict) and "data" in j else j
+
+
+
+@app.get("/mb/movies", tags=["MovieBox"])
+@app.get("/moviebox/movies", tags=["MovieBox"])
+async def mb_movies(
+    page: int = Query(1, ge=1),
+    tabId: str = Query("0", description="operating tab"),
+):
+    """MovieBox movies shelf from tab-operating + search-style filter."""
+    items = []
+    try:
+        data = await mb_request(
+            "GET",
+            f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tabId}&version=",
+        )
+        # flatten subjects that look like movies
+        blocks = []
+        if isinstance(data, dict):
+            blocks = data.get("operatingList") or data.get("list") or data.get("items") or []
+            if not blocks and isinstance(data.get("data"), dict):
+                blocks = data["data"].get("operatingList") or []
+        for b in blocks or []:
+            if not isinstance(b, dict):
+                continue
+            for s in b.get("subjects") or b.get("subjectList") or b.get("items") or []:
+                if not isinstance(s, dict):
+                    continue
+                st = s.get("subjectType") or s.get("stype") or 1
+                if str(st) in ("2", "tv", "series"):
+                    continue
+                items.append({
+                    "subject_id": str(s.get("subjectId") or s.get("id") or ""),
+                    "title": s.get("title") or s.get("name"),
+                    "type": "movie",
+                    "poster": (s.get("cover") or {}).get("url") if isinstance(s.get("cover"), dict) else s.get("cover") or s.get("poster"),
+                    "rating": s.get("imdbRatingValue") or s.get("score"),
+                    "year": s.get("releaseDate") or s.get("year"),
+                    "provider": "moviebox",
+                })
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120], "items": [], "provider": "moviebox"}
+    # also H5 filter movies if available
+    try:
+        if not items:
+            h5 = await _h5_post("/wefeed-h5api-bff/subject/filter", {"page": page, "perPage": 30})
+            for x in (h5.get("items") if isinstance(h5, dict) else []) or []:
+                if not isinstance(x, dict):
+                    continue
+                if str(x.get("subjectType")) == "2":
+                    continue
+                items.append(_mbn_card(x))
+    except Exception:
+        pass
+    return {"ok": True, "page": page, "count": len(items), "items": items, "provider": "moviebox"}
+
+
+@app.get("/mb/series", tags=["MovieBox"])
+@app.get("/moviebox/series", tags=["MovieBox"])
+async def mb_series(
+    page: int = Query(1, ge=1),
+    tabId: str = Query("0"),
+):
+    """MovieBox TV/series shelf."""
+    items = []
+    try:
+        data = await mb_request(
+            "GET",
+            f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tabId}&version=",
+        )
+        blocks = []
+        if isinstance(data, dict):
+            blocks = data.get("operatingList") or data.get("list") or data.get("items") or []
+            if not blocks and isinstance(data.get("data"), dict):
+                blocks = data["data"].get("operatingList") or []
+        for b in blocks or []:
+            if not isinstance(b, dict):
+                continue
+            for s in b.get("subjects") or b.get("subjectList") or b.get("items") or []:
+                if not isinstance(s, dict):
+                    continue
+                st = s.get("subjectType") or s.get("stype") or 1
+                if str(st) not in ("2", "tv", "series"):
+                    continue
+                items.append({
+                    "subject_id": str(s.get("subjectId") or s.get("id") or ""),
+                    "title": s.get("title") or s.get("name"),
+                    "type": "series",
+                    "poster": (s.get("cover") or {}).get("url") if isinstance(s.get("cover"), dict) else s.get("cover") or s.get("poster"),
+                    "rating": s.get("imdbRatingValue") or s.get("score"),
+                    "year": s.get("releaseDate") or s.get("year"),
+                    "provider": "moviebox",
+                })
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120], "items": [], "provider": "moviebox"}
+    try:
+        if not items:
+            h5 = await _h5_post("/wefeed-h5api-bff/subject/filter", {"page": page, "perPage": 30})
+            for x in (h5.get("items") if isinstance(h5, dict) else []) or []:
+                if not isinstance(x, dict):
+                    continue
+                if str(x.get("subjectType")) != "2":
+                    continue
+                items.append(_mbn_card(x))
+    except Exception:
+        pass
+    return {"ok": True, "page": page, "count": len(items), "items": items, "provider": "moviebox"}
+
+
+@app.get("/mbn/home", tags=["MovieBox New"])
+async def mbn_home(host: str = Query(H5_HOST)):
+    """movieboxhd.net home — platforms + operating sections."""
+    data = await _h5_get("/wefeed-h5api-bff/home", {"host": host})
+    ops = data.get("operatingList") or [] if isinstance(data, dict) else []
+    sections = []
+    for o in ops:
+        if not isinstance(o, dict):
+            continue
+        subs = o.get("subjects") or o.get("subjectList") or []
+        sections.append({
+            "type": o.get("type"),
+            "title": o.get("title"),
+            "position": o.get("position"),
+            "items": [_mbn_card(s) for s in subs if isinstance(s, dict)],
+        })
+    return {
+        "ok": True,
+        "platforms": data.get("platformList") if isinstance(data, dict) else [],
+        "sections": sections,
+        "provider": "moviebox-new",
+        "source": "h5-api.aoneroom.com",
+    }
+
+
+@app.get("/mbn/operating", tags=["MovieBox New"])
+async def mbn_operating(tabId: str = Query("0"), host: str = Query(H5_HOST)):
+    """Banner + Popular Series/Movies and genre shelves."""
+    data = await _h5_get("/wefeed-h5api-bff/tab-operating", {"tabId": tabId, "host": host})
+    ops = data.get("operatingList") or [] if isinstance(data, dict) else []
+    sections = []
+    for o in ops:
+        if not isinstance(o, dict):
+            continue
+        subs = o.get("subjects") or o.get("subjectList") or []
+        sections.append({
+            "type": o.get("type"),
+            "title": o.get("title"),
+            "position": o.get("position"),
+            "count": len(subs) if isinstance(subs, list) else 0,
+            "items": [_mbn_card(s) for s in (subs or []) if isinstance(s, dict)],
+        })
+    return {"ok": True, "tabId": tabId, "sections": sections, "provider": "moviebox-new"}
+
+
+@app.get("/mbn/trending", tags=["MovieBox New"])
+async def mbn_trending(tabId: str = Query("0")):
+    """Trending subject list."""
+    data = await _h5_get("/wefeed-h5api-bff/subject/trending", {"tabId": tabId})
+    items = []
+    if isinstance(data, dict):
+        items = [_mbn_card(x) for x in (data.get("subjectList") or []) if isinstance(x, dict)]
+    return {
+        "ok": True,
+        "tabId": tabId,
+        "count": len(items),
+        "items": items,
+        "pager": data.get("pager") if isinstance(data, dict) else None,
+        "provider": "moviebox-new",
+    }
+
+
+@app.get("/mbn/everyone-search", tags=["MovieBox New"])
+async def mbn_everyone_search():
+    """Popular search keywords on movieboxhd."""
+    data = await _h5_get("/wefeed-h5api-bff/subject/everyone-search")
+    words = []
+    if isinstance(data, dict):
+        for x in data.get("everyoneSearch") or []:
+            if isinstance(x, dict) and x.get("title"):
+                words.append(x["title"])
+            elif isinstance(x, str):
+                words.append(x)
+    return {"ok": True, "keywords": words, "count": len(words), "provider": "moviebox-new"}
+
+
+@app.get("/mbn/suggest", tags=["MovieBox New"])
+async def mbn_suggest(q: str = Query(..., min_length=1)):
+    """Autocomplete suggestions (H5)."""
+    try:
+        data = await _h5_post("/wefeed-h5api-bff/subject/search-suggest", {"keyword": q})
+    except HTTPException:
+        data = await _h5_post("/wefeed-h5api-bff/subject/search-suggest", {"word": q})
+    items = []
+    if isinstance(data, dict):
+        for it in data.get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            sub = it.get("subject")
+            items.append({
+                "word": it.get("word") or it.get("title"),
+                "type": it.get("type"),
+                "subject": _mbn_card(sub) if isinstance(sub, dict) else None,
+            })
+    return {"ok": True, "query": q, "items": items, "provider": "moviebox-new"}
+
+
+@app.get("/mbn/filter", tags=["MovieBox New"])
+@app.get("/mbn/catalog", tags=["MovieBox New"])
+async def mbn_filter(
+    page: int = Query(1, ge=1),
+    perPage: int = Query(20, ge=1, le=50),
+):
+    """Browse catalog (filter page) from movieboxhd H5."""
+    data = await _h5_post("/wefeed-h5api-bff/subject/filter", {"page": page, "perPage": perPage})
+    items = []
+    pager = None
+    if isinstance(data, dict):
+        items = [_mbn_card(x) for x in (data.get("items") or []) if isinstance(x, dict)]
+        pager = data.get("pager")
+    return {
+        "ok": True,
+        "page": page,
+        "perPage": perPage,
+        "count": len(items),
+        "items": items,
+        "pager": pager,
+        "provider": "moviebox-new",
+    }
+
+
+@app.get("/mbn/search", tags=["MovieBox New"])
+async def mbn_search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
+    """Search — tries H5 first, falls back to mobile search/v2 (unlimited)."""
+    # H5 search often needs token → use mobile (already free/unlimited)
+    try:
+        mb = await mb_search(q, page)
+        items = []
+        for it in mb.get("items") or []:
+            items.append({
+                **it,
+                "provider": "moviebox-new",
+            })
+        return {
+            "ok": True,
+            "query": q,
+            "page": page,
+            "count": len(items),
+            "items": items,
+            "source": "mobile-bff",
+            "provider": "moviebox-new",
+        }
+    except Exception as e:
+        # last resort: suggest words only
+        sug = await mbn_suggest(q)
+        return {
+            "ok": False,
+            "query": q,
+            "error": str(e)[:120],
+            "suggestions": sug.get("items"),
+            "provider": "moviebox-new",
+        }
+
+
+@app.get("/mbn/detail", tags=["MovieBox New"])
+async def mbn_detail(subjectId: str = Query(...)):
+    """Full subject metadata via mobile get + season-info (real data)."""
+    data = await mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subjectId}")
+    if not isinstance(data, dict):
+        data = {}
+    stype = data.get("subjectType") or data.get("stype") or 1
+    seasons = None
+    if int(stype or 1) == 2:
+        try:
+            seasons = await mb_request(
+                "GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subjectId}"
+            )
+        except Exception:
+            seasons = None
+    # related via H5
+    related = []
+    try:
+        rec = await _h5_get(
+            "/wefeed-h5api-bff/subject/detail-rec",
+            {"subjectId": subjectId, "page": 1, "perPage": 12},
+        )
+        if isinstance(rec, dict):
+            related = [_mbn_card(x) for x in (rec.get("items") or []) if isinstance(x, dict)]
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "subject_id": subjectId,
+        "title": data.get("title") or data.get("name"),
+        "type": "series" if int(stype or 1) == 2 else "movie",
+        "description": data.get("description") or data.get("desc"),
+        "poster": _mbn_poster(data.get("cover") or data.get("poster")),
+        "rating": data.get("imdbRatingValue") or data.get("score"),
+        "year": data.get("releaseDate") or data.get("year"),
+        "genre": data.get("genre"),
+        "seasons": seasons,
+        "related": related,
+        "raw": data,
+        "provider": "moviebox-new",
+    }
+
+
+@app.get("/mbn/related", tags=["MovieBox New"])
+async def mbn_related(
+    subjectId: str = Query(...),
+    page: int = Query(1, ge=1),
+    perPage: int = Query(12, ge=1, le=30),
+):
+    data = await _h5_get(
+        "/wefeed-h5api-bff/subject/detail-rec",
+        {"subjectId": subjectId, "page": page, "perPage": perPage},
+    )
+    items = []
+    if isinstance(data, dict):
+        items = [_mbn_card(x) for x in (data.get("items") or []) if isinstance(x, dict)]
+    return {"ok": True, "subject_id": subjectId, "count": len(items), "items": items, "provider": "moviebox-new"}
+
+
+@app.get("/mbn/stream", tags=["MovieBox New"])
+@app.get("/mbn/play", tags=["MovieBox New"])
+async def mbn_stream(
+    subjectId: str = Query(...),
+    season: int = Query(0),
+    episode: int = Query(0),
+    se: Optional[int] = Query(None),
+    ep: Optional[int] = Query(None),
+):
+    """
+    Real CDN stream for movie/series (not web embed).
+    Mobile play-info/v2 → signCookie → DASH index.mpd + Cookie headers.
+    """
+    s = se if se is not None else season
+    e = ep if ep is not None else episode
+    st = await mb_stream(subjectId, int(s or 0), int(e or 0))
+    streams = []
+    for item in st.get("streams") or []:
+        url = item.get("url") or item.get("cdn_url")
+        if not url:
+            continue
+        if _is_dummy_url(url) and not item.get("sign_cookie"):
+            continue
+        # if only dummy mp4 but we have dash from cookie, prefer already-resolved url
+        headers = item.get("headers") or _mb_stream_headers(item.get("sign_cookie") or "")
+        streams.append({
+            "format": item.get("format") or ("DASH" if ".mpd" in url else "MP4"),
+            "url": url,
+            "cdn_url": url,
+            "resolution": item.get("resolution"),
+            "codec": item.get("codec") or "hevc",
+            "size": item.get("size"),
+            "duration": item.get("duration"),
+            "headers": headers,
+            "sign_cookie": item.get("sign_cookie") or headers.get("Cookie"),
+            "play_hint": "VLC/mpv: open cdn_url with headers Cookie + Referer. MPD has multi-quality.",
+        })
+    return {
+        "ok": bool(streams),
+        "subject_id": subjectId,
+        "season": int(s or 0),
+        "episode": int(e or 0),
+        "title": st.get("title"),
+        "display_resolutions": st.get("display_resolutions"),
+        "streams": streams,
+        "resources": st.get("resources") or [],
+        "count": len(streams),
+        "error": st.get("error"),
+        "provider": "moviebox-new",
+        "source": "mobile-play-info-cdn",
+        "note": "Real hakunaymatata/sbcdn DASH — Cookie required. Use season+episode for series.",
+    }
+
+
+
+@app.get("/mbn/captions", tags=["MovieBox New"])
+async def mbn_captions(subjectId: str = Query(...), resourceId: str = Query(...)):
+    data = await mb_request(
+        "GET",
+        f"/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId={subjectId}&resourceId={resourceId}",
+    )
+    return {"ok": True, "subject_id": subjectId, "captions": data, "provider": "moviebox-new"}
+
+
+@app.get("/mbn/media-domain", tags=["MovieBox New"])
+async def mbn_media_domain():
+    data = await _h5_get("/wefeed-h5api-bff/media-player/get-domain")
+    return {"ok": True, "domain": data, "provider": "moviebox-new"}
+
+
+@app.get("/mbn/tabs", tags=["MovieBox New"])
+async def mbn_tabs():
+    data = await _h5_get("/wefeed-h5api-bff/tab/get-bottom-tab-list")
+    return {"ok": True, "data": data, "provider": "moviebox-new"}
+
+
+@app.get("/mbn/country", tags=["MovieBox New"])
+async def mbn_country():
+    data = await _h5_get("/wefeed-h5api-bff/country-code")
+    return {"ok": True, "data": data, "provider": "moviebox-new"}
+
+
+
+# =============================================================================
+# CineStream (cinestream.watch) — ToonStream catalog + multi-source streams
+# Base: https://cinestream.watch/api/v1
+# =============================================================================
+
+CS_BASE = "https://cinestream.watch"
+CS_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Referer": "https://cinestream.watch/",
+    "Origin": "https://cinestream.watch",
+}
+CS_PLAYER = "https://gemma416okl.com/play/"
+
+
+async def _cs_get(path: str, params: Optional[dict] = None) -> Any:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        r = await client.get(CS_BASE.rstrip("/") + path, params=params or {}, headers=CS_HEADERS)
+        if r.status_code >= 400:
+            raise HTTPException(502, f"CineStream {path} HTTP {r.status_code}: {r.text[:100]}")
+        try:
+            return r.json()
+        except Exception:
+            return {"raw": r.text[:500]}
+
+
+def _cs_card(x: dict) -> dict:
+    if not isinstance(x, dict):
+        return {}
+    return {
+        "id": x.get("id") or x.get("_id"),
+        "title": x.get("title") or x.get("name"),
+        "poster": x.get("poster") or x.get("posterPath"),
+        "banner": x.get("banner"),
+        "rating": x.get("rating") or x.get("vote_average"),
+        "year": x.get("release_year") or x.get("year"),
+        "type": x.get("type") or "tv",
+        "genres": x.get("genres") or [],
+        "language": x.get("language"),
+        "description": x.get("description") or x.get("overview"),
+        "slug": x.get("slug"),
+        "episode_count": x.get("episodeCount"),
+        "season_count": x.get("seasonCount"),
+        "status": x.get("status"),
+        "watch_page_url": x.get("watch_page_url"),
+        "provider": "cinestream",
+    }
+
+
+@app.get("/cs/home", tags=["CineStream"])
+@app.get("/cinestream/home", tags=["CineStream"])
+async def cs_home():
+    """Trending + popular + top_rated shelves."""
+    out = {}
+    for filt in ("trending", "popular", "top_rated", "fresh-drop", "upcoming"):
+        try:
+            data = await _cs_get("/api/v1/anime", {"filter": filt, "page": 1})
+            items = data.get("results") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            out[filt] = [_cs_card(x) for x in (items or []) if isinstance(x, dict)]
+        except Exception as e:
+            out[filt] = []
+            out[f"{filt}_error"] = str(e)[:80]
+    return {"ok": True, "shelves": out, "provider": "cinestream"}
+
+
+@app.get("/cs/anime", tags=["CineStream"])
+@app.get("/cinestream/anime", tags=["CineStream"])
+@app.get("/cs/browse", tags=["CineStream"])
+async def cs_browse(
+    filter: str = Query("trending", description="trending|popular|top_rated|fresh-drop|upcoming|anime-movies|cartoon-series|cartoon-movies"),
+    page: int = Query(1, ge=1),
+    genre: str = Query(""),
+    type: str = Query("", description="movie|tv|empty for anime"),
+):
+    data = await _cs_get(
+        "/api/v1/anime",
+        {"filter": filter, "page": page, "genre": genre, "type": type},
+    )
+    items = data.get("results") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    cards = [_cs_card(x) for x in (items or []) if isinstance(x, dict)]
+    return {
+        "ok": True,
+        "filter": filter,
+        "page": page,
+        "type": type,
+        "count": len(cards),
+        "items": cards,
+        "pager": data.get("pager") if isinstance(data, dict) else None,
+        "provider": "cinestream",
+    }
+
+
+@app.get("/cs/search", tags=["CineStream"])
+@app.get("/cinestream/search", tags=["CineStream"])
+async def cs_search(q: str = Query(..., min_length=1)):
+    data = await _cs_get("/api/v1/search", {"q": q})
+    items = data if isinstance(data, list) else (data.get("results") if isinstance(data, dict) else [])
+    return {
+        "ok": True,
+        "query": q,
+        "count": len(items or []),
+        "items": [_cs_card(x) for x in (items or []) if isinstance(x, dict)],
+        "provider": "cinestream",
+    }
+
+
+@app.get("/cs/genres", tags=["CineStream"])
+@app.get("/cinestream/genres", tags=["CineStream"])
+async def cs_genres():
+    data = await _cs_get("/api/v1/genres")
+    items = data if isinstance(data, list) else []
+    return {"ok": True, "genres": items, "count": len(items), "provider": "cinestream"}
+
+
+@app.get("/cs/hindi-dubbed", tags=["CineStream"])
+async def cs_hindi_dubbed():
+    data = await _cs_get("/api/v1/hindi-dubbed")
+    items = data if isinstance(data, list) else []
+    return {"ok": True, "items": [_cs_card(x) for x in items if isinstance(x, dict)], "count": len(items), "provider": "cinestream"}
+
+
+@app.get("/cs/detail", tags=["CineStream"])
+@app.get("/cs/details", tags=["CineStream"])
+@app.get("/cinestream/detail", tags=["CineStream"])
+async def cs_detail(id: str = Query(..., description="e.g. toon_jojos-bizarre-adventure")):
+    data = await _cs_get("/api/v1/anime/details", {"id": id})
+    if not isinstance(data, dict):
+        raise HTTPException(502, "invalid detail response")
+    card = _cs_card(data)
+    card.update({
+        "description": data.get("description"),
+        "banner": data.get("banner"),
+        "related": [_cs_card(x) for x in (data.get("related") or []) if isinstance(x, dict)],
+        "recommendations": [_cs_card(x) for x in (data.get("recommendations") or []) if isinstance(x, dict)],
+        "trailer": data.get("trailer"),
+        "tags": data.get("tags"),
+        "raw": data,
+    })
+    return {"ok": True, **card, "provider": "cinestream"}
+
+
+@app.get("/cs/episodes", tags=["CineStream"])
+@app.get("/cinestream/episodes", tags=["CineStream"])
+async def cs_episodes(
+    animeId: str = Query(..., description="toon_... id"),
+    season: Optional[int] = Query(None),
+):
+    data = await _cs_get("/api/v1/episodes", {"animeId": animeId})
+    eps = data if isinstance(data, list) else []
+    if season is not None:
+        eps = [e for e in eps if isinstance(e, dict) and int(e.get("season") or 0) == int(season)]
+    out = []
+    for e in eps:
+        if not isinstance(e, dict):
+            continue
+        out.append({
+            "id": e.get("id"),
+            "anime_id": e.get("animeId"),
+            "season": e.get("season"),
+            "episode": e.get("episode"),
+            "title": e.get("title"),
+            "thumbnail": e.get("thumbnail"),
+            "url": e.get("url"),
+            "sources_count": len(e.get("sources") or []),
+            "provider": "cinestream",
+        })
+    return {"ok": True, "anime_id": animeId, "season": season, "count": len(out), "episodes": out, "provider": "cinestream"}
+
+
+@app.get("/cs/stream", tags=["CineStream"])
+@app.get("/cs/play", tags=["CineStream"])
+@app.get("/cinestream/stream", tags=["CineStream"])
+async def cs_stream(
+    animeId: str = Query(...),
+    season: int = Query(1, ge=0),
+    episode: int = Query(1, ge=0),
+):
+    """
+    Multi-source stream list for an episode (from CineStream/ToonStream catalog).
+    Returns iframe hosts + any direct-looking CDN URLs found in sources.
+    """
+    data = await _cs_get("/api/v1/episodes", {"animeId": animeId})
+    eps = data if isinstance(data, list) else []
+    pick = None
+    for e in eps:
+        if not isinstance(e, dict):
+            continue
+        try:
+            es, ee = int(e.get("season") or 0), int(e.get("episode") or 0)
+        except Exception:
+            continue
+        if es == int(season) and ee == int(episode):
+            pick = e
+            break
+    if not pick:
+        for e in eps:
+            if not isinstance(e, dict):
+                continue
+            try:
+                if int(e.get("episode") or 0) == int(episode):
+                    pick = e
+                    break
+            except Exception:
+                continue
+    if not pick and eps:
+        for e in eps:
+            if isinstance(e, dict):
+                pick = e
+                break
+    if not pick:
+        raise HTTPException(404, "episode not found")
+
+    sources = []
+    for s in pick.get("sources") or []:
+        if not isinstance(s, dict):
+            continue
+        url = s.get("url") or ""
+        if not url:
+            continue
+        stype = s.get("type") or "iframe"
+        label = s.get("label") or "source"
+        # classify
+        kind = "iframe"
+        if ".m3u8" in url:
+            kind = "hls"
+            stype = "hls"
+        elif ".mp4" in url and "embed" not in url:
+            kind = "mp4"
+            stype = "mp4"
+        elif "as-cdn" in url or "/video/" in url:
+            kind = "cdn"
+        sources.append({
+            "label": label,
+            "type": stype,
+            "kind": kind,
+            "url": url,
+            "play_url": url,
+        })
+
+    # optional gemma player link
+    player = f"{CS_PLAYER}{animeId}/{season}/{episode}"
+    sources.append({
+        "label": "Gemma Player",
+        "type": "iframe",
+        "kind": "player",
+        "url": player,
+        "play_url": player,
+    })
+
+    return {
+        "ok": bool(sources),
+        "anime_id": animeId,
+        "season": season,
+        "episode": episode,
+        "title": pick.get("title"),
+        "thumbnail": pick.get("thumbnail"),
+        "episode_url": pick.get("url"),
+        "sources": sources,
+        "count": len(sources),
+        "cdn_sources": [s for s in sources if s.get("kind") in ("hls", "mp4", "cdn")],
+        "provider": "cinestream",
+        "note": "Prefer kind=cdn/hls/mp4 when available; iframe hosts need embed player.",
+    }
+
+
+@app.get("/cs/resolve-netmirror", tags=["CineStream"])
+async def cs_resolve_netmirror(
+    id: str = Query(...),
+    dp: str = Query(""),
+    title: str = Query(""),
+    se: int = Query(0),
+    ep: int = Query(0),
+):
+    data = await _cs_get(
+        "/api/v1/resolve-netmirror",
+        {"id": id, "dp": dp, "title": title, "se": se, "ep": ep},
+    )
+    return {"ok": True, "data": data, "provider": "cinestream"}
+
+
+@app.get("/cs/admin-store", tags=["CineStream"])
+async def cs_admin_store():
+    data = await _cs_get("/api/v1/admin-store")
+    return {"ok": True, "data": data, "provider": "cinestream"}
+
+
+@app.get("/cs/broken-videos", tags=["CineStream"])
+async def cs_broken_videos():
+    data = await _cs_get("/api/v1/broken-videos")
+    return {"ok": True, "items": data if isinstance(data, list) else data, "provider": "cinestream"}
+
+
+@app.get("/cs/hidden-items", tags=["CineStream"])
+async def cs_hidden_items():
+    data = await _cs_get("/api/v1/hidden-items")
+    return {"ok": True, "items": data if isinstance(data, list) else data, "provider": "cinestream"}
+
+
+@app.get("/cs/missing-catalog", tags=["CineStream"])
+async def cs_missing_catalog():
+    data = await _cs_get("/api/v1/missing-catalog")
+    return {"ok": True, "items": data if isinstance(data, list) else data, "provider": "cinestream"}
+
+
+
+# =============================================================================
+# PirateBot (theogpiratebot.online) — multi-tier CF edge + TMDB + stream servers
+# Edge API: https://theogpiratebot-tmdb-proxy.gleamcasteheavan.workers.dev
+# Routes: /tmdb/*, /api/tmdb/*, /api/toon-stream, /api/downloads, /api/stream-check,
+#         /api/anime-metadata, /api/anime-episodes, /api/anime-schedule, /api/anime-trending
+# =============================================================================
+
+PB_WORKERS = [
+    "https://theogpiratebot-tmdb-proxy.gleamcasteheavan.workers.dev",
+    "https://sexy.dryfruits.workers.dev",
+    "https://damp-bird-e8d5.moviehub4u1209.workers.dev",
+    "https://soft.niggasoup45.workers.dev",
+    "https://juicypuhh.request-moviehub4u.workers.dev",
+    "https://loudwolf.contact-theogpiratebot.workers.dev",
+    "https://froxyproxy.gleamcasteheavan-960.workers.dev",
+]
+PB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Referer": "https://theogpiratebot.online/",
+    "Origin": "https://theogpiratebot.online",
+}
+
+# Stream server templates from serverRegistry (theogpiratebot)
+PB_SERVERS_MOVIE = [
+    ("vidstuck", "https://vidstuck.xyz/embed/movie/{id}?branding=TheOGPirateBot&server=centaurus&overlay=true&color=ffffff"),
+    ("vidfast", "https://vidfast.vc/movie/{id}?autoPlay=true"),
+    ("roxy", "https://zxcstream.xyz/player/movie/{id}?dubLang=en&server=0"),
+    ("bingr", "https://bingr.one/watch/movie/{id}"),
+    ("nxsha", "https://nxsha.space/embed/movie/{id}?lang=hi&disable_app_ad=true"),
+]
+PB_SERVERS_TV = [
+    ("vidstuck", "https://vidstuck.xyz/embed/tv/{id}/{s}/{e}?branding=TheOGPirateBot&server=centaurus&overlay=true&color=ffffff"),
+    ("vidfast", "https://vidfast.vc/tv/{id}/{s}/{e}?autoPlay=true"),
+    ("roxy", "https://zxcstream.xyz/player/tv/{id}/{s}/{e}?dubLang=en&server=0"),
+    ("bingr", "https://bingr.one/watch/tv/{id}/{s}/{e}"),
+    ("nxsha", "https://nxsha.space/embed/tv/{id}/{s}/{e}?lang=hi&disable_app_ad=true"),
+]
+PB_ANIME_SERVERS = [
+    ("megaplay_sub", "https://megaplay.buzz/stream/ani/{id}/{ep}/sub?autoplay=true"),
+    ("megaplay_dub", "https://megaplay.buzz/stream/ani/{id}/{ep}/dub?autoplay=true"),
+    ("zoko_sub", "https://zokoanime.video/stream/ani/{id}/{ep}/sub"),
+    ("zoko_dub", "https://zokoanime.video/stream/ani/{id}/{ep}/dub"),
+    ("4animo_sub", "https://cdn.4animo.xyz/embed/hd-3/ani/{id}/{ep}/sub?k=1&autoplay=1"),
+    ("4animo_dub", "https://cdn.4animo.xyz/embed/hd-3/ani/{id}/{ep}/dub?k=1&autoplay=1"),
+]
+
+
+async def _pb_get(path: str, params: Optional[dict] = None) -> Any:
+    """Fetch from PirateBot CF workers with tier failover."""
+    last_err = None
+    async with httpx.AsyncClient(timeout=28.0, follow_redirects=True) as client:
+        for base in PB_WORKERS:
+            url = base.rstrip("/") + path
+            try:
+                r = await client.get(url, params=params or {}, headers=PB_HEADERS)
+                if r.status_code in (429, 500, 502, 503, 504, 520, 521, 522, 523, 524):
+                    last_err = f"{base} HTTP {r.status_code}"
+                    continue
+                try:
+                    return r.json()
+                except Exception:
+                    return {"raw": r.text[:500], "status": r.status_code, "worker": base}
+            except Exception as e:
+                last_err = f"{base}: {type(e).__name__}"
+                continue
+    raise HTTPException(502, f"PirateBot edge failed: {last_err}")
+
+
+def _pb_card(x: dict, media: str = "movie") -> dict:
+    if not isinstance(x, dict):
+        return {}
+    mid = x.get("id")
+    title = x.get("title") or x.get("name")
+    poster = x.get("poster_path") or x.get("poster")
+    if poster and isinstance(poster, str) and poster.startswith("/"):
+        poster = f"https://image.tmdb.org/t/p/w500{poster}"
+    backdrop = x.get("backdrop_path")
+    if backdrop and isinstance(backdrop, str) and backdrop.startswith("/"):
+        backdrop = f"https://image.tmdb.org/t/p/w1280{backdrop}"
+    return {
+        "id": mid,
+        "tmdb_id": mid,
+        "title": title,
+        "overview": x.get("overview"),
+        "poster": poster,
+        "backdrop": backdrop,
+        "rating": x.get("vote_average"),
+        "date": x.get("release_date") or x.get("first_air_date"),
+        "media_type": x.get("media_type") or media,
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/health", tags=["PirateBot"])
+@app.get("/piratebot/health", tags=["PirateBot"])
+async def pb_health():
+    data = await _pb_get("/api/health")
+    return {"ok": True, "data": data, "workers": PB_WORKERS, "provider": "piratebot"}
+
+
+@app.get("/pb/site-access", tags=["PirateBot"])
+async def pb_site_access():
+    data = await _pb_get("/api/site-access")
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/tmdb/{path:path}", tags=["PirateBot"])
+async def pb_tmdb_proxy(path: str, request: Request):
+    """Proxy any TMDB path via PirateBot CF edge (no API key needed)."""
+    params = dict(request.query_params)
+    data = await _pb_get(f"/tmdb/{path.lstrip('/')}", params)
+    return data if isinstance(data, dict) else {"data": data}
+
+
+@app.get("/pb/trending", tags=["PirateBot"])
+async def pb_trending(
+    media: str = Query("all", description="all|movie|tv"),
+    window: str = Query("week", description="day|week"),
+    page: int = Query(1, ge=1),
+):
+    path = f"/tmdb/trending/{media}/{window}"
+    data = await _pb_get(path, {"page": page})
+    results = data.get("results") if isinstance(data, dict) else []
+    return {
+        "ok": True,
+        "media": media,
+        "window": window,
+        "page": page,
+        "count": len(results or []),
+        "items": [_pb_card(x, x.get("media_type") or media) for x in (results or []) if isinstance(x, dict)],
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/popular", tags=["PirateBot"])
+async def pb_popular(media: str = Query("movie"), page: int = Query(1, ge=1)):
+    media = "tv" if media in ("tv", "series") else "movie"
+    data = await _pb_get(f"/tmdb/{media}/popular", {"page": page})
+    results = data.get("results") if isinstance(data, dict) else []
+    return {
+        "ok": True,
+        "media": media,
+        "page": page,
+        "count": len(results or []),
+        "items": [_pb_card(x, media) for x in (results or []) if isinstance(x, dict)],
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/top-rated", tags=["PirateBot"])
+async def pb_top_rated(media: str = Query("movie"), page: int = Query(1, ge=1)):
+    media = "tv" if media in ("tv", "series") else "movie"
+    data = await _pb_get(f"/tmdb/{media}/top_rated", {"page": page})
+    results = data.get("results") if isinstance(data, dict) else []
+    return {
+        "ok": True,
+        "media": media,
+        "items": [_pb_card(x, media) for x in (results or []) if isinstance(x, dict)],
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/search", tags=["PirateBot"])
+async def pb_search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
+    data = await _pb_get("/tmdb/search/multi", {"query": q, "page": page})
+    results = data.get("results") if isinstance(data, dict) else []
+    return {
+        "ok": True,
+        "query": q,
+        "count": len(results or []),
+        "items": [_pb_card(x, x.get("media_type") or "movie") for x in (results or []) if isinstance(x, dict)],
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/movie/{tmdb_id}", tags=["PirateBot"])
+async def pb_movie_detail(tmdb_id: int):
+    data = await _pb_get(f"/tmdb/movie/{tmdb_id}", {"append_to_response": "credits,videos,similar,recommendations,external_ids"})
+    card = _pb_card(data, "movie") if isinstance(data, dict) else {}
+    return {"ok": True, **card, "detail": data, "provider": "piratebot"}
+
+
+@app.get("/pb/tv/{tmdb_id}", tags=["PirateBot"])
+async def pb_tv_detail(tmdb_id: int):
+    data = await _pb_get(f"/tmdb/tv/{tmdb_id}", {"append_to_response": "credits,videos,similar,recommendations,external_ids,content_ratings"})
+    card = _pb_card(data, "tv") if isinstance(data, dict) else {}
+    return {"ok": True, **card, "detail": data, "provider": "piratebot"}
+
+
+@app.get("/pb/tv/{tmdb_id}/season/{season}", tags=["PirateBot"])
+async def pb_tv_season(tmdb_id: int, season: int):
+    data = await _pb_get(f"/tmdb/tv/{tmdb_id}/season/{season}")
+    return {"ok": True, "tmdb_id": tmdb_id, "season": season, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/stream", tags=["PirateBot"])
+@app.get("/pb/play", tags=["PirateBot"])
+@app.get("/piratebot/stream", tags=["PirateBot"])
+async def pb_stream(
+    tmdb_id: int = Query(...),
+    type: str = Query("movie", description="movie|tv"),
+    season: int = Query(1, ge=0),
+    episode: int = Query(1, ge=0),
+    title: Optional[str] = Query(None),
+):
+    """
+    Multi-server stream list (embed + toon-stream resolver when available).
+    Same servers as theogpiratebot.online player.
+    """
+    is_tv = type.lower() in ("tv", "series", "show")
+    # resolve title if missing
+    if not title:
+        try:
+            path = f"/tmdb/tv/{tmdb_id}" if is_tv else f"/tmdb/movie/{tmdb_id}"
+            meta = await _pb_get(path)
+            if isinstance(meta, dict):
+                title = meta.get("name") or meta.get("title")
+        except Exception:
+            title = None
+
+    servers = []
+    templates = PB_SERVERS_TV if is_tv else PB_SERVERS_MOVIE
+    for key, tmpl in templates:
+        url = tmpl.format(id=tmdb_id, s=season, e=episode)
+        servers.append({
+            "key": key,
+            "label": key,
+            "type": "embed",
+            "url": url,
+            "play_url": url,
+        })
+
+    # toon-stream edge resolver
+    toon = None
+    try:
+        params = {
+            "type": "tv" if is_tv else "movie",
+            "id": str(tmdb_id),
+            "title": title or str(tmdb_id),
+        }
+        if is_tv:
+            params["season"] = str(season)
+            params["episode"] = str(episode)
+        toon = await _pb_get("/api/toon-stream", params)
+        if isinstance(toon, dict) and toon.get("success") and (toon.get("url") or toon.get("sources")):
+            if toon.get("url"):
+                servers.insert(0, {
+                    "key": "toonstream",
+                    "label": "ToonStream CDN",
+                    "type": "cdn" if any(x in str(toon.get("url")) for x in (".m3u8", ".mp4", "as-cdn")) else "iframe",
+                    "url": toon.get("url"),
+                    "play_url": toon.get("url"),
+                })
+            for s in toon.get("sources") or []:
+                if isinstance(s, dict) and s.get("url"):
+                    servers.append({
+                        "key": "toonstream",
+                        "label": s.get("label") or "ToonStream",
+                        "type": s.get("type") or "iframe",
+                        "url": s["url"],
+                        "play_url": s["url"],
+                    })
+    except Exception as e:
+        toon = {"error": str(e)[:120]}
+
+    # downloads relay
+    downloads = None
+    try:
+        params = {"type": "tv" if is_tv else "movie", "id": str(tmdb_id), "title": title or str(tmdb_id)}
+        if is_tv:
+            params["season"] = str(season)
+            params["episode"] = str(episode)
+        downloads = await _pb_get("/api/downloads", params)
+    except Exception as e:
+        downloads = {"error": str(e)[:120]}
+
+    return {
+        "ok": bool(servers),
+        "tmdb_id": tmdb_id,
+        "type": "tv" if is_tv else "movie",
+        "title": title,
+        "season": season if is_tv else 0,
+        "episode": episode if is_tv else 0,
+        "servers": servers,
+        "count": len(servers),
+        "toon_stream": toon,
+        "downloads": downloads,
+        "provider": "piratebot",
+        "note": "Embed servers from theogpiratebot registry; toon-stream CDN when resolved.",
+    }
+
+
+@app.get("/pb/anime/stream", tags=["PirateBot"])
+async def pb_anime_stream(
+    anilist_id: int = Query(...),
+    episode: int = Query(1, ge=1),
+):
+    """Anime multi-server embeds (MegaPlay / Zoko / 4animo)."""
+    servers = []
+    for key, tmpl in PB_ANIME_SERVERS:
+        url = tmpl.format(id=anilist_id, ep=episode)
+        servers.append({"key": key, "label": key, "type": "embed", "url": url, "play_url": url})
+    return {
+        "ok": True,
+        "anilist_id": anilist_id,
+        "episode": episode,
+        "servers": servers,
+        "count": len(servers),
+        "provider": "piratebot",
+    }
+
+
+@app.get("/pb/stream-check", tags=["PirateBot"])
+async def pb_stream_check(url: str = Query(...)):
+    data = await _pb_get("/api/stream-check", {"url": url})
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/toon-stream", tags=["PirateBot"])
+async def pb_toon_stream(
+    type: str = Query(..., description="movie|tv"),
+    id: str = Query(...),
+    title: str = Query(...),
+    season: int = Query(1),
+    episode: int = Query(1),
+):
+    params = {"type": type, "id": id, "title": title}
+    if type in ("tv", "series"):
+        params["season"] = str(season)
+        params["episode"] = str(episode)
+    data = await _pb_get("/api/toon-stream", params)
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/downloads", tags=["PirateBot"])
+async def pb_downloads(
+    type: str = Query("movie"),
+    id: str = Query(...),
+    title: str = Query(""),
+    season: int = Query(0),
+    episode: int = Query(0),
+):
+    params = {"type": type, "id": id, "title": title or id}
+    if type in ("tv", "series"):
+        params["season"] = str(season)
+        params["episode"] = str(episode)
+    data = await _pb_get("/api/downloads", params)
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/anime-metadata", tags=["PirateBot"])
+async def pb_anime_metadata(title: str = Query(...)):
+    data = await _pb_get("/api/anime-metadata", {"title": title})
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/anime-episodes", tags=["PirateBot"])
+async def pb_anime_episodes(anilist_id: int = Query(...)):
+    data = await _pb_get("/api/anime-episodes", {"anilist_id": anilist_id})
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/anime-schedule", tags=["PirateBot"])
+async def pb_anime_schedule():
+    data = await _pb_get("/api/anime-schedule")
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
+@app.get("/pb/anime-trending", tags=["PirateBot"])
+async def pb_anime_trending():
+    data = await _pb_get("/api/anime-trending")
+    return {"ok": True, "data": data, "provider": "piratebot"}
+
+
 # PaxSenix-compatible MovieBox routes (direct aoneroom — no API key, unlimited)
 # Same upstream as api.paxsenix.org/moviebox/* but without their rate limit.
 # NOTE: "MP4" label from upstream is often a dummy notice file; real video is
@@ -10048,7 +9102,7 @@ async def tools_password(length: int = Query(16, ge=6, le=64), symbols: bool = T
     if symbols:
         alphabet += "!@#$%^&*()-_=+"
     pwd = "".join(random.choice(alphabet) for _ in range(length))
-    return {"ok": True, "password": pwd, "length": length}
+    return {"ok": True, "password": pwd, "length": length}E
 
 
 @app.get("/tools/uuid", tags=["Tools"])
@@ -10534,6 +9588,607 @@ code{background:#1a2332;padding:.1rem .35rem;border-radius:4px}
 <p>Place <code>web/index.html</code> next to <code>api.py</code> to enable the UI.</p>
 </div></body></html>
 """
+
+
+
+# =============================================================================
+# AI · Chat · Image · TempMail  (native free backends — no PaxSenix key needed)
+# Pollinations.ai (text + image) · optional GROQ/OPENROUTER/GEMINI/OPENAI keys
+# =============================================================================
+
+_AI_MODELS = [
+    {"id": "openai", "name": "OpenAI (via Pollinations)", "owned_by": "pollinations", "tier": "free", "backend": "pollinations"},
+    {"id": "openai-fast", "name": "GPT-OSS Fast", "owned_by": "pollinations", "tier": "free", "backend": "pollinations"},
+    {"id": "deepseek", "name": "DeepSeek", "owned_by": "pollinations", "tier": "free", "backend": "pollinations"},
+    {"id": "mistral", "name": "Mistral", "owned_by": "pollinations", "tier": "free", "backend": "pollinations"},
+    {"id": "gemini", "name": "Gemini", "owned_by": "pollinations", "tier": "free", "backend": "pollinations"},
+    {"id": "claude", "name": "Claude", "owned_by": "pollinations", "tier": "free", "backend": "pollinations"},
+    {"id": "groq", "name": "Groq Llama (needs GROQ_API_KEY)", "owned_by": "groq", "tier": "free-key", "backend": "groq"},
+    {"id": "openrouter", "name": "OpenRouter auto (needs OPENROUTER_API_KEY)", "owned_by": "openrouter", "tier": "free-key", "backend": "openrouter"},
+]
+
+
+async def _ai_chat_pollinations(messages: list, model: str = "openai", system: Optional[str] = None) -> dict:
+    msgs = list(messages or [])
+    if system:
+        msgs = [{"role": "system", "content": system}] + msgs
+    payload = {"model": model or "openai", "messages": msgs}
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        r = await client.post(
+            "https://text.pollinations.ai/openai",
+            json=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "ElitePlex/5.19", "Accept": "application/json"},
+        )
+        if r.status_code != 200:
+            # fallback simple GET
+            user = ""
+            for m in reversed(msgs):
+                if m.get("role") == "user":
+                    user = m.get("content") or ""
+                    break
+            if user:
+                r2 = await client.get(
+                    f"https://text.pollinations.ai/{quote(user[:1500])}",
+                    headers={"User-Agent": "ElitePlex/5.19"},
+                )
+                if r2.status_code == 200 and r2.text:
+                    return {
+                        "id": f"poll_{int(time.time())}",
+                        "object": "chat.completion",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": r2.text}, "finish_reason": "stop"}],
+                        "model": model,
+                        "provider": "pollinations-get",
+                    }
+            return {"ok": False, "error": f"pollinations HTTP {r.status_code}", "body": r.text[:300]}
+        j = r.json()
+        j["provider"] = "pollinations"
+        return j
+
+
+async def _ai_chat_groq(messages: list, model: str = "llama-3.3-70b-versatile") -> dict:
+    key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if not key:
+        return {"ok": False, "error": "GROQ_API_KEY not set"}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages},
+        )
+        if r.status_code != 200:
+            return {"ok": False, "error": r.text[:300]}
+        j = r.json()
+        j["provider"] = "groq"
+        return j
+
+
+async def _ai_chat_openrouter(messages: list, model: str = "openrouter/auto") -> dict:
+    key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if not key:
+        return {"ok": False, "error": "OPENROUTER_API_KEY not set"}
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        r = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://ElitePlex.local",
+                "X-Title": "ElitePlex",
+            },
+            json={"model": model, "messages": messages},
+        )
+        if r.status_code != 200:
+            return {"ok": False, "error": r.text[:300]}
+        j = r.json()
+        j["provider"] = "openrouter"
+        return j
+
+
+async def _ai_chat_gemini(messages: list, model: str = "gemini-2.0-flash") -> dict:
+    key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+    if not key:
+        return {"ok": False, "error": "GEMINI_API_KEY not set"}
+    # convert messages
+    contents = []
+    system = None
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            system = m.get("content")
+            continue
+        contents.append({
+            "role": "user" if role == "user" else "model",
+            "parts": [{"text": m.get("content") or ""}],
+        })
+    body: Dict[str, Any] = {"contents": contents}
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(url, json=body)
+        if r.status_code != 200:
+            return {"ok": False, "error": r.text[:300]}
+        j = r.json()
+        text = ""
+        try:
+            text = j["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            text = str(j)[:500]
+        return {
+            "id": f"gem_{int(time.time())}",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "model": model,
+            "provider": "gemini",
+        }
+
+
+async def _ai_chat_route(messages: list, model: str = "openai", system: Optional[str] = None) -> dict:
+    m = (model or "openai").lower().strip()
+    if m in ("groq", "llama", "llama3") or m.startswith("llama-"):
+        return await _ai_chat_groq(messages, model if m.startswith("llama") else "llama-3.3-70b-versatile")
+    if m in ("openrouter", "auto") or "/" in m and not m.startswith("openai"):
+        if os.environ.get("OPENROUTER_API_KEY"):
+            return await _ai_chat_openrouter(messages, model if "/" in m else "openrouter/auto")
+    if m.startswith("gemini") and (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+        return await _ai_chat_gemini(messages, model if m.startswith("gemini-") else "gemini-2.0-flash")
+    # default: pollinations free
+    return await _ai_chat_pollinations(messages, model=model if model else "openai", system=system)
+
+
+
+@app.get("/health/cookies", tags=["Meta"])
+async def health_cookies():
+    """Show whether YouTube cookies.txt is loaded (does not expose cookie values)."""
+    path = _resolve_ytdlp_cookies()
+    info = {"ok": bool(path), "loaded": bool(path), "path": None, "size": 0, "has_sid": False}
+    if path:
+        try:
+            info["path"] = path
+            info["size"] = os.path.getsize(path)
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                body = f.read(50000)
+            real = 0
+            for line in body.splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split("	")
+                if len(parts) >= 7 and parts[5] in ("LOGIN_INFO", "SID", "__Secure-1PSID", "SAPISID", "APISID", "HSID", "SSID"):
+                    real += 1
+            info["has_sid"] = real >= 1
+            info["cookie_rows"] = real
+            if "# TEMPLATE" in body or "REPLACE_ME" in body:
+                info["ok"] = False
+                info["loaded"] = False
+                info["note"] = "Template cookies.txt only — export real YouTube cookies from browser"
+        except Exception as e:
+            info["error"] = str(e)[:80]
+    else:
+        info["note"] = (
+            "No cookies loaded. Export from browser → cookies.txt next to api.py, "
+            "or set YTDLP_COOKIES / YTDLP_COOKIES_B64 env. See cookies.txt template."
+        )
+    return info
+
+
+@app.get("/yt/player/{video_id}", tags=["YouTube"])
+@app.get("/youtube/player/{video_id}", tags=["YouTube"])
+async def yt_player(video_id: str):
+    """Direct CDN streams via InnerTube (ANDROID) — no yt-dlp, unlimited."""
+    data = await _innertube_player(video_id.replace("yt:", "").strip())
+    if not data.get("ok"):
+        raise HTTPException(502, data.get("error") or "player failed")
+    return data
+
+
+@app.get("/dl/yt", tags=["Downloader"])
+@app.get("/dl/youtube", tags=["Downloader"])
+async def dl_youtube_native(
+    url: str = Query(..., description="YouTube URL or video id"),
+    quality: str = Query("720", description="360|480|720|1080|best|audio"),
+):
+    """YouTube direct CDN via InnerTube (no yt-dlp). quality=audio for audio-only."""
+    vid = _extract_youtube_id(url) or url.strip()
+    if not re.match(r"^[\w-]{6,20}$", vid or ""):
+        raise HTTPException(400, "invalid youtube url/id")
+    data = await _innertube_player(vid)
+    if not data.get("ok"):
+        raise HTTPException(502, data.get("error") or "extract failed")
+    q = (quality or "720").lower()
+    chosen = None
+    if q in ("audio", "mp3", "m4a", "bestaudio"):
+        chosen = data.get("audio_url")
+        kind = "audio"
+    else:
+        target = {"360": 360, "480": 480, "720": 720, "1080": 1080, "best": 9999}.get(q, 720)
+        # prefer progressive
+        progressive = [v for v in (data.get("video_streams") or []) if v.get("progressive")]
+        pool = progressive or (data.get("video_streams") or [])
+        # closest height <= target
+        pool_sorted = sorted(pool, key=lambda x: abs((x.get("height") or 0) - target))
+        for v in pool_sorted:
+            h = v.get("height") or 0
+            if target >= 9999 or h <= target + 80:
+                chosen = v.get("url")
+                break
+        if not chosen and pool:
+            chosen = pool[0].get("url")
+        if not chosen:
+            chosen = data.get("video_url") or data.get("audio_url")
+        kind = "video"
+    return {
+        "ok": bool(chosen),
+        "provider": data.get("provider"),
+        "title": data.get("title"),
+        "thumbnail": data.get("thumb"),
+        "duration": data.get("duration"),
+        "url": chosen,
+        "directUrl": chosen,
+        "download_url": chosen,
+        "quality": quality,
+        "kind": kind,
+        "audio_url": data.get("audio_url"),
+        "video_url": data.get("video_url"),
+        "formats": (data.get("formats") or [])[:20],
+        "video_id": vid,
+    }
+
+
+@app.get("/lyrics/synced", tags=["Lyrics"])
+async def lyrics_synced(
+    title: str = Query(..., min_length=1),
+    artist: str = Query(""),
+):
+    """Synced LRC lyrics via LRCLIB."""
+    q = f"{title} {artist}".strip()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get("https://lrclib.net/api/search", params={"q": q})
+        arr = r.json() if r.status_code == 200 else []
+    if not arr:
+        return {"ok": False, "title": title, "artist": artist, "synced": None, "plain": None}
+    best = arr[0]
+    return {
+        "ok": True,
+        "title": best.get("trackName") or title,
+        "artist": best.get("artistName") or artist,
+        "album": best.get("albumName"),
+        "duration": best.get("duration"),
+        "synced": best.get("syncedLyrics"),
+        "plain": best.get("plainLyrics"),
+        "provider": "lrclib",
+        "id": best.get("id"),
+    }
+
+
+@app.get("/yt/stream/{video_id}", tags=["YouTube"])
+@app.get("/youtube/stream/{video_id}", tags=["YouTube"])
+async def yt_stream_cdn(video_id: str, audio: bool = Query(True)):
+    """Best-effort direct CDN: InnerTube → loader.to."""
+    vid = video_id.replace("yt:", "").strip()
+    data = await _innertube_player(vid)
+    if data.get("ok"):
+        url = data.get("audio_url") if audio else (data.get("video_url") or data.get("audio_url"))
+        return {
+            "ok": True,
+            "video_id": vid,
+            "title": data.get("title"),
+            "url": url,
+            "directUrl": url,
+            "audio_url": data.get("audio_url"),
+            "video_url": data.get("video_url"),
+            "provider": data.get("provider"),
+        }
+    ld = await _loader_to_youtube(vid, fmt="mp3" if audio else "360")
+    if ld.get("ok"):
+        return {**ld, "ok": True}
+    raise HTTPException(502, {"error": "cdn unavailable", "innertube": data.get("error"), "loader": ld.get("error")})
+
+
+@app.get("/music/home", tags=["Music"])
+async def music_home_all():
+    sections = []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get("https://api.deezer.com/chart/0/tracks")
+            if r.status_code == 200:
+                tracks = []
+                for it in (r.json().get("data") or [])[:15]:
+                    tracks.append({
+                        "id": it.get("id"),
+                        "title": it.get("title"),
+                        "artist": (it.get("artist") or {}).get("name"),
+                        "thumb": (it.get("album") or {}).get("cover_medium"),
+                        "preview": it.get("preview"),
+                        "audio_url": it.get("preview"),
+                        "provider": "deezer",
+                    })
+                sections.append({"title": "Deezer Charts", "items": tracks})
+    except Exception:
+        pass
+    return {"ok": True, "sections": sections, "provider": "aggregate"}
+
+@app.get("/v1/models", tags=["AI"])
+async def v1_models():
+    """List available LLM models (free Pollinations + optional keyed providers)."""
+    data = []
+    for m in _AI_MODELS:
+        data.append({
+            "id": m["id"],
+            "object": "model",
+            "owned_by": m["owned_by"],
+            "tier": m["tier"],
+            "backend": m["backend"],
+            "name": m["name"],
+        })
+    # try live pollinations list
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get("https://text.pollinations.ai/models")
+            if r.status_code == 200:
+                live = r.json()
+                if isinstance(live, list):
+                    for item in live:
+                        if isinstance(item, dict) and item.get("name"):
+                            mid = item["name"]
+                            if not any(x["id"] == mid for x in data):
+                                data.append({
+                                    "id": mid,
+                                    "object": "model",
+                                    "owned_by": "pollinations",
+                                    "tier": item.get("tier") or "free",
+                                    "backend": "pollinations",
+                                    "name": item.get("description") or mid,
+                                })
+    except Exception:
+        pass
+    return {"object": "list", "data": data, "provider": "ElitePlex-native"}
+
+
+@app.post("/v1/chat/completions", tags=["AI"])
+async def v1_chat_completions(request: Request):
+    """OpenAI-compatible chat. Free via Pollinations — no key required.
+
+    Optional env for stronger models: GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY
+    Body: { model, messages: [{role, content}], system? }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "JSON body required")
+    messages = body.get("messages") or []
+    if not messages and body.get("text"):
+        messages = [{"role": "user", "content": body["text"]}]
+    if not messages:
+        raise HTTPException(400, "messages required")
+    model = body.get("model") or "openai"
+    system = body.get("system")
+    result = await _ai_chat_route(messages, model=model, system=system)
+    if result.get("ok") is False and "choices" not in result:
+        raise HTTPException(502, result.get("error") or "chat failed")
+    return result
+
+
+@app.get("/v1/{model_id}/chat", tags=["AI"])
+async def v1_model_chat(
+    model_id: str,
+    text: str = Query(..., min_length=1),
+    system: Optional[str] = Query(None),
+):
+    """Simple GET chat with a model id."""
+    messages = [{"role": "user", "content": text}]
+    result = await _ai_chat_route(messages, model=model_id, system=system)
+    if result.get("ok") is False and "choices" not in result:
+        return {"ok": False, "error": result.get("error")}
+    content = ""
+    try:
+        content = result["choices"][0]["message"]["content"]
+    except Exception:
+        content = str(result)[:1000]
+    return {"ok": True, "model": model_id, "text": text, "response": content, "raw": result}
+
+
+@app.get("/ai/chat", tags=["AI"])
+@app.get("/ai/deepseek", tags=["AI"])
+@app.get("/ai/metaai", tags=["AI"])
+@app.get("/ai/gemini-realtime", tags=["AI"])
+async def ai_chat_simple(
+    text: str = Query(..., min_length=1, description="prompt"),
+    model: str = Query("openai"),
+    system: Optional[str] = None,
+):
+    """Unified simple AI chat (PaxSenix-style GET). Free, unlimited via Pollinations."""
+    result = await _ai_chat_route([{"role": "user", "content": text}], model=model, system=system)
+    content = ""
+    try:
+        content = result["choices"][0]["message"]["content"]
+    except Exception:
+        content = result.get("error") or str(result)[:800]
+    return {
+        "ok": "choices" in result,
+        "model": model,
+        "text": text,
+        "response": content,
+        "provider": result.get("provider") or "pollinations",
+    }
+
+
+@app.post("/ai/chat", tags=["AI"])
+async def ai_chat_post(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "JSON body required")
+    text = body.get("text") or body.get("prompt") or body.get("message") or ""
+    if not text and body.get("messages"):
+        return await v1_chat_completions(request)
+    if not text:
+        raise HTTPException(400, "text required")
+    model = body.get("model") or "openai"
+    result = await _ai_chat_route([{"role": "user", "content": text}], model=model, system=body.get("system"))
+    content = ""
+    try:
+        content = result["choices"][0]["message"]["content"]
+    except Exception:
+        content = result.get("error") or str(result)[:800]
+    return {"ok": "choices" in result, "model": model, "response": content, "provider": result.get("provider")}
+
+
+@app.get("/ai-image/generate", tags=["AI Images"])
+@app.get("/ai-image/flux", tags=["AI Images"])
+@app.get("/ai-image/pollinations", tags=["AI Images"])
+@app.get("/ai-image/sdxl", tags=["AI Images"])
+async def ai_image_generate(
+    prompt: Optional[str] = Query(None),
+    text: Optional[str] = Query(None),
+    width: int = Query(1024, ge=256, le=2048),
+    height: int = Query(1024, ge=256, le=2048),
+    model: str = Query("flux"),
+    nologo: bool = Query(True),
+):
+    """Free AI image generation via Pollinations (Flux etc). No API key."""
+    p = (prompt or text or "").strip()
+    if not p:
+        raise HTTPException(400, "prompt or text required")
+    # Pollinations image CDN — returns image directly; we return the URL
+    img_url = (
+        f"https://image.pollinations.ai/prompt/{quote(p)}"
+        f"?width={width}&height={height}&model={quote(model)}&nologo={'true' if nologo else 'false'}&enhance=true"
+    )
+    return {
+        "ok": True,
+        "provider": "pollinations",
+        "model": model,
+        "prompt": p,
+        "image_url": img_url,
+        "url": img_url,
+        "width": width,
+        "height": height,
+        "note": "Open image_url directly — PNG/JPEG from Pollinations CDN",
+    }
+
+
+@app.get("/ai-image/models", tags=["AI Images"])
+async def ai_image_models():
+    return {
+        "ok": True,
+        "models": [
+            {"id": "flux", "name": "Flux"},
+            {"id": "flux-realism", "name": "Flux Realism"},
+            {"id": "turbo", "name": "Turbo"},
+            {"id": "gptimage", "name": "GPT Image"},
+        ],
+        "provider": "pollinations",
+    }
+
+
+# ---- Temp Mail (Guerrilla Mail free API) ----
+@app.get("/tempmail/create", tags=["TempMail"])
+async def tempmail_create():
+    """Create a temporary email address (Guerrilla Mail)."""
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(
+            "https://api.guerrillamail.com/ajax.php",
+            params={"f": "get_email_address", "lang": "en"},
+        )
+        if r.status_code != 200:
+            raise HTTPException(502, "tempmail provider error")
+        j = r.json()
+        return {
+            "ok": True,
+            "email": j.get("email_addr"),
+            "alias": j.get("alias"),
+            "sid_token": j.get("sid_token"),
+            "timestamp": j.get("email_timestamp"),
+            "provider": "guerrillamail",
+            "note": "Use sid_token with /tempmail/inbox to check mail",
+        }
+
+
+@app.get("/tempmail/inbox", tags=["TempMail"])
+async def tempmail_inbox(
+    sid_token: str = Query(..., description="from /tempmail/create"),
+    email: Optional[str] = Query(None),
+):
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(
+            "https://api.guerrillamail.com/ajax.php",
+            params={"f": "check_email", "sid_token": sid_token, "seq": 0},
+        )
+        if r.status_code != 200:
+            raise HTTPException(502, "inbox fetch failed")
+        j = r.json()
+        return {"ok": True, "email": email, "count": j.get("count"), "list": j.get("list") or [], "provider": "guerrillamail"}
+
+
+@app.get("/tempmail/body", tags=["TempMail"])
+async def tempmail_body(
+    sid_token: str = Query(...),
+    message_id: str = Query(..., description="mail_id from inbox"),
+):
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(
+            "https://api.guerrillamail.com/ajax.php",
+            params={"f": "fetch_email", "sid_token": sid_token, "email_id": message_id},
+        )
+        if r.status_code != 200:
+            raise HTTPException(502, "body fetch failed")
+        j = r.json()
+        return {"ok": True, "mail": j, "provider": "guerrillamail"}
+
+
+@app.get("/tools/urlshorten", tags=["Tools"])
+@app.get("/tools/urlshorter", tags=["Tools"])
+async def tools_urlshorten(url: str = Query(..., min_length=8)):
+    """URL shortener via is.gd (free, no key)."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get("https://is.gd/create.php", params={"format": "json", "url": url})
+        if r.status_code != 200:
+            raise HTTPException(502, "shorten failed")
+        j = r.json()
+        return {"ok": True, "url": url, "short": j.get("shorturl"), "provider": "is.gd"}
+
+
+@app.get("/tools/whois", tags=["Tools"])
+async def tools_whois(domain: str = Query(..., min_length=3)):
+    """Simple DNS lookup."""
+    import socket
+    try:
+        ips = socket.getaddrinfo(domain, None)
+        addrs = sorted({x[4][0] for x in ips})
+        return {"ok": True, "domain": domain, "addresses": addrs}
+    except Exception as e:
+        return {"ok": False, "domain": domain, "error": str(e)}
+
+
+@app.get("/ai-tools/summarize", tags=["AI Tools"])
+async def ai_summarize(
+    input: str = Query(..., min_length=1),
+    length: str = Query("medium"),
+):
+    prompt = f"Summarize the following text in a {length} summary. Reply with only the summary:\n\n{input[:6000]}"
+    result = await _ai_chat_route([{"role": "user", "content": prompt}], model="openai")
+    content = ""
+    try:
+        content = result["choices"][0]["message"]["content"]
+    except Exception:
+        content = result.get("error") or ""
+    return {"ok": bool(content), "summary": content, "provider": result.get("provider")}
+
+
+@app.get("/ai-tools/tone-rewrite", tags=["AI Tools"])
+async def ai_tone_rewrite(
+    text: str = Query(..., min_length=1),
+    tone: str = Query("professional"),
+):
+    prompt = f"Rewrite the text in a {tone} tone. Reply with only the rewritten text:\n\n{text[:4000]}"
+    result = await _ai_chat_route([{"role": "user", "content": prompt}], model="openai")
+    content = ""
+    try:
+        content = result["choices"][0]["message"]["content"]
+    except Exception:
+        content = result.get("error") or ""
+    return {"ok": bool(content), "text": content, "tone": tone, "provider": result.get("provider")}
+
 
 
 @app.get("/site", response_class=HTMLResponse, tags=["Meta"])
