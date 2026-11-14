@@ -1,4 +1,4 @@
-# ElitePlex API v9.0.3 — restore DASH helpers + /px proxy + real MP4 detectors
+ePlex API v9.0.3 — restore DASH helpers + /px proxy + real MP4 detectors
 # Modules: libretube_api.py (YouTube), telegram_cdn_api.py (/tg CDN, optional Telethon)
 from __future__ import annotations
 
@@ -99,7 +99,7 @@ def _ci_bind_creator():
 
 _ci_verify()
 
-VERSION = "9.3.0"
+VERSION = "9.4.0"
 CREATOR = _ci_bind_creator()
 
 app = FastAPI(title="ElitePlex API", version=VERSION, docs_url=None, redoc_url=None)
@@ -1439,6 +1439,254 @@ async def mb_tabs():
 
 
 
+
+
+
+
+# ========== YOUTUBE DOWNLOADERS (site backends + unified) ==========
+# Internal backends (not official public APIs). May change / rate-limit.
+YT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+YT_TECH = "https://ytdownloader.tech"
+YT_ULTRA = "https://api.ytultra.com"
+
+def _yt_video_id(url_or_id: str) -> Optional[str]:
+    s = (url_or_id or "").strip()
+    if re.fullmatch(r"[\w-]{11}", s):
+        return s
+    m = re.search(r"(?:v=|/shorts/|youtu\.be/|embed/)([\w-]{11})", s)
+    return m.group(1) if m else None
+
+def _yt_watch_url(url_or_id: str) -> str:
+    vid = _yt_video_id(url_or_id)
+    if vid:
+        return f"https://www.youtube.com/watch?v={vid}"
+    return (url_or_id or "").strip()
+
+async def _yt_tech_resolve(url: str) -> dict:
+    async with _client(35.0) as client:
+        r = await client.post(
+            YT_TECH + "/api/resolve",
+            json={"url": url},
+            headers={
+                "User-Agent": YT_UA,
+                "Content-Type": "application/json",
+                "Origin": YT_TECH,
+                "Referer": YT_TECH + "/",
+                "Accept": "application/json",
+            },
+        )
+        if r.status_code >= 400:
+            raise HTTPException(502, detail=fail("ytdownloader.tech resolve failed", status=r.status_code, body=r.text[:200]))
+        return r.json()
+
+async def _yt_tech_prepare(video_id: str, format_id: str, url: str) -> dict:
+    async with _client(40.0) as client:
+        r = await client.post(
+            YT_TECH + "/api/prepare",
+            json={"videoId": video_id, "formatId": str(format_id), "url": url},
+            headers={
+                "User-Agent": YT_UA,
+                "Content-Type": "application/json",
+                "Origin": YT_TECH,
+                "Referer": YT_TECH + "/",
+                "Accept": "application/json",
+            },
+        )
+        if r.status_code >= 400:
+            raise HTTPException(502, detail=fail("ytdownloader.tech prepare failed", status=r.status_code, body=r.text[:200]))
+        return r.json()
+
+async def _yt_ultra_download(url: str) -> dict:
+    async with _client(40.0) as client:
+        r = await client.post(
+            YT_ULTRA + "/ikool/youtube/download",
+            json={"url": url},
+            headers={
+                "User-Agent": YT_UA,
+                "Content-Type": "application/json",
+                "Origin": "https://www.ytultra.com",
+                "Referer": "https://www.ytultra.com/en/youtube-video-downloader/",
+                "Accept": "application/json",
+            },
+        )
+        if r.status_code >= 400:
+            raise HTTPException(502, detail=fail("ytultra failed", status=r.status_code, body=r.text[:200]))
+        return r.json()
+
+def _yt_ultra_normalize(payload: dict) -> dict:
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    medias = data.get("medias") or []
+    streams = []
+    for m in medias:
+        if not isinstance(m, dict):
+            continue
+        u = m.get("url") or m.get("downloadUrl")
+        streams.append({
+            "quality": m.get("quality") or m.get("format"),
+            "format": m.get("format"),
+            "url": u,
+            "play_url": u,
+            "locked": bool(m.get("locked")),
+            "size": m.get("size") or m.get("fileSize"),
+            "kind": "audio" if "mp3" in str(m.get("format") or "").lower() or "m4a" in str(m.get("format") or "").lower() else "video",
+            "source": "ytultra",
+        })
+    unlocked = [s for s in streams if s.get("url") and not s.get("locked")]
+    return {
+        "title": data.get("title"),
+        "thumbnail": data.get("imageUrl"),
+        "duration": data.get("duration"),
+        "streams": streams,
+        "unlocked": unlocked,
+        "count": len(streams),
+        "unlocked_count": len(unlocked),
+        "best": unlocked[0]["url"] if unlocked else None,
+        "hdAudio": data.get("hdAudio"),
+        "raw_code": payload.get("code"),
+    }
+
+@app.get("/yt/info", tags=["YouTube"])
+async def yt_info(url: str = Query(..., min_length=8, description="YouTube URL or 11-char video id")):
+    """Unified info: ytultra direct links + ytdownloader.tech format list."""
+    watch = _yt_watch_url(url)
+    vid = _yt_video_id(url)
+    out = {"url": watch, "videoId": vid, "sources": {}}
+    errors = []
+    # ultra
+    try:
+        raw = await _yt_ultra_download(watch)
+        out["sources"]["ytultra"] = _yt_ultra_normalize(raw)
+    except Exception as e:
+        errors.append(f"ytultra:{e}")
+    # tech
+    try:
+        tech = await _yt_tech_resolve(watch)
+        out["sources"]["ytdownloader_tech"] = tech
+        out["videoId"] = tech.get("videoId") or vid
+        out["title"] = tech.get("title") or (out.get("sources", {}).get("ytultra") or {}).get("title")
+    except Exception as e:
+        errors.append(f"ytdownloader.tech:{e}")
+    # prefer title
+    if not out.get("title"):
+        out["title"] = (out.get("sources", {}).get("ytultra") or {}).get("title")
+    ultra = out["sources"].get("ytultra") or {}
+    out["best"] = ultra.get("best")
+    out["unlocked"] = ultra.get("unlocked") or []
+    out["errors"] = errors or None
+    return ok(out, provider="youtube", endpoint="info")
+
+@app.get("/yt/resolve", tags=["YouTube"])
+async def yt_resolve(url: str = Query(..., min_length=8)):
+    """ytdownloader.tech /api/resolve — metadata + format ids (video/mp3/m4a)."""
+    watch = _yt_watch_url(url)
+    data = await _yt_tech_resolve(watch)
+    return ok(data, provider="ytdownloader.tech", endpoint="resolve")
+
+@app.post("/yt/prepare", tags=["YouTube"])
+async def yt_prepare(
+    url: str = Query(..., min_length=8),
+    format_id: str = Query(..., description="formatId from /yt/resolve"),
+    video_id: str = Query("", description="Optional videoId from resolve"),
+):
+    """ytdownloader.tech /api/prepare — starts conversion job (returns job id)."""
+    watch = _yt_watch_url(url)
+    vid = video_id or _yt_video_id(url)
+    if not vid:
+        tech = await _yt_tech_resolve(watch)
+        vid = tech.get("videoId")
+    if not vid:
+        return fail("videoId required")
+    data = await _yt_tech_prepare(vid, format_id, watch)
+    return ok({"videoId": vid, "formatId": format_id, **data}, provider="ytdownloader.tech", endpoint="prepare")
+
+@app.get("/yt/ultra", tags=["YouTube"])
+async def yt_ultra(url: str = Query(..., min_length=8)):
+    """ytultra.com backend — medias list; unlocked items include googlevideo play_url."""
+    watch = _yt_watch_url(url)
+    raw = await _yt_ultra_download(watch)
+    norm = _yt_ultra_normalize(raw)
+    return ok(norm, provider="ytultra", endpoint="ultra")
+
+@app.get("/yt/stream", tags=["YouTube"])
+async def yt_stream(
+    url: str = Query(..., min_length=8),
+    quality: str = Query("", description="Optional filter e.g. 720, 480, mp3"),
+):
+    """Best direct stream URLs (unlocked ytultra medias)."""
+    watch = _yt_watch_url(url)
+    raw = await _yt_ultra_download(watch)
+    norm = _yt_ultra_normalize(raw)
+    streams = [s for s in (norm.get("unlocked") or []) if s.get("url")]
+    if quality:
+        q = quality.lower().replace("p", "")
+        filtered = [s for s in streams if q in str(s.get("quality") or "").lower() or q in str(s.get("format") or "").lower()]
+        if filtered:
+            streams = filtered
+    return ok({
+        "title": norm.get("title"),
+        "thumbnail": norm.get("thumbnail"),
+        "duration": norm.get("duration"),
+        "streams": streams,
+        "count": len(streams),
+        "best": streams[0]["url"] if streams else None,
+        "note": "Direct googlevideo links; may expire. Higher qualities may be locked by upstream.",
+    }, provider="youtube", endpoint="stream")
+
+@app.get("/yt/mp3", tags=["YouTube"])
+async def yt_mp3(url: str = Query(..., min_length=8)):
+    """Audio-focused links from ytultra (and format ids from ytdownloader.tech)."""
+    watch = _yt_watch_url(url)
+    out = {"url": watch, "audio": [], "formats": None}
+    try:
+        raw = await _yt_ultra_download(watch)
+        norm = _yt_ultra_normalize(raw)
+        out["title"] = norm.get("title")
+        out["thumbnail"] = norm.get("thumbnail")
+        for s in norm.get("streams") or []:
+            fmt = str(s.get("format") or s.get("quality") or "").lower()
+            if s.get("url") and ("mp3" in fmt or "m4a" in fmt or "audio" in fmt or s.get("kind") == "audio"):
+                out["audio"].append(s)
+        # also any unlocked under  audio-ish quality labels
+        if not out["audio"]:
+            for s in norm.get("unlocked") or []:
+                if s.get("url"):
+                    # keep as progressive fallback note
+                    pass
+    except Exception as e:
+        out["ultra_error"] = str(e)[:160]
+    try:
+        tech = await _yt_tech_resolve(watch)
+        out["formats"] = {"mp3": tech.get("mp3"), "m4a": tech.get("m4a"), "videoId": tech.get("videoId")}
+        out["title"] = out.get("title") or tech.get("title")
+        out["prepare_hint"] = "POST /yt/prepare?url=...&format_id=" + str((tech.get("mp3") or {}).get("formatId") or "140")
+    except Exception as e:
+        out["tech_error"] = str(e)[:160]
+    out["count"] = len(out["audio"])
+    out["best"] = out["audio"][0]["url"] if out["audio"] else None
+    return ok(out, provider="youtube", endpoint="mp3")
+
+@app.get("/yt/health", tags=["YouTube"])
+async def yt_health():
+    """Check upstream reachability."""
+    status = {}
+    async with _client(12.0) as client:
+        try:
+            r = await client.get(YT_TECH + "/", headers={"User-Agent": YT_UA})
+            status["ytdownloader.tech"] = r.status_code
+        except Exception as e:
+            status["ytdownloader.tech"] = str(e)[:80]
+        try:
+            r = await client.post(
+                YT_ULTRA + "/ikool/youtube/download",
+                json={"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+                headers={"User-Agent": YT_UA, "Content-Type": "application/json", "Origin": "https://www.ytultra.com"},
+            )
+            status["ytultra"] = r.status_code
+        except Exception as e:
+            status["ytultra"] = str(e)[:80]
+    return ok({"upstreams": status}, provider="youtube", endpoint="health")
 
 
 # ========== APP (multi-provider convenience for mobile clients) ==========
@@ -4599,7 +4847,7 @@ async def kt_captcha_info():
         "sitekey_domain": "kartoons.to only",
         "why_widget_fails_on_vercel": (
             "Cloudflare Turnstile sitekeys are locked to the site that created them. "
-            "Loading this key on movieallshawon.vercel.app shows 'Unable to connect to website'."
+            "Loading this key on 1eliteapi.fastapicloud.dev shows 'Unable to connect to website'."
         ),
         "recommended": "device_login",
         "device_login": {
@@ -7309,10 +7557,10 @@ body{
 <body>
 <div class="top">
   <div class="brand">
-    <div class="logo">SH</div>
+    <div class="logo">EP</div>
     <div>
       <h1>ElitePlex API</h1>
-      <small>v9.3.0 · creator locked</small>
+      <small>v9.4.0 · creator locked</small>
     </div>
   </div>
   <div class="search">
@@ -7322,7 +7570,7 @@ body{
 </div>
 <div class="tabs" id="tabs"></div>
 <div class="wrap">
-  <div class="hint"><b>How to test:</b> open an endpoint → fill parameters → <b>Try it</b>. Every JSON includes a verified <code>creator</code> field (integrity-locked).</div>
+  <div class="hint"><b>How to test:</b> open an endpoint → fill parameters → <b>Try it</b>. Every JSON includes a verified <code>creator</code> field (integrity-locked). New: <b>YouTube</b> section (/yt/*).</div>
   <div class="stats" id="stats"></div>
   <div id="list"></div>
   <div class="footer">ElitePlex API</div>
@@ -7330,6 +7578,12 @@ body{
 <script>
 const API = location.origin;
 const E = [
+  {g:"YouTube",p:"/yt/health",how:"YouTube downloader upstreams health.",params:[]},
+  {g:"YouTube",p:"/yt/info",how:"Unified info (ytultra + ytdownloader.tech).",params:[{n:"url",v:"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}]},
+  {g:"YouTube",p:"/yt/stream",how:"Direct unlocked video URLs (ytultra).",params:[{n:"url",v:"https://www.youtube.com/watch?v=dQw4w9WgXcQ"},{n:"quality",v:"720"}]},
+  {g:"YouTube",p:"/yt/mp3",how:"Audio formats / prepare hint.",params:[{n:"url",v:"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}]},
+  {g:"YouTube",p:"/yt/resolve",how:"ytdownloader.tech resolve (format ids).",params:[{n:"url",v:"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}]},
+  {g:"YouTube",p:"/yt/ultra",how:"ytultra medias list.",params:[{n:"url",v:"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}]},
   {g:"App",p:"/app/meta",how:"App feature + provider map for clients.",params:[]},
   {g:"App",p:"/app/providers",how:"All providers + MMC aliases.",params:[]},
   {g:"App",p:"/app/search",how:"Unified multi-provider search.",params:[{n:"q",v:"avatar"},{n:"page",v:"1"}]},
