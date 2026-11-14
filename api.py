@@ -1,4 +1,4 @@
-ePlex API v9.0.3 — restore DASH helpers + /px proxy + real MP4 detectors
+# StreamHub API v9.0.3 — restore DASH helpers + /px proxy + real MP4 detectors
 # Modules: libretube_api.py (YouTube), telegram_cdn_api.py (/tg CDN, optional Telethon)
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ try:
     from telegram_cdn_api import router as tg_router, init_tg_cdn
     _TG_CDN_OK = True
 except Exception as _tg_err:
-    print(f"[ElitePlex] telegram_cdn import failed: {_tg_err}")
+    print(f"[StreamHub] telegram_cdn import failed: {_tg_err}")
     tg_router = None  # type: ignore
     init_tg_cdn = None  # type: ignore
     _TG_CDN_OK = False
@@ -49,7 +49,7 @@ _CI_P = (41, 3, 29, 250, 241, 193)
 _CI_K = 0x5A
 _CI_H1 = "6c1b86f4c8f0e0f0e3b8a0c6d2e1f9a0"
 _CI_H2 = hashlib.sha256(_ci_dec(_CI_P, _CI_K).encode()).hexdigest()
-_CI_H3 = hashlib.md5((_ci_dec(_CI_P, _CI_K) + "|ElitePlex|v9").encode()).hexdigest()
+_CI_H3 = hashlib.md5((_ci_dec(_CI_P, _CI_K) + "|streamhub|v9").encode()).hexdigest()
 _CI_H4 = hashlib.sha1((_ci_dec(_CI_P, _CI_K) + "#bind").encode()).hexdigest()
 _CI_OK = True
 
@@ -74,7 +74,7 @@ def _ci_verify() -> bool:
         if hashlib.sha256(n.encode()).hexdigest() != _CI_H2:
             _CI_OK = False
             return False
-        if hashlib.md5((n + "|ElitePlex|v9").encode()).hexdigest() != _CI_H3:
+        if hashlib.md5((n + "|streamhub|v9").encode()).hexdigest() != _CI_H3:
             _CI_OK = False
             return False
         if hashlib.sha1((n + "#bind").encode()).hexdigest() != _CI_H4:
@@ -102,7 +102,7 @@ _ci_verify()
 VERSION = "9.4.0"
 CREATOR = _ci_bind_creator()
 
-app = FastAPI(title="ElitePlex API", version=VERSION, docs_url=None, redoc_url=None)
+app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 
 @app.middleware("http")
 async def _ci_lock_mw(request, call_next):  # CI_LOCK_MW
@@ -131,9 +131,9 @@ if _TG_CDN_OK and tg_router is not None:
                 if init_tg_cdn:
                     await init_tg_cdn()
             except Exception as e:
-                print(f"[ElitePlex] Telegram CDN init deferred: {e}")
+                print(f"[StreamHub] Telegram CDN init deferred: {e}")
     except Exception as e:
-        print(f"[ElitePlex] Telegram CDN mount failed: {e}")
+        print(f"[StreamHub] Telegram CDN mount failed: {e}")
         _TG_CDN_OK = False
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -1695,7 +1695,7 @@ async def yt_health():
 async def app_meta():
     """Feature catalog for multi-movie clients."""
     return ok({
-        "name": "ElitePlex",
+        "name": "StreamHub",
         "version": VERSION,
         "features": [
             "search", "home", "details", "streams", "cdn_proxy",
@@ -1875,7 +1875,7 @@ async def app_stream(
 # ========== MYMOVIECLAN (mymovieclan.up.railway.app) ==========
 # Full proxy of public MovieClan / MoviesExplorer APIs — none omitted.
 MMC_BASE = "https://mymovieclan.up.railway.app"
-MMC_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 ElitePlex-MMC"
+MMC_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 StreamHub-MMC"
 
 # Known provider aliases discovered from /api/availability (priority order)
 MMC_PROVIDERS = [
@@ -4847,7 +4847,7 @@ async def kt_captcha_info():
         "sitekey_domain": "kartoons.to only",
         "why_widget_fails_on_vercel": (
             "Cloudflare Turnstile sitekeys are locked to the site that created them. "
-            "Loading this key on 1eliteapi.fastapicloud.dev shows 'Unable to connect to website'."
+            "Loading this key on movieallshawon.vercel.app shows 'Unable to connect to website'."
         ),
         "recommended": "device_login",
         "device_login": {
@@ -4867,7 +4867,7 @@ async def kt_captcha_info():
 KT_CAPTCHA_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Kartoons Login — ElitePlex</title>
+<title>Kartoons Login — StreamHub</title>
 <style>
 :root{--bg:#0a0a0c;--card:#141418;--bd:#2a2a32;--tx:#f4f4f5;--mu:#9ca3af;--ok:#34d399;--bad:#f87171;--ac:#8b5cf6}
 *{box-sizing:border-box}
@@ -6994,7 +6994,7 @@ async def ap_auth_ui():
     html = """<!DOCTYPE html>
 <html lang="bn"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>AnimePirates Login — ElitePlex</title>
+<title>AnimePirates Login — StreamHub</title>
 <style>
 :root{--bg:#0b0b0f;--card:#15151c;--fg:#f2f2f7;--muted:#9a9aad;--acc:#7c5cff;--ok:#22c55e;--err:#ef4444}
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);min-height:100vh;display:grid;place-items:center;padding:16px}
@@ -7459,7 +7459,7 @@ DOCS_HTML = """<!DOCTYPE html>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <meta name="theme-color" content="#0a0a0c"/>
-<title>ElitePlex API</title>
+<title>StreamHub API</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
 <style>
 :root{
@@ -7557,9 +7557,9 @@ body{
 <body>
 <div class="top">
   <div class="brand">
-    <div class="logo">EP</div>
+    <div class="logo">SH</div>
     <div>
-      <h1>ElitePlex API</h1>
+      <h1>StreamHub API</h1>
       <small>v9.4.0 · creator locked</small>
     </div>
   </div>
@@ -7573,7 +7573,7 @@ body{
   <div class="hint"><b>How to test:</b> open an endpoint → fill parameters → <b>Try it</b>. Every JSON includes a verified <code>creator</code> field (integrity-locked). New: <b>YouTube</b> section (/yt/*).</div>
   <div class="stats" id="stats"></div>
   <div id="list"></div>
-  <div class="footer">ElitePlex API</div>
+  <div class="footer">StreamHub API</div>
 </div>
 <script>
 const API = location.origin;
@@ -7838,7 +7838,7 @@ async def icon_png(size: int):
 @app.get("/manifest.webmanifest", include_in_schema=False)
 async def manifest():
     return JSONResponse({
-        "name": "ElitePlex", "short_name": "ElitePlex", "description": "Stream, download and discover movies, series, anime and live TV.",
+        "name": "StreamHub", "short_name": "StreamHub", "description": "Stream, download and discover movies, series, anime and live TV.",
         "start_url": "/", "scope": "/", "display": "standalone", "orientation": "any",
         "background_color": "#05060f", "theme_color": "#05060f",
         "icons": [
@@ -7870,7 +7870,7 @@ SITE_HTML = r'''<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#05060f">
-<title>ElitePlex — stream, download, discover</title>
+<title>StreamHub — stream, download, discover</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icon-192.png">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23060913'/%3E%3Ccircle cx='32' cy='32' r='17' fill='none' stroke='%23ffb224' stroke-width='4'/%3E%3Cpath d='M27 23l16 9-16 9z' fill='%23ffb224'/%3E%3C/svg%3E">
@@ -8492,11 +8492,11 @@ html[data-size=l] .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr)
 <symbol id="i-api" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6l-6 6 6 6M16 6l6 6-6 6M14 4l-4 16"/></symbol>
 </defs></svg>
 
-<div id="splash"><div><svg viewBox="0 0 64 64"><circle class="ring" cx="32" cy="32" r="22"/><path class="tri" d="M27 23l16 9-16 9z"/></svg><b>ElitePlex</b></div></div>
+<div id="splash"><div><svg viewBox="0 0 64 64"><circle class="ring" cx="32" cy="32" r="22"/><path class="tri" d="M27 23l16 9-16 9z"/></svg><b>STREAMHUB</b></div></div>
 <div id="aurora"><i></i><i></i><i></i></div><div id="spot"></div><div id="stars"></div><div id="prog"></div>
 
 <header id="top">
-  <a class="logo" href="#/home" aria-label="ElitePlex home"><svg viewBox="0 0 64 64"><circle class="ring" cx="32" cy="32" r="22" fill="none"/><path class="tri" d="M27 23l16 9-16 9z"/></svg><span>ElitePlex</span></a>
+  <a class="logo" href="#/home" aria-label="StreamHub home"><svg viewBox="0 0 64 64"><circle class="ring" cx="32" cy="32" r="22" fill="none"/><path class="tri" d="M27 23l16 9-16 9z"/></svg><span>StreamHub</span></a>
   <nav id="nav" aria-label="Sections"></nav>
   <div class="tspace"></div>
   <a class="ibtn" href="#/search" aria-label="Search"><svg><use href="#i-search"/></svg></a>
@@ -9071,7 +9071,7 @@ class Player{
   }
   _media(){
     if(!('mediaSession' in navigator))return;
-    try{navigator.mediaSession.metadata=new MediaMetadata({title:this.ctx.title||'ElitePlex',artist:this.ctx.sub||'ElitePlex',artwork:this.ctx.poster?[{src:this.ctx.poster,sizes:'512x512'}]:[]});
+    try{navigator.mediaSession.metadata=new MediaMetadata({title:this.ctx.title||'StreamHub',artist:this.ctx.sub||'StreamHub',artwork:this.ctx.poster?[{src:this.ctx.poster,sizes:'512x512'}]:[]});
       navigator.mediaSession.setActionHandler('play',()=>this.v.play());navigator.mediaSession.setActionHandler('pause',()=>this.v.pause());
       navigator.mediaSession.setActionHandler('seekbackward',()=>this._seekBy(-10));navigator.mediaSession.setActionHandler('seekforward',()=>this._seekBy(10));
       navigator.mediaSession.setActionHandler('nexttrack',this.ctx.next?()=>this.ctx.next():null)}catch(e){}
@@ -9309,7 +9309,7 @@ window.addEventListener('scroll',()=>{$('#top').classList.toggle('solid',scrollY
   /* ---- PWA ---- */
   let deferred=null;
   window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferred=e;const b=document.getElementById('instBtn');if(b)b.style.display=''});
-  window.addEventListener('appinstalled',()=>{deferred=null;toast('Installed — find ElitePlex on your home screen')});
+  window.addEventListener('appinstalled',()=>{deferred=null;toast('Installed — find StreamHub on your home screen')});
   if('serviceWorker' in navigator&&location.protocol.startsWith('http'))window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}));
   /* ---- settings sheet ---- */
   const cfg=document.getElementById('cfg'),cin=document.getElementById('cfgIn');
@@ -9321,11 +9321,11 @@ window.addEventListener('scroll',()=>{$('#top').classList.toggle('solid',scrollY
     '<h4>DEFAULT VIDEO QUALITY</h4>'+seg('q',[['auto','Auto'],['1080','1080p'],['720','720p'],['480','480p'],['360','360p']])+
     '<h4>AUTOPLAY NEXT EPISODE</h4>'+seg('autonext',[['true','On'],['false','Off']])+
     '<h4>CARD SIZE</h4>'+seg('size',[['s','Small'],['m','Medium'],['l','Large']])+
-    '<h4>APP</h4><div class="seg"><button id="instBtn" style="'+(deferred?'':'display:none')+'">'+ico('dl')+' Install ElitePlex</button><button data-act="clearhist">Clear watch history</button><button data-act="clearlist">Clear My list</button><button data-act="lock18">Lock Midnight</button><button data-act="reload">Clear cache &amp; reload</button></div>'+
+    '<h4>APP</h4><div class="seg"><button id="instBtn" style="'+(deferred?'':'display:none')+'">'+ico('dl')+' Install StreamHub</button><button data-act="clearhist">Clear watch history</button><button data-act="clearlist">Clear My list</button><button data-act="lock18">Lock Midnight</button><button data-act="reload">Clear cache &amp; reload</button></div>'+
     (deferred?'':'<p style="color:var(--dim);font-size:12.5px;margin-top:8px">To install: browser menu → “Add to Home screen” (Android / iOS) or the install icon in the address bar (PC).</p>')+
     '<div class="hide-touch"><h4>KEYBOARD SHORTCUTS</h4>'+[['/','Search'],['?','Settings'],['Space / K','Play / pause'],['← → / J L','Seek 5 s / 10 s'],['↑ ↓','Volume'],['M','Mute'],['F','Fullscreen'],['N','Next episode'],['0–9','Jump to 0–90 %'],['Esc','Close / back']].map(k=>'<div class="krow"><span>'+k[1]+'</span><kbd>'+k[0]+'</kbd></div>').join('')+'</div>'+
     '<h4>GESTURES (PHONE)</h4><p style="color:var(--dim);font-size:13px;line-height:1.7">Double-tap left / right: ∓10 s · Swipe sideways: scrub · Hold: 2× speed · Fullscreen: swipe up/down on the right for volume, left for brightness.</p>'+
-    '<h4>ABOUT</h4><p style="color:var(--dim);font-size:13px">ElitePlex · <a href="/docs" target="_blank" rel="noopener" style="color:var(--a1);text-decoration:underline">API docs</a></p>';
+    '<h4>ABOUT</h4><p style="color:var(--dim);font-size:13px">StreamHub · <a href="/docs" target="_blank" rel="noopener" style="color:var(--a1);text-decoration:underline">API docs</a></p>';
   }
   const openCfg=()=>{drawCfg();cfg.classList.add('open');document.body.classList.add('lock')};
   const closeCfg=()=>{cfg.classList.remove('open');if(!det.classList.contains('open')&&!document.getElementById('theatre').classList.contains('open'))document.body.classList.remove('lock')};
@@ -10139,7 +10139,7 @@ function openTheatre(o){
   const box=$('#tbox');box.innerHTML='<div id="plh"></div><div class="srcs" id="srcs"></div>';
   const srcs=$('#srcs',box);
   const pl=new Player($('#plh',box),{onChange:(i,l)=>{srcs.innerHTML=srcChips(l,i)}});
-  window._tpl=pl;pl.setSources(o.sources,{title:o.title,sub:o.sub||'ElitePlex',poster:o.poster,live:!!o.live});
+  window._tpl=pl;pl.setSources(o.sources,{title:o.title,sub:o.sub||'StreamHub',poster:o.poster,live:!!o.live});
   srcs.onclick=e=>{const c=e.target.closest('[data-src]');if(c){const i=+c.dataset.src;pl.sources[i].dead=false;pl.sources[i].proxied=false;pl.play(i,true)}};
   $('[data-tclose]',t).onclick=closeTheatre;
 }
